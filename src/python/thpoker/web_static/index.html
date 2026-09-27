@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hold'em trainer</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<main>
+  <section id="setup">
+    <h1>Hold'em trainer</h1>
+    <form id="setup-form">
+      <label>Game
+        <select name="mode"><option value="cash">Cash</option><option value="tournament">Tournament</option></select>
+      </label>
+      <label>Players <input name="seats" type="number" min="2" max="8" value="6"></label>
+      <label>Bots
+        <select name="tier"><option value="1">Tier 1 (easy)</option><option value="2" selected>Tier 2</option><option value="3">Tier 3 (strong)</option></select>
+      </label>
+      <label>Blinds <input name="blinds" value="50/100"></label>
+      <label>Stack (big blinds, empty for the default) <input name="stack" type="number" min="1" step="1"></label>
+      <label class="inline"><input name="hide_styles" type="checkbox"> Hide the bots' styles</label>
+      <button type="submit">Deal</button>
+    </form>
+    <p class="error" id="setup-error"></p>
+  </section>
+
+  <section id="table" hidden>
+    <div id="seats"></div>
+    <div id="middle">
+      <div id="board"></div>
+      <div id="pot"></div>
+    </div>
+    <div id="controls">
+      <div id="actions"></div>
+      <div id="sizing" hidden>
+        <input id="amount" type="number" step="any">
+        <input id="slider" type="range" step="any">
+        <span id="presets"></span>
+      </div>
+      <div id="between"></div>
+      <p class="error" id="table-error"></p>
+    </div>
+    <div id="panels">
+      <pre id="log"></pre>
+      <pre id="analysis"></pre>
+    </div>
+  </section>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>

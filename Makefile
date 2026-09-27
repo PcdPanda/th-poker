@@ -33,11 +33,6 @@ install-dev: ## Install the package in development mode
 build: ## Build the package and extensions
 	$(PYTHON) setup.py build_ext --inplace
 
-build-cpp: ## Build C++ components
-	mkdir -p src/cpp/build
-	cd src/cpp/build && cmake .. -DCMAKE_BUILD_TYPE=Release
-	cd src/cpp/build && cmake --build . --config Release
-
 # Testing
 test: ## Run tests
 	PYTHONPATH=$(PYTHONPATH) $(PYTEST) src/python/pytemplate/tests/ tests/
@@ -75,13 +70,9 @@ clean: ## Clean build artifacts
 	find . -type f -name "*.pyc" -delete
 	find . -type d -name "__pycache__" -delete
 	find . -type f -name "*.so" -delete
-	find . -type f -name "*.cpp" -delete
 
-clean-cpp: ## Clean C++ build artifacts
-	rm -rf src/cpp/build/
-	rm -rf src/python/cpp/lib/
 
-distclean: clean clean-cpp ## Clean all generated files
+distclean: clean  Clean all generated files
 	rm -rf .venv/
 	rm -rf venv/
 	rm -rf .tox/
