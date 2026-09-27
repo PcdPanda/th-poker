@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools", "cython"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 120
+lint.ignore = ["F401"]
+
+[tool.ruff.format]
+# Like Black, use double quotes for strings.
+quote-style = "double"
+docstring-code-format = true
+docstring-code-line-length = 72
+indent-style = "space"
