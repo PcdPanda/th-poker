@@ -146,6 +146,9 @@ BOT_TIERS: dict[int, type[RuleBot] | type[EquityBot] | type[RangeBot]] = {
 }
 # One name per seat, unrelated to style, so hidden styles stay hidden and no two bots match.
 _BOT_NAMES = ("Alex", "Blake", "Casey", "Devon", "Emery", "Finley", "Harper", "Jordan")
+# The chance, by tier, that a bot winning without a shodown shows its cards: easier bots show
+# more, which gives a newcomer more hands to learn from.
+SHOW_CHANCE = {1: 0.5, 2: 0.25, 3: 0.1}
 
 
 def _seat_bots(config: TableConfig) -> dict[int, Bot]:
@@ -222,10 +225,28 @@ class TableRunner:
             self.hand, applied = apply_action(self.hand, decision.action)
             events.extend(applied)
         if is_terminal(self.hand):
+            events.extend(self._show_uncontested())
             self.hud.record(self.hand)
             self.session, ended = end_hand(self.session, self.hand)
             events.extend(ended)
         return events
+
+    def _show_uncontested(self) -> list[Event]:
+        """With a user at the table, a bot that won without a showdown may show its cards. The
+        engine's `shown` is left alone, so no bot, statistic or review ever sees them."""
+        hand = self.hand
+        assert hand is not None
+        awards = hand.awards
+        if self.user_seat is None or len(awards) != 1 or len(awards[0].eligible) != 1:
+            return []
+        seat = awards[0].eligible[0]
+        cards = hand.hole_cards[seat]
+        assert cards is not None  # a winner was dealt in
+        if seat not in self.bots:
+            return []
+        if Rng(hand.seed).derive("show", seat).random() >= SHOW_CHANCE[self.config.tier]:
+            return []
+        return [Event("CardsShown", {"hand_id": hand.hand_id, "seat": seat, "cards": list(cards)})]
 
     def user_rebuy(self) -> list[Event]:
         if self.user_seat is None:
@@ -266,6 +287,14 @@ class TableRunner:
 
 
 MIN_HANDS = 20  # hands before the numbers are worth reading
+STYLE_WORDS = {
+    "nit": "very tight",
+    "tag": "tight-aggressive",
+    "lag": "loose-aggressive",
+    "calling_station": "calls a lot",
+    "maniac": "wild",
+    "balanced": "balanced",
+}
 EXPLOITS = {
     "nit": "Steal its blinds often and respect its raises: when it bets, it has it.",
     "tag": "Solid; look for spots where it folds too much, such as to 3-bets and late-street pressure.",

@@ -1,12 +1,13 @@
-from   typing                   import Any
-
+from   dataclasses              import replace
+import io
 import pytest
-
 from   thpoker.analysis.review  import review_hand
 import thpoker.analysis.stats
-from   thpoker.analysis.stats   import (DecisionRecord, MIN_HANDS, compare,
-                                        facing_bucket, loss_by_tag, patterns,
-                                        progress, record, tags)
+from   thpoker.analysis.stats   import (DecisionRecord, HAND_COLUMNS,
+                                        MIN_HANDS, compare, facing_bucket,
+                                        hand_rows, loss_by_tag, patterns,
+                                        progress, record, tags,
+                                        write_hands_csv)
 from   thpoker.analysis.tests.review \
                                 import BetsTheRiver
 from   thpoker.analysis.tests.tracking \
@@ -16,8 +17,9 @@ from   thpoker.bots.bot         import Bot, PRESETS
 from   thpoker.game.engine      import new_hand
 from   thpoker.game.state       import (Action, ActionType, GameConfig,
                                         Observation, Street)
-from   thpoker.game.tests.decks import (CALL, CHECK, heads_up, play,
+from   thpoker.game.tests.decks import (CALL, CHECK, FOLD, heads_up, play,
                                         stacked_deck)
+from   typing                   import Any
 
 
 def decision(
@@ -170,3 +172,48 @@ def test_a_few_hands_give_no_verdict():
 
 def test_only_cash_decisions_count():
     assert progress([hand_decision("hand-1", 0.01, mode="tournament")]) is None
+
+
+def test_hand_rows_count_the_chips_put_in_and_join_the_review():
+    deck = stacked_deck(0, 2, {0: "AsKd", 1: "QhQc"}, "2c3d7h8s9c")
+    raise_300 = Action(ActionType.RAISE, 300)
+    shown_down = play(
+        new_hand(GameConfig(2), 1, 0, (10_000, 10_000), hand_id="hand-7", deck=deck)[0],
+        raise_300,
+        CALL,
+        *[CHECK] * 6,
+    )
+    # Blake folds to the raise: 200 of the user's 300 come back, so 100 went in and won 200.
+    folded_to = play(
+        new_hand(GameConfig(2), 1, 0, (10_000, 10_000), hand_id="hand-8", deck=deck)[0],
+        raise_300,
+        FOLD,
+    )
+    reviewed = DecisionRecord("s", "hand-7", 0, {}, 1.5, 0.2, "mistake", "raise", None, 0.5)
+    other_session = replace(reviewed, session="t", hand_id="hand-8")
+    rows = hand_rows([shown_down, folded_to], 0, 1, "s", "2026-01-02", "cash", [reviewed, other_session])
+    picked = [{k: row[k] for k in ("position", "put_in", "result", "showdown", "mistakes", "loss_bb")} for row in rows]
+    assert picked == [
+        {
+            "position": "BTN",
+            "put_in": 300,
+            "result": -300,
+            "showdown": "yes",
+            "mistakes": 1,
+            "loss_bb": 1.5,
+        },
+        {
+            "position": "BTN",
+            "put_in": 100,
+            "result": 100,
+            "showdown": "no",
+            "mistakes": "",
+            "loss_bb": "",
+        },
+    ]
+    stream = io.StringIO()
+    write_hands_csv(rows[:1], stream)
+    assert stream.getvalue().splitlines() == [
+        ",".join(HAND_COLUMNS),
+        "s,2026-01-02,cash,2,7,BTN,As Kd,2c 3d 7h 8s 9c,300,-300,-3.0,yes,1,1,1.5,",
+    ]

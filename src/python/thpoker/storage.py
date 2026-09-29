@@ -29,6 +29,8 @@ def read_session_log(path: Path) -> list[dict[str, Any]]:
     with path.open(encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, 1):
             record = json.loads(line)
+            if not isinstance(record, dict) or "type" not in record:
+                raise ValueError(f"{path}:{line_number} is not a record")
             if record.get("schema_version", 0) > SCHEMA_VERSION:
                 raise ValueError(
                     f"{path}:{line_number} has schema version {record['schema_version']}, "

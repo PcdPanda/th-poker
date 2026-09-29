@@ -16,12 +16,16 @@ them would mislead.
 
 from   bisect                   import bisect_left, bisect_right
 from   collections              import defaultdict
+import csv
 from   dataclasses              import dataclass
 import math
-
-from   thpoker.analysis.review  import DecisionReview, hand_group
-from   thpoker.game.state       import Street
+from   thpoker.analysis.review  import (DecisionReview, hand_group,
+                                        position_names)
+from   thpoker.game.cards       import cards_str
+from   thpoker.game.engine      import observation
+from   thpoker.game.state       import GameState, Street
 from   thpoker.storage          import Record
+from   typing                   import Any, TextIO
 
 MIN_SAMPLE = 5  # decisions a pattern needs before it is reported
 LARGE_FACING = ("medium", "large", "overbet")  # bets of more than 40% of the pot
@@ -255,3 +259,81 @@ def progress(records: list[DecisionRecord]) -> Progress | None:
     mean = sum(w * loss for w, loss in zip(weights, losses)) / total
     stderr = sum((w * (loss - mean)) ** 2 for w, loss in zip(weights, losses)) ** 0.5 / total
     return Progress(count, decisions, 100 * mean, 100 * stderr, compare(100 * mean, 100 * stderr, count))
+
+
+HAND_COLUMNS = (
+    "session",
+    "date",
+    "mode",
+    "players",
+    "hand",
+    "position",
+    "cards",
+    "board",
+    "put_in",
+    "result",
+    "result_bb",
+    "showdown",
+    "decisions",
+    "mistakes",
+    "loss_bb",
+    "loss_prize_pct",
+)
+
+
+def _number(amount: float) -> float | int:
+    return int(amount) if amount == int(amount) else round(amount, 2)
+
+
+def hand_rows(
+    hands: list[GameState],
+    user: int,
+    scale: int,
+    session: str,
+    date: str,
+    mode: str,
+    decisions: list[DecisionRecord],
+) -> list[dict[str, Any]]:
+    """One row per hand the user was dealt into, in chips as shown on the table, for a
+    spreadsheet. Only the user's own cards appear. The review columns come from `decisions`
+    (records written by `thpoker review`) and stay blank for hands never reviewed."""
+    reviewed: dict[str, list[DecisionRecord]] = defaultdict(list)
+    for decision in decisions:
+        if decision.session == session:
+            reviewed[decision.hand_id].append(decision)
+    rows = []
+    for hand in hands:
+        if not hand.dealt_in[user]:
+            continue
+        won = sum(x for a in hand.awards for s, x in zip(a.winners, a.shares) if s == user)
+        result = hand.stacks[user] - hand.starting_stacks[user]
+        records = reviewed.get(hand.hand_id)
+        loss = sum(r.loss for r in records) if records else None
+        tournament = mode == "tournament"
+        rows.append(
+            {
+                "session": session,
+                "date": date,
+                "mode": mode,
+                "players": sum(hand.dealt_in),
+                "hand": int(hand.hand_id.rpartition("-")[2]),
+                "position": position_names(observation(hand, user))[user],
+                "cards": cards_str(hand.hole_cards[user] or ()),
+                "board": cards_str(hand.board),
+                "put_in": _number((won - result) / scale),
+                "result": _number(result / scale),
+                "result_bb": round(result / hand.config.big_blind, 2),
+                "showdown": "yes" if user in hand.shown else "no",
+                "decisions": len(records) if records else "",
+                "mistakes": sum(r.verdict == "mistake" for r in records) if records else "",
+                "loss_bb": round(loss, 2) if loss is not None and not tournament else "",
+                "loss_prize_pct": round(100 * loss, 3) if loss is not None and tournament else "",
+            }
+        )
+    return rows
+
+
+def write_hands_csv(rows: list[dict[str, Any]], stream: TextIO):
+    writer = csv.DictWriter(stream, fieldnames=HAND_COLUMNS, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(rows)

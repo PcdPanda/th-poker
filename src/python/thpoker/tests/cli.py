@@ -1,10 +1,9 @@
 import builtins
+import csv
 from   dataclasses              import replace
 import json
 from   pathlib                  import Path
-
 import pytest
-
 from   thpoker.analysis.stats   import DecisionRecord
 from   thpoker.cli              import build_config, main, parse_args
 from   thpoker.game.session     import Mode
@@ -90,6 +89,14 @@ def test_a_logged_session_can_be_reviewed_after_a_hand_and_later(monkeypatch, ca
     ]
     assert main(["review", str(log), "--hand", user_hands[0].removeprefix("hand-")]) == 0
     assert "1 Situation" in capsys.readouterr().out
+    # The export has a row per logged hand, and every reviewed decision lands on its hand's row.
+    out = tmp_path / "hands.csv"
+    assert main(["export", str(log), "--out", str(out), "--decisions-log", decisions]) == 0
+    rows = list(csv.DictReader(out.open(encoding="utf-8")))
+    logged = [r["hand"]["hand_id"].removeprefix("hand-") for r in hands if r["type"] == "hand"]
+    assert [row["hand"] for row in rows] == logged
+    reviewed = DecisionRecord.read(Path(decisions), "decision")
+    assert sum(int(row["decisions"] or 0) for row in rows) == len(reviewed) > 0
 
 
 def test_predict_then_reveal_logs_estimates_for_calibration(monkeypatch, capsys, tmp_path):

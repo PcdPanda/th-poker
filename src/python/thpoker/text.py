@@ -2,15 +2,21 @@
 a hand or a session, and the rendering of reviews (the data comes from `analysis/review.py`).
 """
 
+from   collections              import defaultdict
 from   collections.abc          import Callable
-
+import functools
+import math
 from   thpoker.analysis.ev      import OptionValue
 from   thpoker.analysis.review  import (DecisionReview, HandReview, RangeView,
-                                        SessionSummary, best_option)
+                                        SessionSummary, best_option,
+                                        position_names)
 from   thpoker.analysis.training \
                                 import Calibration, RECENT
 from   thpoker.game.cards       import RANKS, cards_str
-from   thpoker.game.state       import Action, ActionType, Event
+from   thpoker.game.engine      import new_hand, observation, replay_states
+from   thpoker.game.evaluator   import describe, evaluate
+from   thpoker.game.state       import (Action, ActionType, AnteType, Event,
+                                        GameState, Street)
 
 
 def format_chips(amount: float, scale: int) -> str:
@@ -26,8 +32,15 @@ def _conjugate(verb: str, is_user: bool) -> str:
     return f"{first}s {rest}".rstrip()
 
 
-def narrate(event: Event, label: Callable[[int], str], chips: Callable[[int], str], user: int | None) -> list[str]:
-    """Lines describing `event`: `label` names a seat, `chips` formats an amount."""
+def narrate(
+    event: Event,
+    label: Callable[[int], str],
+    chips: Callable[[int], str],
+    user: int | None,
+    plain: bool = False,
+) -> list[str]:
+    """Lines describing `event`: `label` names a seat, `chips` formats an amount. `plain` words
+    the pot line for newcomers ("Casey wins 300") rather than as a pot and its shares."""
     data = event.data
     if event.kind == "ActionTaken":
         action = Action.from_dict(data["action"])
@@ -49,7 +62,17 @@ def narrate(event: Event, label: Callable[[int], str], chips: Callable[[int], st
             f"  {label(hand['seat'])} {_conjugate('show', hand['seat'] == user)} {cards_str(hand['cards'])}: {hand['description']}"
             for hand in data["hands"]
         ]
+    if event.kind == "CardsShown":
+        return [f"  {label(data['seat'])} shows {cards_str(data['cards'])}"]
     if event.kind == "PotAwarded":
+        if plain:
+            return [
+                "  "
+                + ", ".join(
+                    f"{label(s)} {_conjugate('win', s == user)} {chips(x)}"
+                    for s, x in zip(data["winners"], data["shares"])
+                )
+            ]
         winners = ", ".join(f"{label(s)} {chips(x)}" for s, x in zip(data["winners"], data["shares"]))
         return [f"  Pot {chips(data['amount'])} -> {winners}"]
     if event.kind == "BlindLevelChanged":
@@ -257,3 +280,364 @@ def render_calibration(summary: list[Calibration]) -> list[str]:
                 f"(last {window}: {_share(item.recent_error)}); your guesses run {_share(abs(item.bias))} {lean}"
             )
     return lines
+
+
+# Plain words, for the web page and for pasting a hand into a chat assistant.
+
+_SUIT_SYMBOLS = {"c": "♣", "d": "♦", "h": "♥", "s": "♠"}
+_POSITION_WORDS = {
+    "HJ": "in the hijack (two seats before the dealer)",
+    "CO": "in the cutoff (just before the dealer)",
+    "BTN": "on the dealer button (last to act after the flop)",
+    "SB": "in the small blind",
+    "BB": "in the big blind",
+}
+_SEAT_WORDS = {
+    "HJ": "Hijack",
+    "CO": "Cutoff",
+    "BTN": "Dealer",
+    "SB": "Small blind",
+    "BB": "Big blind",
+}
+_POT_TYPE_WORDS = {
+    "unopened": "Nobody has raised yet.",
+    "limped": "Players have only called the big blind so far.",
+    "single-raised": "There has been one raise.",
+    "3-bet": "There has been a raise and a re-raise.",
+    "4-bet+": "There have been three or more raises.",
+}
+_GROUP_WORDS = {
+    "two pair+": "two pair or better",
+    "one pair": "one pair",
+    "draw": "a draw",
+    "air": "nothing yet",
+}
+_TEXTURE_WORDS = {
+    "A-high": "ace-high",
+    "K-high": "king-high",
+    "broadway": "high cards (ten to ace)",
+    "middle": "middle cards",
+    "low": "low cards",
+    "unpaired": "no pair",
+    "paired": "a pair",
+    "trips": "three of a kind",
+    "rainbow": "all different suits",
+    "two-tone": "two cards of one suit",
+    "monotone": "all one suit",
+    "flush possible": "a flush possible",
+    "no flush": "no flush possible",
+    "connected": "cards close in rank (straights likely)",
+    "semi-connected": "cards fairly close in rank",
+    "disconnected": "cards far apart in rank",
+    "flush completed": "the last card made a flush possible",
+    "straight completed": "the last card made a straight possible",
+    "board paired": "the last card paired the board",
+    "overcard": "the last card is higher than the rest",
+    "brick": "the last card changed little",
+}
+_STREET_WORDS = {
+    Street.PREFLOP: "Before the flop",
+    Street.FLOP: "Flop",
+    Street.TURN: "Turn",
+    Street.RIVER: "River",
+}
+
+
+def pretty_cards(cards: tuple[int, ...] | list[int]) -> str:
+    """ "A♠ 10♥" rather than "As Th"."""
+    return " ".join(("10" if text[0] == "T" else text[0]) + _SUIT_SYMBOLS[text[1]] for text in cards_str(cards).split())
+
+
+def chips_shown(bb: float, big_blind: int, scale: int) -> float:
+    """Big blinds as the chips shown on the table, rounded to the smallest chip."""
+    return round(bb * big_blind / scale, 0 if scale == 1 else 2) + 0.0  # + 0.0: no "-0"
+
+
+def _chips(bb: float, big_blind: int, scale: int, signed: bool = False) -> str:
+    places = 0 if scale == 1 else 2
+    value = chips_shown(bb, big_blind, scale)
+    return f"{value:+,.{places}f}" if signed and value else f"{value:,.{places}f}"
+
+
+def _worth(option: OptionValue, review: DecisionReview, big_blind: int, scale: int) -> str:
+    if review.tournament:
+        assert option.icm is not None
+        noise = f" ± {100 * option.icm_stderr:.2f}" if option.icm_stderr else ""
+        return f"{100 * option.icm:.2f}%{noise}"
+    noise = "" if option.exact else f" ± {_chips(option.stderr, big_blind, scale)}"
+    return _chips(option.ev, big_blind, scale, signed=True) + noise
+
+
+def decision_headline(review: DecisionReview, scale: int, big_blind: int, mix: dict[Action, float]) -> str:
+    """One line: the verdict on a chosen move, or the suggestion for a coach hint. The best move
+    is the best against a strong player, the standard the verdict uses. When a hint's averages
+    are within their noise of each other, it names what a strong player does (`mix`) instead."""
+    tournament = review.tournament
+    best = best_option(review.reference, tournament)
+    best_text = describe_action(best.action, scale)
+    if review.chosen is None:
+        value, clear = _icm_or_ev(best, tournament), True
+        for other in review.reference:
+            if other.action == best.action:
+                continue
+            if tournament:
+                noise = math.hypot(best.icm_stderr or 0.0, other.icm_stderr or 0.0)
+            else:
+                noise = math.hypot(best.stderr, other.stderr)
+            clear = clear and value - _icm_or_ev(other, tournament) > 2 * noise
+        if clear or not mix:
+            return f"Suggested: {best_text}."
+        usual = max(mix, key=mix.__getitem__)
+        return (
+            f"Too close to tell from the averages. A strong player would "
+            f"{describe_action(usual, scale)} here {_share(mix[usual])} of the time."
+        )
+    chosen = describe_action(review.chosen, scale)
+    verdict = review.verdict()
+    if verdict == "best":
+        return f"Good move. Best option: {chosen}."
+    if verdict == "close":
+        return f"Close. Best option: {best_text}; your {chosen} was nearly as good."
+    loss, _ = review.loss(review.reference)
+    cost = f"{100 * loss:.2f}% of the prize pool" if tournament else f"{_chips(loss, big_blind, scale)} chips"
+    return f"Costly. Best option: {best_text}; your {chosen} gave up about {cost} on average."
+
+
+def _icm_or_ev(option: OptionValue, tournament: bool) -> float:
+    if tournament:
+        assert option.icm is not None
+        return option.icm
+    return option.ev
+
+
+def decision_summary(review: DecisionReview, scale: int, big_blind: int) -> list[str]:
+    """The two or three lines a newcomer reads under the headline."""
+    error = "" if review.equity.exact else f" (± {_share(review.equity.stderr)})"
+    lines = [f"You win about {_share(review.equity.value)}{error} of the time against the hands they likely hold."]
+    required = review.thresholds.required_equity
+    if required is not None:
+        to_call = _chips(review.situation.to_call_bb, big_blind, scale)
+        lines.append(f"Calling costs {to_call}: it pays if you win at least {_share(required)} of the time.")
+    if review.exploit_spot():
+        best_bot = best_option(review.exploitative, review.tournament)
+        lines.append(
+            f"Against these particular opponents, {describe_action(best_bot.action, scale)} does better than the standard play."
+        )
+    return lines
+
+
+def decision_details(review: DecisionReview, labels: dict[int, str], scale: int, big_blind: int) -> list[str]:
+    """Everything else, in words: the spot, the board, what each opponent likely holds, and the
+    break-even numbers."""
+    spot = review.situation
+    after = "last" if spot.in_position else "first"
+    where = (
+        "in early position (among the first to act)"
+        if spot.position.startswith("UTG")
+        else _POSITION_WORDS[spot.position]
+    )
+    lines = [
+        f"You are {where}, with {spot.players} players in the hand; you act {after} after the flop.",
+        f"{_POT_TYPE_WORDS[spot.pot_type]} Pot {_chips(spot.pot_bb, big_blind, scale)}, "
+        f"{_chips(spot.to_call_bb, big_blind, scale)} to call, {_chips(spot.effective_bb, big_blind, scale)} left to play for.",
+    ]
+    if spot.spr is not None:
+        lines.append(f"Stack-to-pot ratio {spot.spr:.1f}: the chips left to play for, per chip already in the pot.")
+    if spot.texture is not None:
+        tags = spot.texture
+        words = [_TEXTURE_WORDS[t] for t in (tags.high, tags.pairing, tags.suits, tags.connectivity)]
+        change = f"; {_TEXTURE_WORDS[tags.change]}" if tags.change else ""
+        lines.append(f"The board: {', '.join(words)}{change}.")
+    alike: dict[str, list[str]] = {}  # opponents who read the same, named together
+    for seat, view in review.ranges.items():
+        groups = ""
+        if view.groups is not None:
+            groups = (
+                " (" + ", ".join(f"{_GROUP_WORDS[name]} {_share(share)}" for name, share in view.groups.items()) + ")"
+            )
+        alike.setdefault(f"about {_share(view.width)} of all starting hands{groups}", []).append(labels[seat])
+    for holding, names in alike.items():
+        who = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+        lines.append(f"{who} likely {'holds' if len(names) == 1 else 'each hold'} {holding}.")
+    if review.percentile is not None:
+        lines.append(f"Your hand is stronger than {_share(review.percentile)} of the hands you would likely have here.")
+    defense = review.thresholds.defense_share
+    if defense is not None:
+        lines.append(
+            f"Folding more than {_share(1 - defense)} of your hands here would let any bluff against you profit."
+        )
+    for action, folds in review.thresholds.bluff_break_even.items():
+        lines.append(
+            f"A bluff {describe_action(action, scale)} pays off if they fold more than {_share(folds)} of the time."
+        )
+    if review.reference_note is not None:
+        lines.append(f"The strong-player numbers here come from a {review.reference_note}.")
+    if not all(o.exact for o in review.exploitative + review.reference):
+        lines.append("Numbers with ± are estimates from sampling: options closer than that are too close to call.")
+    if not review.tournament:
+        lines.append(f"1 big blind = {_chips(1, big_blind, scale)} chips.")
+    return lines
+
+
+def plain_decision_text(
+    number: int,
+    review: DecisionReview,
+    labels: dict[int, str],
+    scale: int,
+    big_blind: int,
+    mix: dict[Action, float],
+) -> list[str]:
+    board = pretty_cards(review.board) if review.board else "none yet"
+    chose = "" if review.chosen is None else f"; you chose {describe_action(review.chosen, scale)}"
+    lines = [
+        f"Decision {number} ({_STREET_WORDS[review.situation.street].lower()}): your cards {pretty_cards(review.hole)}, board {board}{chose}.",
+        decision_headline(review, scale, big_blind, mix),
+    ]
+    lines += decision_summary(review, scale, big_blind)
+    lines += decision_details(review, labels, scale, big_blind)
+    unit = "share of the prize pool" if review.tournament else "chips"
+    best = best_option(review.reference, review.tournament).action
+    reference = {o.action: o for o in review.reference}
+    lines.append(
+        f"Options (average result in {unit}: against these bots | against a strong player | how often a strong player does it):"
+    )
+    for option in review.exploitative:
+        marks = [
+            m
+            for m, on in (
+                ("your choice", option.action == review.chosen),
+                ("best", option.action == best),
+            )
+            if on
+        ]
+        lines.append(
+            f"  {describe_action(option.action, scale)}: {_worth(option, review, big_blind, scale)} | "
+            f"{_worth(reference[option.action], review, big_blind, scale)} | {_share(mix.get(option.action, 0.0))}"
+            + (f" ({', '.join(marks)})" if marks else "")
+        )
+    return lines
+
+
+def hand_result_text(net_bb: float, all_in_net_bb: float | None, scale: int, big_blind: int) -> str:
+    if abs(net_bb) < 1e-9:
+        text = "You broke even this hand."
+    else:
+        verb = "won" if net_bb > 0 else "lost"
+        blinds = f"{abs(net_bb):.1f}".removesuffix(".0")
+        unit = "big blind" if blinds == "1" else "big blinds"
+        text = f"You {verb} {_chips(abs(net_bb), big_blind, scale)} chips ({blinds} {unit}) this hand."
+    if all_in_net_bb is not None:
+        text += f" With the cards as they were when the chips went in, you would average {_chips(all_in_net_bb, big_blind, scale, signed=True)}."
+    return text
+
+
+def hand_history_text(
+    hand: GameState,
+    user: int,
+    labels: dict[int, str],
+    scale: int,
+    game: str,
+    shown: dict[int, tuple[int, int]],
+) -> list[str]:
+    """The hand as the user saw it, street by street, up to its result (which the caller adds):
+    only the user's cards and cards that were shown. `game` names it ("cash game",
+    "tournament"); `shown` holds cards a bot showed without a showdown."""
+    config = hand.config
+    chips = functools.partial(format_chips, scale=scale)
+    states = replay_states(hand)
+    ante = ""
+    if config.ante_type == AnteType.BIG_BLIND_ANTE:
+        ante = f", big blind ante {chips(config.ante)}"
+    elif config.ante_type == AnteType.PER_PLAYER:
+        ante = f", ante {chips(config.ante)} each"
+    lines = [
+        f"No-limit Texas Hold'em {game}, {sum(hand.dealt_in)} players, blinds "
+        f"{chips(config.small_blind)}/{chips(config.big_blind)}{ante}. "
+        f"Hand {hand.hand_id.rpartition('-')[2]}.",
+        "Seats in the order they act before the flop, with their chips at the start of the hand:",
+    ]
+    # What each seat posted, from the deal's own events: the amounts depend only on the stacks,
+    # and a later state has already returned any uncalled part.
+    posted: dict[int, int] = defaultdict(int)
+    for event in new_hand(config, hand.seed, hand.button, hand.starting_stacks, hand.dealt_in, hand.hand_id)[1]:
+        if event.kind == "AntesPosted":
+            for seat, amount in enumerate(event.data["amounts"]):
+                posted[seat] += amount
+        elif event.kind == "BlindsPosted":
+            posted[event.data["small_blind_seat"]] += event.data["small_blind"]
+            posted[event.data["big_blind_seat"]] += event.data["big_blind"]
+    for seat, code in position_names(observation(hand, user)).items():
+        extra = f", posts {chips(posted[seat])}" if posted[seat] else ""
+        mine = f", your cards {pretty_cards(hand.hole_cards[seat] or ())}" if seat == user else ""
+        seat_name = _SEAT_WORDS.get(code, "Early position")
+        lines.append(f"  {seat_name} ({code}): {labels[seat]}, {chips(hand.starting_stacks[seat])}{extra}{mine}")
+    street = None
+    moves: list[str] = []
+    for index, before in enumerate(states):
+        # A street's header comes with its first action, or at the end for a street just dealt.
+        now = hand.history[index].street if index < len(hand.history) else before.street
+        if now != street and now != Street.COMPLETE:
+            if moves:
+                lines.append("  " + ", ".join(moves) + ".")
+            moves = []
+            street = now
+            header = _STREET_WORDS[street]
+            if street != Street.PREFLOP:
+                new = before.board[-1:] if street != Street.FLOP else before.board
+                header += f" {pretty_cards(new)} (pot {chips(before.pot)})"
+            lines.append(header + ":")
+        if index < len(hand.history):
+            entry = hand.history[index]
+            moves.append(_move_text(entry.action, entry.seat, before, labels[entry.seat], entry.seat == user, chips))
+    if moves:
+        lines.append("  " + ", ".join(moves) + ".")
+    final = states[-1]
+    if final.street == Street.COMPLETE:
+        runout = final.board[len(states[-2].board) :] if hand.history else final.board
+        if runout:
+            lines.append(f"The rest of the board, with no more betting: {pretty_cards(runout)}.")
+        for seat in final.shown:
+            cards = final.hole_cards[seat]
+            assert cards is not None
+            value = describe(evaluate(list(cards) + list(final.board)))
+            lines.append(f"{labels[seat]} {_conjugate('show', seat == user)} {pretty_cards(cards)}: {value}.")
+        for seat, cards in shown.items():
+            lines.append(f"{labels[seat]} shows {pretty_cards(cards)} without being called.")
+        widest = max((len(a.eligible) for a in final.awards), default=0)
+        for award in final.awards:
+            side = " (side pot)" if len(award.eligible) < widest else ""
+            lines.append(
+                ", ".join(
+                    f"{labels[s]} {_conjugate('win', s == user)} {chips(x)}"
+                    for s, x in zip(award.winners, award.shares)
+                )
+                + side
+                + "."
+            )
+    elif final.to_act == user:
+        lines.append("The hand is still being played, and it is your turn.")
+    else:
+        lines.append("The hand is still being played.")
+    return lines
+
+
+def _move_text(
+    action: Action,
+    seat: int,
+    before: GameState,
+    name: str,
+    is_user: bool,
+    chips: Callable[[int], str],
+) -> str:
+    """A call shows the chips it adds; a bet or raise the street total it makes."""
+    committed = before.committed_this_street[seat]
+    everything = committed + before.stacks[seat]
+    if action.type == ActionType.CALL:
+        verb = f"call {chips(min(before.current_bet, everything) - committed)}"
+        all_in = before.current_bet >= everything
+    elif action.amount is not None:
+        verb = f"{_VERBS[action.type]} {chips(action.amount)}"
+        all_in = action.amount == everything
+    else:
+        verb, all_in = _VERBS[action.type], False
+    return f"{name} {_conjugate(verb, is_user)}" + (" (all-in)" if all_in else "")

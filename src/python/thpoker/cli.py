@@ -9,9 +9,6 @@ import math
 from   operator                 import attrgetter
 from   pathlib                  import Path
 import sys
-import time
-from   typing                   import Any
-
 from   thpoker.analysis.drills  import (ChartQuestion, DrillResult, ICM,
                                         IcmQuestion, MIXED, PREFLOP, PUSHFOLD,
                                         RIGHT, THRESHOLDS, ThresholdQuestion,
@@ -25,8 +22,9 @@ from   thpoker.analysis.ev      import PROFILES, Profile, pick_profile
 from   thpoker.analysis.review  import (DecisionReview, HandReview, REFERENCE,
                                         hint, review_decision, review_hand,
                                         summarize, triaged_review)
-from   thpoker.analysis.stats   import (DecisionRecord, loss_by_tag, patterns,
-                                        progress, record)
+from   thpoker.analysis.stats   import (DecisionRecord, hand_rows, loss_by_tag,
+                                        patterns, progress, record,
+                                        write_hands_csv)
 from   thpoker.analysis.training \
                                 import (BEST_OPTION, Estimate, MISTAKE,
                                         best_action, calibration, grade_option,
@@ -51,6 +49,8 @@ from   thpoker.table            import (EXPLOITS, TableConfig, TableRunner,
 from   thpoker.text             import (describe_action, format_chips, narrate,
                                         render_calibration, render_decision,
                                         render_hand, render_summary)
+import time
+from   typing                   import Any
 
 HELP = """Actions:
   f            fold
@@ -82,6 +82,8 @@ class PlaySession:
     session log, the level clock, hints and reviews. `scale` is internal chip units per
     displayed chip, so user-entered blinds like 1/2 keep enough precision for pot-sized bets."""
 
+    plain = False
+
     def __init__(self, runner: TableRunner, scale: int, log: SessionLog | None, profile: Profile):
         self.runner = runner
         self.scale = scale
@@ -96,6 +98,9 @@ class PlaySession:
     def say(self, line: str):
         print(line)
 
+    def label(self, seat: int) -> str:
+        return self.runner.seat_label(seat)
+
     def chips(self, amount: int) -> str:
         return format_chips(amount, self.scale)
 
@@ -107,7 +112,7 @@ class PlaySession:
         for event in events:
             if self.log is not None:
                 self.log.append("event", {"hand_id": hand.hand_id if hand else None, "event": event.to_dict()})
-            for line in narrate(event, self.runner.seat_label, self.chips, self.runner.user_seat):
+            for line in narrate(event, self.label, self.chips, self.runner.user_seat, self.plain):
                 self.say(line)
 
     def hand_over(self):
@@ -132,6 +137,9 @@ class PlaySession:
         self.record([e for e in events if e.kind in ("PlayerEliminated", "TournamentFinished")])
 
     def hint_lines(self) -> list[str]:
+        return render_decision(self.hint_review(), self.runner.bot_labels(), self.scale)
+
+    def hint_review(self) -> DecisionReview:
         """The five steps for the decision the user faces now (DESIGN.md Section 7.8); logged,
         so the decision can be left out of the statistics."""
         hand, user = self.runner.hand, self.runner.user_seat
@@ -146,8 +154,8 @@ class PlaySession:
         )
         if self.log is not None:
             self.log.append("hint", {"hand_id": hand.hand_id, "index": len(hand.history)})
-        return render_decision(decision, self.runner.bot_labels(), self.scale)
-
+        return decision
+    
     def review_lines(self, hand: GameState) -> list[str]:
         review = full_review(self.runner, hand, self.profile)
         return render_hand(review, self.runner.bot_labels(), self.scale, grids=True)
@@ -547,14 +555,18 @@ def load_session(
     """A logged session with a user: its configuration, display scale, a runner that rebuilds
     the same bots, its hands, and all its records. Raises `OSError` or `ValueError`."""
     records = read_session_log(path)
-    logged = next((r for r in records if r["type"] == "table_config"), None)
-    if logged is None:
-        raise ValueError("no table configuration in the log")
-    config = TableConfig.from_dict(logged["config"])
+    try:
+        logged = next((r for r in records if r["type"] == "table_config"), None)
+        if logged is None:
+            raise ValueError("no table configuration in the log")
+        config = TableConfig.from_dict(logged["config"])
+        hands = [GameState.from_dict(r["hand"]) for r in records if r["type"] == "hand"]
+        scale = logged["scale"]
+    except (KeyError, TypeError) as error:
+        raise ValueError(f"damaged log: {error!r}") from error
     if config.session.user_seat is None:
         raise ValueError("bot-only sessions have no decisions to review")
-    hands = [GameState.from_dict(r["hand"]) for r in records if r["type"] == "hand"]
-    return config, logged["scale"], TableRunner(config), hands, records
+    return config, scale, TableRunner(config), hands, records
 
 
 def add_device_argument(parser: argparse.ArgumentParser):
@@ -850,8 +862,55 @@ def _ask(prompt: str) -> str:
     return input(prompt).strip().lower()
 
 
+def session_rows(
+    path: Path,
+    config: TableConfig,
+    scale: int,
+    hands: list[GameState],
+    decisions: list[DecisionRecord],
+) -> list[dict[str, Any]]:
+    """One CSV row per hand of a logged session, dated by the log's last write."""
+    user = config.session.user_seat
+    assert user is not None  # checked by load_session
+    mode = "tournament" if config.session.mode == Mode.TOURNAMENT else "cash"
+    day = date.fromtimestamp(path.stat().st_mtime).isoformat()
+    return hand_rows(hands, user, scale, path.stem, day, mode, decisions)
+
+
+def export_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="thpoker export",
+        description="Write one CSV row per hand of saved sessions, for a spreadsheet or pandas.",
+    )
+    parser.add_argument("logs", nargs="*", type=Path, help="session logs (default: every saved session)")
+    parser.add_argument("--out", type=Path, help="the CSV file to write (default: print it)")
+    parser.add_argument("--decisions-log", type=Path, default=default_decisions_log())
+    args = parser.parse_args(argv)
+    try:
+        decisions = DecisionRecord.read(args.decisions_log, "decision")
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"Leaving the review columns blank: {args.decisions_log}: {error}", file=sys.stderr)
+        decisions = []
+    rows: list[dict[str, Any]] = []
+    for path in args.logs or sorted(default_log_dir().glob("session-*.jsonl")):
+        try:
+            config, scale, _, hands, _ = load_session(path)
+        except (OSError, ValueError) as error:
+            print(f"Skipping {path}: {error}", file=sys.stderr)
+            continue
+        rows += session_rows(path, config, scale, hands, decisions)
+    if args.out is None:
+        write_hands_csv(rows, sys.stdout)
+    else:
+        with args.out.open("w", encoding="utf-8", newline="") as handle:
+            write_hands_csv(rows, handle)
+        print(f"Wrote {len(rows)} hands to {args.out}")
+    return 0
+
+
 COMMANDS = {
     "drill": drill_main,
+    "export": export_main,
     "review": review_main,
     "calibration": calibration_main,
     "leaks": leaks_main,

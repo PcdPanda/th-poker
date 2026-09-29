@@ -7,47 +7,116 @@
   <link rel="stylesheet" href="/style.css">
 </head>
 <body>
-<main>
-  <section id="setup">
-    <h1>Hold'em trainer</h1>
-    <form id="setup-form">
-      <label>Game
-        <select name="mode"><option value="cash">Cash</option><option value="tournament">Tournament</option></select>
-      </label>
-      <label>Players <input name="seats" type="number" min="2" max="8" value="6"></label>
-      <label>Bots
-        <select name="tier"><option value="1">Tier 1 (easy)</option><option value="2" selected>Tier 2</option><option value="3">Tier 3 (strong)</option></select>
-      </label>
-      <label>Blinds <input name="blinds" value="50/100"></label>
-      <label>Stack (big blinds, empty for the default) <input name="stack" type="number" min="1" step="1"></label>
-      <label class="inline"><input name="hide_styles" type="checkbox"> Hide the bots' styles</label>
-      <button type="submit">Deal</button>
-    </form>
-    <p class="error" id="setup-error"></p>
-  </section>
+  <header id="bar">
+    <span class="brand">Hold'em trainer</span>
+    <label class="toggle" id="helpers-toggle" hidden title="Hide pot odds, hand names, chips-in-the-pot totals and player stats, as at a real table">
+      <input type="checkbox" id="hide-helpers"> Hide helpers
+    </label>
+    <button type="button" id="new-game" class="link" hidden>New game</button>
+  </header>
+  <main>
+    <section id="setup">
+      <h1>Play Texas Hold'em against computer players</h1>
+      <p class="lead">A coach can explain any decision, during the hand or after it. New to poker? The poker words are explained at the bottom of the page.</p>
+      <form id="setup-form">
+        <fieldset>
+          <legend>Game</legend>
+          <label class="choice"><input type="radio" name="mode" value="cash" checked> Cash game <small>play as long as you like</small></label>
+          <label class="choice"><input type="radio" name="mode" value="tournament"> Tournament <small>the last player with chips wins</small></label>
+        </fieldset>
+        <label>Players at the table <input name="seats" type="number" min="2" max="8" value="6"></label>
+        <label>Opponents
+          <select name="tier"><option value="1">Easy</option><option value="2" selected>Medium</option><option value="3">Hard</option></select>
+        </label>
+        <label class="inline"><input name="coach" type="checkbox" checked> Coach: hints and checks of your moves while you play</label>
+        <details class="more">
+          <summary>More options</summary>
+          <label id="blinds-field">Blinds <small>the two forced bets each hand, small/big</small>
+            <input name="blinds" value="50/100" pattern="\d+(\.\d+)?/\d+(\.\d+)?" title="Like 50/100: the small blind, a slash, then the big blind">
+          </label>
+          <label>Starting chips, in big blinds <small>empty for 100: 10,000 chips with 50/100 blinds</small>
+            <input name="stack" type="number" min="1" step="1" placeholder="100">
+          </label>
+        </details>
+        <button type="submit" class="primary">Start playing</button>
+      </form>
+      <p class="error" id="setup-error" role="alert"></p>
+      <button type="button" id="open-history" class="secondary">Past sessions</button>
+    </section>
 
-  <section id="table" hidden>
-    <div id="seats"></div>
-    <div id="middle">
-      <div id="board"></div>
-      <div id="pot"></div>
-    </div>
-    <div id="controls">
-      <div id="actions"></div>
-      <div id="sizing" hidden>
-        <input id="amount" type="number" step="any">
-        <input id="slider" type="range" step="any">
-        <span id="presets"></span>
+    <section id="table" hidden>
+      <div id="opponents" class="seats"></div>
+      <div id="middle">
+        <div id="board" class="cards"></div>
+        <div id="pot"></div>
+        <p id="status" aria-live="polite"></p>
+        <p id="odds" class="helper"></p>
       </div>
-      <div id="between"></div>
-      <p class="error" id="table-error"></p>
-    </div>
-    <div id="panels">
-      <pre id="log"></pre>
-      <pre id="analysis"></pre>
-    </div>
-  </section>
-</main>
-<script src="/app.js"></script>
+      <div id="me"></div>
+      <div id="controls">
+        <div id="actions"></div>
+        <div id="sizing" hidden>
+          <input id="amount" type="number" step="any" aria-label="Amount">
+          <input id="slider" type="range" step="any" aria-label="Amount">
+          <span id="presets"></span>
+        </div>
+        <div id="between"></div>
+        <p class="error" id="table-error" role="alert"></p>
+        <p class="keys">Keys: F fold, K check, C call, R bet or raise, H coach, N next hand</p>
+      </div>
+      <div id="panels">
+        <section class="panel">
+          <h2>Hand log</h2>
+          <div id="log"></div>
+        </section>
+        <section class="panel" id="coach-panel" hidden>
+          <h2>Coach</h2>
+          <div id="coach"></div>
+        </section>
+      </div>
+      <details id="your-hands">
+        <summary>Your hands <span id="net"></span></summary>
+        <div id="hands-table"></div>
+        <a id="csv" href="#">Download all hands of this session as CSV</a>
+      </details>
+    </section>
+
+    <section id="history" hidden>
+      <h1>Past sessions</h1>
+      <p><button type="button" id="history-back" class="secondary">Back</button> <a href="/api/history.csv">Download every saved hand as CSV</a></p>
+      <p class="error" id="history-error" role="alert"></p>
+      <div id="sessions"></div>
+      <div id="session-hands"></div>
+      <section class="panel" id="history-coach-panel" hidden>
+        <h2>Review</h2>
+        <div id="history-coach"></div>
+      </section>
+    </section>
+
+    <details id="glossary">
+      <summary>Poker words</summary>
+      <dl>
+        <dt>Blinds</dt><dd>Two forced bets made before the cards are dealt, so there is always something to win: the small blind, and the big blind (usually twice as much). They move one seat each hand.</dd>
+        <dt>Big blind</dt><dd>The larger forced bet. Amounts are often counted in big blinds: with 50/100 blinds, 10,000 chips is 100 big blinds.</dd>
+        <dt>Pot</dt><dd>All the chips bet so far in the hand. The winner takes it.</dd>
+        <dt>Check</dt><dd>Pass without betting. You can only check when nobody has bet in this round.</dd>
+        <dt>Call</dt><dd>Match the current bet to stay in the hand.</dd>
+        <dt>Bet, raise</dt><dd>Put chips in first (bet), or more than the current bet (raise). The others must then call, raise or fold.</dd>
+        <dt>Fold</dt><dd>Give up the hand. You lose the chips you have already put in, but nothing more.</dd>
+        <dt>All-in</dt><dd>Bet every chip you have left.</dd>
+        <dt>Dealer</dt><dd>The button marks the dealer. The dealer acts last after the flop, which is an advantage: you see what the others do first.</dd>
+        <dt>Position</dt><dd>Where you sit relative to the dealer. Acting later is better, because you know more when you decide.</dd>
+        <dt>Flop, turn, river</dt><dd>The shared cards: three at once (the flop), then a fourth (the turn), then a fifth (the river). There is a round of betting before and after each.</dd>
+        <dt>Pot odds</dt><dd>What a call costs compared with what you can win. If calling 100 into a pot of 200 needs you to win 1 time in 3 (33%), and you win more often than that, the call pays.</dd>
+        <dt>Chance to win</dt><dd>How often your hand would win against the hands the others likely hold, if all the cards were dealt. Also called equity.</dd>
+        <dt>Likely hands</dt><dd>The hands a player could have, given what they have done so far. Also called a range.</dd>
+        <dt>Average result</dt><dd>What an option wins or loses on average if you played the same spot many times. Also called expected value, or EV.</dd>
+        <dt>Strong player</dt><dd>The trainer's model of a solid opponent. Your moves are judged by how they do against it.</dd>
+        <dt>Tight, loose, aggressive</dt><dd>Tight players play few hands, loose players many. Aggressive players bet and raise a lot; passive ones mostly call.</dd>
+        <dt>Showdown</dt><dd>When the betting is over and more than one player is left, the hands are shown and the best one wins.</dd>
+      </dl>
+    </details>
+  </main>
+  <script src="/app.js"></script>
 </body>
 </html>
