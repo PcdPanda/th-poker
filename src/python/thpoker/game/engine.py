@@ -49,11 +49,11 @@ def new_hand(
         raise ConfigError(f"a hand needs at least two dealt-in seats, got {dealt}")
     if not 0 <= button < n or not dealt[button]:
         raise ConfigError(f"button seat {button} is not dealt in")
-    cards = list(deck) if deck is not None else Rng(seed).derive("deck").permutation(52)
+    cards = list(deck) if deck is not None else _shuffled(seed)
     if sorted(cards) != list(range(52)):
         raise ConfigError("deck must be an ordering of all 52 cards")
 
-    order = [(button + k) % n for k in range(1, n + 1) if dealt[(button + k) % n]]
+    order = _deal_order(button, dealt)
     if len(order) == 2:
         small_blind_seat, big_blind_seat = button, order[0]
     else:
@@ -108,6 +108,24 @@ def new_hand(
     first = small_blind_seat if len(order) == 2 else (big_blind_seat + 1) % n
     hand.advance(first, events)
     return hand.freeze(), events
+
+
+def _shuffled(seed: int) -> list[int]:
+    return Rng(seed).derive("deck").permutation(52)
+
+
+def _deal_order(button: int, dealt: tuple[bool, ...]) -> list[int]:
+    """Dealt-in seats from the one left of the button round to the button."""
+    n = len(dealt)
+    return [(button + k) % n for k in range(1, n + 1) if dealt[(button + k) % n]]
+
+
+def dealt_hole_cards(seed: int, button: int, dealt_in: tuple[bool, ...], seat: int) -> tuple[int, int]:
+    """The hole cards `new_hand` deals `seat` from `seed`'s deck, without dealing the hand."""
+    order = _deal_order(button, dealt_in)
+    cards = _shuffled(seed)
+    position = order.index(seat)
+    return cards[position], cards[position + len(order)]
 
 
 def apply_action(state: GameState, action: Action) -> tuple[GameState, list[Event]]:

@@ -164,14 +164,21 @@ class _Walk:
             # Bots share one distribution object among hands decided alike (a class, a bucket).
             groups: dict[int, tuple[dict[AbstractAction, float], list[int]]] = {}
             for hole, distribution in self.bots[seat].policies(view, holes).items():
-                groups.setdefault(id(distribution), (distribution, []))[1].append(hole)
+                group = groups.get(id(distribution))
+                if group is None:
+                    groups[id(distribution)] = (distribution, [hole])
+                else:
+                    group[1].append(hole)
             split: dict[Action, np.ndarray] = {}
             for distribution, members in groups.values():
                 for abstract, probability in distribution.items():
                     action = concrete[abstract]
                     if action not in split:
                         split[action] = np.zeros(len(COMBOS))
-                    split[action][members] += probability
+                    if len(members) == 1:  # a scalar index costs far less than a fancy one
+                        split[action][members[0]] += probability
+                    else:
+                        split[action][members] += probability
             for action, likelihood in split.items():
                 joint = weights * likelihood
                 share = float(joint.sum())

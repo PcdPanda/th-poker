@@ -24,16 +24,26 @@ from   thpoker.analysis.review  import (DecisionReview, REFERENCE, best_option,
                                         thresholds)
 from   thpoker.analysis.stats   import (DecisionRecord, hand_rows,
                                         write_hands_csv)
+from   thpoker.analysis.tracking \
+                                import track
 from   thpoker.bots.abstraction import to_action
+from   thpoker.bots.equity_bot  import public_seed
+from   thpoker.charts           import seats_from_button
 from   thpoker.cli              import (PlaySession, add_device_argument,
-                                        build_config, full_review,
-                                        load_session, parse_args, session_rows)
-from   thpoker.game.cards       import card_str
+                                        build_config, collect_shows,
+                                        full_review, game_name, load_session,
+                                        logged_shows, parse_args,
+                                        plain_history, seat_labels,
+                                        session_histories, session_rows)
+from   thpoker.game.cards       import PREFLOP_CLASSES, card_str
 from   thpoker.game.engine      import is_terminal, observation, replay_states
 from   thpoker.game.evaluator   import describe, evaluate
+from   thpoker.game.rng         import Rng
 from   thpoker.game.rules       import IllegalActionError
 from   thpoker.game.session     import Mode
 from   thpoker.game.state       import Action, ActionType, Event, GameState
+from   thpoker.odds             import (hand_equity, hand_range, hand_window,
+                                        range_share)
 from   thpoker.storage          import (SessionLog, default_decisions_log,
                                         default_log_dir)
 from   thpoker.table            import (EXPLOITS, MIN_HANDS, STYLE_WORDS,
@@ -44,6 +54,7 @@ from   thpoker.text             import (chips_shown, decision_details,
                                         hand_result_text, plain_decision_text)
 import threading
 from   typing                   import Any, NamedTuple
+
 
 STATIC = Path(__file__).resolve().parent / "web_static"
 ASSETS = {
@@ -64,6 +75,13 @@ _PAST = {
     ActionType.RAISE: "raised to",
 }
 _BLINDS = re.compile(r"\d+(\.\d+)?/\d+(\.\d+)?")
+_POSITION = re.compile(r"[A-Z]{2,3}(\+\d)?")
+_HANDS = re.compile(r"[a-z]+(-[a-z]+)*|\d+(\.\d+)?-\d+(\.\d+)?")
+_SET_WORDS = {
+    "pairs": "pairs",
+    "small-aces": "small aces",
+    "suited-connectors": "suited connectors",
+}
 
 
 class WebError(ValueError):
@@ -83,13 +101,63 @@ def _csv(rows: list[dict[str, Any]], filename: str) -> Download:
     return Download(filename, stream.getvalue())
 
 
-def _labels(runner: TableRunner, styled: bool) -> dict[int, str]:
-    """Seat names, with each bot's style in plain words when `styled` and styles are shown."""
-    labels = {} if runner.user_seat is None else {runner.user_seat: "You"}
-    for seat, bot in runner.bots.items():
-        style = styled and not runner.config.hide_styles
-        labels[seat] = f"{bot.name} ({STYLE_WORDS[bot.style.name]})" if style else bot.name
-    return labels
+def _hands_label(classes: tuple[str, ...]) -> str:
+    """A training session's dealt hands in plain words: a named set, a few classes, a share of
+    the strength order, or a count."""
+    for name, words in _SET_WORDS.items():
+        if set(classes) == set(hand_range(name)):
+            return words
+    if len(classes) <= 3:
+        return ", ".join(classes) + " only"
+    window = hand_window(classes)
+    if window is None:
+        return f"{len(classes)} hand types"
+    low, high = window
+    if low == 0:
+        return "any hand" if high == 1 else f"best {_percent(high)}%"
+    return f"worst {_percent(1 - low)}%" if high == 1 else f"top {_percent(low)}-{_percent(high)}%"
+
+
+def _percent(share: float) -> str:
+    """A whole percent, or one decimal where that would read as none or all."""
+    whole = round(100 * share)
+    return str(whole) if 0 < whole < 100 else f"{100 * share:.1f}"
+
+
+def _training(config: TableConfig) -> dict[str, str | None] | None:
+    """A training session's fixed seat (a position code) and dealt hands, for the page."""
+    session = config.session
+    if session.mode != Mode.TRAINING:
+        return None
+    position = session.user_position
+    return {
+        "position": None if position is None else seats_from_button(session.num_seats)[position],
+        "hands": _hands_label(session.user_hands) if session.user_hands else None,
+    }
+
+
+def _hands_json(spec: str) -> dict[str, Any]:
+    """The hands a spec deals, for the setup page's preview."""
+    classes = hand_range(spec)
+    chosen = set(classes)
+    return {
+        "classes": [1.0 if c in chosen else 0.0 for c in PREFLOP_CLASSES],
+        "count": len(classes),
+        "share": round(range_share(classes), 4),
+        "label": _hands_label(classes),
+    }
+
+
+def _result(hand: GameState, user: int, scale: int, all_in_bb: float | None) -> str | None:
+    if not is_terminal(hand) or not hand.dealt_in[user]:
+        return None
+    net = (hand.stacks[user] - hand.starting_stacks[user]) / hand.config.big_blind
+    return hand_result_text(net, all_in_bb, scale, hand.config.big_blind)
+
+
+def _hand_text(history: list[str], plain_result: str | None) -> str:
+    """The hand's progress to copy: its history and result, with no analysis and no styles."""
+    return "\n".join(history + ([plain_result] if plain_result else [])) + "\n"
 
 
 def _strong_mix(hand: GameState, user: int, index: int) -> dict[Action, float]:
@@ -173,14 +241,10 @@ def _coach_json(
     review's expected result from when the chips went in."""
     user = runner.user_seat
     assert user is not None
-    result = None
-    if is_terminal(hand) and hand.dealt_in[user]:
-        net = (hand.stacks[user] - hand.starting_stacks[user]) / hand.config.big_blind
-        result = hand_result_text(net, all_in_bb, scale, hand.config.big_blind)
-    plain, styled = _labels(runner, False), _labels(runner, True)
-    game = "tournament" if runner.config.session.mode == Mode.TOURNAMENT else "cash game"
+    result = _result(hand, user, scale, all_in_bb)
+    plain, styled = seat_labels(runner, False), seat_labels(runner, True)
     big_blind = hand.config.big_blind
-    copy = hand_history_text(hand, user, styled, scale, game, shows) + [""]
+    copy = hand_history_text(hand, user, styled, scale, game_name(runner), shows) + [""]
     decisions = []
     for number, review in enumerate(reviews, 1):
         mix = _strong_mix(hand, user, review.index)
@@ -188,20 +252,14 @@ def _coach_json(
         copy += plain_decision_text(number, review, styled, scale, big_blind, mix) + [""]
     if result is not None:
         copy.append(result)
+    history = plain_history(runner, hand, scale, shows)
     return {
-        "history": hand_history_text(hand, user, plain, scale, game, shows),
+        "history": history,
         "decisions": decisions,
         "result": result,
         "copy_text": "\n".join(copy).strip() + "\n",
+        "hand_text": _hand_text(history, _result(hand, user, scale, None)),
     }
-
-
-def _shows(events: list[Event], shows: dict[str, dict[int, tuple[int, int]]]):
-    """Collect cards a bot showed without a showdown, by hand id."""
-    for event in events:
-        if event.kind == "CardsShown":
-            cards = tuple(event.data["cards"])
-            shows.setdefault(event.data["hand_id"], {})[event.data["seat"]] = (cards[0], cards[1])
 
 
 class WebTable(PlaySession):
@@ -221,6 +279,7 @@ class WebTable(PlaySession):
         self.shows: dict[str, dict[int, tuple[int, int]]] = {}
         self.last_hand: GameState | None = None  # the finished hand already in `rows`
         self.rows: list[dict[str, Any]] = []
+        self.checked: dict[tuple[str, int], DecisionReview] = {}
         self.coach = coach
         super().__init__(TableRunner(config), scale, log, profile)
         self.name = log.path.stem if log is not None else f"web-{config.session.seed}"
@@ -232,7 +291,7 @@ class WebTable(PlaySession):
         return "You" if seat == self.runner.user_seat else self.runner.bots[seat].name
 
     def record(self, events: list[Event]):
-        _shows(events, self.shows)
+        collect_shows(events, self.shows)
         super().record(events)
 
     def hand_over(self):
@@ -241,9 +300,10 @@ class WebTable(PlaySession):
         if hand is None or user is None or hand is self.last_hand:
             return
         self.last_hand = hand
-        mode = "tournament" if self.runner.config.session.mode == Mode.TOURNAMENT else "cash"
+        mode = self.runner.config.session.mode.value.lower()
         today = date.today().isoformat()
-        self.rows += hand_rows([hand], user, self.scale, self.name, today, mode, [])
+        histories = session_histories(self.runner, self.scale, [hand], self.shows)
+        self.rows += hand_rows([hand], user, self.scale, self.name, today, mode, [], histories)
 
     def next_hand(self):
         """Deal the next hand, or for a user out of a tournament play it out to the end."""
@@ -257,6 +317,7 @@ class WebTable(PlaySession):
         if self.knocked_out():
             self.fast_forward()
             return
+        self.checked = {}
         self.lines.append(f"=== Hand {runner.session.hand_number + 1}")
         self.record(runner.start_hand(self.minutes()))
         self.hand_over()
@@ -361,7 +422,7 @@ class WebTable(PlaySession):
                     cards=[card_str(c) for c in cards] if cards else None,
                 )
             seats.append(entry)
-        cash = runner.config.session.mode == Mode.CASH
+        cash = runner.config.session.mode != Mode.TOURNAMENT
         result: dict[str, Any] = {
             "seats": seats,
             "log": self.lines[-80:],
@@ -375,6 +436,7 @@ class WebTable(PlaySession):
             "hands": self.rows[-RECENT_HANDS:],
             "hud_min_hands": MIN_HANDS,
             "acted": view is not None and any(e.seat == user for e in view.history),
+            "training": _training(runner.config),
         }
         if user is not None and cash:
             result["session_net"] = (runner.session.stacks[user] - runner.session.buy_ins[user]) / self.scale
@@ -391,6 +453,9 @@ class WebTable(PlaySession):
             if hand_over and view.dealt_in[view.seat]:
                 net = view.stacks[view.seat] - view.starting_stacks[view.seat]
                 result["hand_result"] = net / self.scale
+            assert hand is not None and user is not None
+            history = plain_history(runner, hand, self.scale, shown)
+            result["hand_text"] = _hand_text(history, _result(hand, user, self.scale, None))
         if runner.user_to_act():
             assert view is not None
             legal = runner.user_legal_actions()
@@ -432,19 +497,21 @@ class WebTable(PlaySession):
         mine = [i for i, e in enumerate(hand.history) if e.seat == user] if hand else []
         if hand is None or user is None or not mine:
             raise WebError("you haven't acted in this hand yet")
-        review = review_decision(
-            hand,
-            user,
-            self.runner.bots,
-            REFERENCE,
-            mine[-1],
-            self.runner.config.payouts,
-            self.profile.min_branch,
-            self.profile.solver_seconds,
-        )
+        key = (hand.hand_id, mine[-1])
+        if key not in self.checked:
+            self.checked[key] = review_decision(
+                hand,
+                user,
+                self.runner.bots,
+                REFERENCE,
+                mine[-1],
+                self.runner.config.payouts,
+                self.profile.min_branch,
+                self.profile.solver_seconds,
+            )
         if self.log is not None and self.runner.user_to_act():
             self.log.append("hint", {"hand_id": hand.hand_id, "index": len(hand.history)})
-        return self._answer(hand, [review])
+        return self._answer(hand, [self.checked[key]])
 
     def review(self) -> dict[str, Any]:
         """The user's last finished hand, which after a fast-forward is not the hand shown."""
@@ -452,8 +519,25 @@ class WebTable(PlaySession):
         playing = current is not None and not is_terminal(current)
         if hand is None or user is None or playing:
             raise WebError("a review needs a finished hand")
-        review = full_review(self.runner, hand, self.profile)
+        reviewed = {i: r for (hand_id, i), r in self.checked.items() if hand_id == hand.hand_id}
+        review = full_review(self.runner, hand, self.profile, reviewed)
         return self._answer(hand, review.decisions, review.all_in_net_bb)
+
+    def chance(self) -> dict[str, Any]:
+        """A training helper: the user's chance to win now against the hands the others likely
+        hold, read from their play with their own policies, as the coach reads them."""
+        runner = self.runner
+        if runner.config.session.mode != Mode.TRAINING:
+            raise WebError("the chance to win is shown in training only")
+        hand, user = runner.hand, runner.user_seat
+        if hand is None or user is None or is_terminal(hand) or hand.folded[user]:
+            raise WebError("the chance to win needs you in a hand being played")
+        hole = hand.hole_cards[user]
+        assert hole is not None
+        ranges = track(hand, user, runner.bots, REFERENCE)[-1].ranges
+        opponents = [weights for seat, weights in ranges.items() if seat != user]
+        seed = public_seed(observation(hand, user))
+        return {"chance": round(hand_equity(hole, hand.board, opponents, Rng(seed)).value, 3)}
 
     def hands_csv(self) -> Download:
         return _csv(self.rows, f"{self.name}.csv")
@@ -469,6 +553,8 @@ def _session_argv(options: dict[str, Any]) -> list[str]:
         "blinds": str,
         "stack": (int, float),
         "seed": int,
+        "position": str,
+        "hands": str,
     }
     for name, kind in fields.items():
         value = options.get(name)
@@ -488,6 +574,11 @@ def _session_argv(options: dict[str, Any]) -> list[str]:
         small, big = map(float, blinds.split("/"))
         if not 0 < small <= big:  # the command line's own check words this for its users
             raise WebError("the small blind must be above 0 and no bigger than the big blind")
+    position, hands = options.get("position"), options.get("hands")
+    if isinstance(position, str) and not _POSITION.fullmatch(position):
+        raise WebError("pick a seat from the list")
+    if isinstance(hands, str) and not _HANDS.fullmatch(hands):
+        raise WebError("hands look like 5-25 (the top 5% to 25% of hands) or pairs")
     for flag, name in (("--hide-styles", "hide_styles"), ("--hints", "coach")):
         if options.get(name) is True:
             argv.append(flag)
@@ -503,7 +594,8 @@ class _Saved(NamedTuple):
     runner: TableRunner
     hands: list[GameState]
     shows: dict[str, dict[int, tuple[int, int]]]
-    rows: list[dict[str, Any]]  # without the review columns
+    rows: list[dict[str, Any]]  # without the review columns or the histories
+    histories: dict[str, str]  # filled when the session's hands are first asked for
 
 
 class App:
@@ -529,6 +621,8 @@ class App:
                 return self._history(method, parts, payload)
             if method == "POST" and parts == ["sessions"]:
                 return self._create(payload)
+            if method == "GET" and len(parts) == 2 and parts[0] == "hands":
+                return _hands_json(parts[1])
             if len(parts) < 2 or parts[0] != "sessions":
                 raise KeyError(parts)
             table = self.tables[parts[1]]
@@ -537,6 +631,8 @@ class App:
                 return table.state()
             if method == "GET" and command == "hands.csv":
                 return table.hands_csv()
+            if method == "GET" and command == "chance":
+                return table.chance()
             if method == "POST" and command == "action":
                 table.act(payload)
                 return table.state()
@@ -558,7 +654,7 @@ class App:
         try:
             args = parse_args(_session_argv(payload))
             config, scale = build_config(args)
-            coach = args.hints if args.hints is not None else config.session.mode == Mode.CASH
+            coach = args.hints if args.hints is not None else config.session.mode != Mode.TOURNAMENT
             log = SessionLog(self.log_dir / f"session-{config.session.seed}.jsonl") if self.log_dir else None
             table = WebTable(config, scale, log, self.profile, coach)
             table.next_hand()
@@ -587,16 +683,16 @@ class App:
         saved = self.saved.get(path)
         if saved is None or saved.modified != modified:
             config, scale, runner, hands, records = load_session(path)
-            shows: dict[str, dict[int, tuple[int, int]]] = {}
-            try:
-                events = [Event.from_dict(r["event"]) for r in records if r["type"] == "event"]
-            except (KeyError, TypeError) as error:
-                raise ValueError(f"damaged log: {error!r}") from error
-            _shows(events, shows)
-            rows = session_rows(path, config, scale, hands, [])
-            saved = _Saved(modified, config, scale, runner, hands, shows, rows)
+            shows = logged_shows(records)
+            rows = session_rows(path, config, scale, hands, [], {})
+            saved = _Saved(modified, config, scale, runner, hands, shows, rows, {})
             self.saved[path] = saved
         return saved
+
+    def _histories(self, saved: _Saved) -> dict[str, str]:
+        if not saved.histories:
+            saved.histories.update(session_histories(saved.runner, saved.scale, saved.hands, saved.shows))
+        return saved.histories
 
     def _decisions(self) -> list[DecisionRecord]:
         """Reviewed decisions for the review columns, which stay blank if that log is damaged."""
@@ -617,12 +713,12 @@ class App:
                 except (OSError, ValueError):
                     continue  # bot-only or damaged logs have nothing to show
                 rows = saved.rows
-                tournament = saved.config.session.mode == Mode.TOURNAMENT
                 listed.append(
                     {
                         "name": name,
                         "date": date.fromtimestamp(saved.modified).isoformat(),
-                        "mode": "tournament" if tournament else "cash",
+                        "mode": saved.config.session.mode.value.lower(),
+                        "training": _training(saved.config),
                         "players": saved.config.session.num_seats,
                         "difficulty": saved.config.tier,
                         "hands": len(rows),
@@ -637,7 +733,7 @@ class App:
                     saved = self._load(path)
                 except (OSError, ValueError):
                     continue
-                rows += session_rows(path, saved.config, saved.scale, saved.hands, decisions)
+                rows += session_rows(path, saved.config, saved.scale, saved.hands, decisions, self._histories(saved))
             return _csv(rows, "thpoker-hands.csv")
         if len(parts) < 2:
             raise KeyError(parts)
@@ -645,7 +741,7 @@ class App:
         saved = self._load(path)
         command = parts[2] if len(parts) > 2 else None
         if method == "GET" and command in (None, "hands.csv"):
-            rows = session_rows(path, saved.config, saved.scale, saved.hands, self._decisions())
+            rows = session_rows(path, saved.config, saved.scale, saved.hands, self._decisions(), self._histories(saved))
             return {"name": path.stem, "rows": rows} if command is None else _csv(rows, f"{path.stem}.csv")
         if method == "POST" and command == "review":
             number = payload.get("hand")

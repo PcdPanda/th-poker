@@ -191,7 +191,16 @@ def test_hand_rows_count_the_chips_put_in_and_join_the_review():
     )
     reviewed = DecisionRecord("s", "hand-7", 0, {}, 1.5, 0.2, "mistake", "raise", None, 0.5)
     other_session = replace(reviewed, session="t", hand_id="hand-8")
-    rows = hand_rows([shown_down, folded_to], 0, 1, "s", "2026-01-02", "cash", [reviewed, other_session])
+    rows = hand_rows(
+        [shown_down, folded_to],
+        0,
+        1,
+        "s",
+        "2026-01-02",
+        "cash",
+        [reviewed, other_session],
+        {"hand-7": "You raise to 300."},
+    )
     picked = [{k: row[k] for k in ("position", "put_in", "result", "showdown", "mistakes", "loss_bb")} for row in rows]
     assert picked == [
         {
@@ -215,5 +224,5 @@ def test_hand_rows_count_the_chips_put_in_and_join_the_review():
     write_hands_csv(rows[:1], stream)
     assert stream.getvalue().splitlines() == [
         ",".join(HAND_COLUMNS),
-        "s,2026-01-02,cash,2,7,BTN,As Kd,2c 3d 7h 8s 9c,300,-300,-3.0,yes,1,1,1.5,",
+        "s,2026-01-02,cash,2,7,BTN,As Kd,2c 3d 7h 8s 9c,300,-300,-3.0,yes,1,1,1.5,,You raise to 300.",
     ]

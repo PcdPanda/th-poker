@@ -10,6 +10,7 @@ thpoker                                    # 6-max cash game, Tier 2 bots
 thpoker --seats 2 --tier 3                 # heads-up against the strongest bots
 thpoker --mode tournament --preset turbo   # a single-table tournament
 thpoker --hide-styles                      # guess the bots' styles as you play
+thpoker --mode training --position BB --hands 0-25  # one seat, the best 25% of hands
 thpoker web                                # the same table in a browser
                                            # (on a phone: run it in Termux or Pydroid)
 

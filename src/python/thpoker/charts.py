@@ -65,6 +65,12 @@ def seat_names(num_players: int) -> list[str]:
     return early + late + ["BTN", "SB", "BB"]
 
 
+def seats_from_button(num_players: int) -> list[str]:
+    """Position names by how many dealt-in seats left of the button they sit (0 is BTN)."""
+    names = seat_names(num_players)
+    return names if num_players == 2 else names[-3:] + names[:-3]
+
+
 @cache
 def _charts() -> dict[str, Any]:
     data = json.loads(gzip.decompress(PUSHFOLD_CHARTS.read_bytes()))

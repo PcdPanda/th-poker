@@ -49,14 +49,20 @@ class DecisionRecord(Record):
     bet_fraction: float | None
 
 
-def record(review: DecisionReview, session: str, hand_id: str, paid_places: int | None = None) -> DecisionRecord:
+def record(
+    review: DecisionReview,
+    session: str,
+    hand_id: str,
+    paid_places: int | None = None,
+    training: bool = False,
+) -> DecisionRecord:
     loss, stderr = review.loss(review.reference)
     assert review.chosen is not None
     return DecisionRecord(
         session,
         hand_id,
         review.index,
-        tags(review, review.tournament, paid_places),
+        tags(review, review.tournament, paid_places, training),
         loss,
         stderr,
         review.verdict(),
@@ -157,12 +163,18 @@ def hand_class(review: DecisionReview) -> str:
     return "marginal" if made or percentile >= 0.4 else "air"
 
 
-def tags(review: DecisionReview, tournament: bool, paid_places: int | None = None) -> dict[str, str]:
-    """The decision's tags. `paid_places` (tournaments) sets the stage."""
+def tags(
+    review: DecisionReview,
+    tournament: bool,
+    paid_places: int | None = None,
+    training: bool = False,
+) -> dict[str, str]:
+    """The decision's tags. `paid_places` (tournaments) sets the stage. Training decisions get
+    their own mode, so the cash measures leave them out."""
     spot = review.situation
     table = "heads-up" if spot.dealt == 2 else "3-5" if spot.dealt <= 5 else "6-8"
     result = {
-        "mode": "tournament" if tournament else "cash",
+        "mode": "training" if training else "tournament" if tournament else "cash",
         "table": table,
         "pot": "heads-up" if spot.players == 2 else "multiway",
         "street": spot.street.value.lower(),
@@ -278,6 +290,7 @@ HAND_COLUMNS = (
     "mistakes",
     "loss_bb",
     "loss_prize_pct",
+    "history",
 )
 
 
@@ -293,10 +306,12 @@ def hand_rows(
     date: str,
     mode: str,
     decisions: list[DecisionRecord],
+    histories: dict[str, str],
 ) -> list[dict[str, Any]]:
     """One row per hand the user was dealt into, in chips as shown on the table, for a
     spreadsheet. Only the user's own cards appear. The review columns come from `decisions`
-    (records written by `thpoker review`) and stay blank for hands never reviewed."""
+    (records written by `thpoker review`) and stay blank for hands never reviewed; `histories`
+    holds each hand's moves as the user saw them, by hand id."""
     reviewed: dict[str, list[DecisionRecord]] = defaultdict(list)
     for decision in decisions:
         if decision.session == session:
@@ -328,6 +343,7 @@ def hand_rows(
                 "mistakes": sum(r.verdict == "mistake" for r in records) if records else "",
                 "loss_bb": round(loss, 2) if loss is not None and not tournament else "",
                 "loss_prize_pct": round(100 * loss, 3) if loss is not None and tournament else "",
+                "history": histories.get(hand.hand_id, ""),
             }
         )
     return rows

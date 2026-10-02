@@ -11,7 +11,8 @@ from   thpoker.game.rng         import Rng
 import thpoker.odds
 from   thpoker.odds             import (Classes, FULL_RANGE, Range, chen_score,
                                         equity_to_reach_top, equity_vs_random,
-                                        hand_equity, range_equities,
+                                        hand_equity, hand_range, hand_window,
+                                        range_equities, range_share,
                                         ranked_range, representative_equities,
                                         texture)
 
@@ -36,6 +37,24 @@ def test_width_cuts_are_unbiased_across_widths():
     widths = [w / 100 for w in range(1, 100)]
     errors = [sum(ranked_range(0.0, w)) - w * len(COMBOS) for w in widths]
     assert abs(sum(errors) / len(errors)) < 10
+
+
+def test_training_hands_come_from_a_strength_window_or_a_named_set():
+    assert len(hand_range("0-100")) == len(PREFLOP_CLASSES)
+    best = hand_range("0-5")
+    assert best[:3] == ("AA", "KK", "QQ") and abs(range_share(best) - 0.05) < 0.01
+    low, high = hand_window(hand_range("25-5"))  # either order
+    assert hand_range("25-5") == hand_range("5-25") and abs(low - 0.05) < 0.01
+    assert abs(high - 0.25) < 0.01
+    (nearest,) = hand_range("40-40.1")  # too narrow for any class: the nearest one
+    assert abs(sum(hand_window([nearest])) / 2 - 0.4) < 0.01
+    assert set(hand_range("pairs")) == {rank * 2 for rank in "AKQJT98765432"}
+    assert hand_window(hand_range("pairs")) is None
+    assert set(hand_range("small-aces")) == {f"A{r}{s}" for r in "98765432" for s in "so"}
+    assert set(hand_range("suited-connectors")) == {a + b + "s" for a, b in zip("AKQJT9876543", "KQJT98765432")}
+    for bad in ("top", "5-", "-5", "5-150", "AKs"):
+        with pytest.raises(ValueError):
+            hand_range(bad)
 
 
 def only(*hands: str) -> Range:

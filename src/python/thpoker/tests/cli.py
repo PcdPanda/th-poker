@@ -4,11 +4,16 @@ from   dataclasses              import replace
 import json
 from   pathlib                  import Path
 import pytest
-from   thpoker.analysis.stats   import DecisionRecord
+from   thpoker.analysis.review  import position_names
+from   thpoker.analysis.stats   import DecisionRecord, progress
+from   thpoker.charts           import seat_names
 from   thpoker.cli              import build_config, main, parse_args
-from   thpoker.game.session     import Mode
-from   thpoker.game.state       import AnteType
+from   thpoker.game.cards       import parse_cards, preflop_class
+from   thpoker.game.engine      import new_hand, observation
+from   thpoker.game.session     import Mode, begin_hand, start_session
+from   thpoker.game.state       import AnteType, GameState
 from   thpoker.storage          import SessionLog
+from   thpoker.text             import pretty_cards
 
 
 def answers(monkeypatch, actions=(), between=(), other="", special=None):
@@ -65,11 +70,42 @@ def test_quick_play_session_runs_and_quits(monkeypatch, capsys):
         ["--mode", "tournament", "--hands-per-level", "5", "--minutes-per-level", "3"],
         ["--preset", "deep"],
         ["--auto-rebuy", "50", "--reset-stacks"],
+        ["--position", "CO"],
+        ["--mode", "tournament", "--hands", "pairs"],
+        ["--mode", "training", "--seats", "3", "--position", "UTG"],
+        ["--mode", "training", "--hands", "top"],
     ],
 )
 def test_invalid_setup_exits_with_an_error(argv, capsys):
     assert main(argv + ["--no-log"]) == 2
     assert "Invalid setup" in capsys.readouterr().err
+
+
+def test_training_keeps_the_user_at_the_chosen_position_every_hand():
+    for seats in range(2, 9):
+        for name in seat_names(seats):
+            argv = ["--mode", "training", "--seats", str(seats), "--position", name.lower()]
+            config, _ = build_config(parse_args(argv))
+            state, _ = start_session(config.session)
+            for _ in range(4):
+                state, setup, _ = begin_hand(state)
+                hand, _ = new_hand(setup.config, setup.seed, setup.button, setup.stacks, setup.dealt_in)
+                assert position_names(observation(hand, 0))[0] == name
+
+
+def test_training_decisions_are_logged_but_kept_out_of_the_measures(monkeypatch, capsys, tmp_path):
+    answers(monkeypatch, between=[""])
+    argv = ["--mode", "training", "--hands", "pairs", "--seed", "8", "--seats", "3"]
+    assert main(argv + ["--log-dir", str(tmp_path), "--training-log", str(tmp_path / "t.jsonl")]) == 0
+    assert "Training session" in capsys.readouterr().out
+    log, decisions = tmp_path / "session-8.jsonl", tmp_path / "decisions.jsonl"
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    dealt = [GameState.from_dict(r["hand"]).hole_cards[0] for r in records if r["type"] == "hand"]
+    assert len(dealt) == 2 and all(cards and len(preflop_class(*cards)) == 2 for cards in dealt)
+    assert main(["review", str(log), "--decisions-log", str(decisions)]) == 0
+    reviewed = DecisionRecord.read(decisions, "decision")
+    assert reviewed and {r.tags["mode"] for r in reviewed} == {"training"}
+    assert progress(reviewed) is None
 
 
 def test_a_logged_session_can_be_reviewed_after_a_hand_and_later(monkeypatch, capsys, tmp_path):
@@ -95,6 +131,8 @@ def test_a_logged_session_can_be_reviewed_after_a_hand_and_later(monkeypatch, ca
     rows = list(csv.DictReader(out.open(encoding="utf-8")))
     logged = [r["hand"]["hand_id"].removeprefix("hand-") for r in hands if r["type"] == "hand"]
     assert [row["hand"] for row in rows] == logged
+    for row in rows:
+        assert f"your cards {pretty_cards(parse_cards(row['cards']))}" in row["history"]
     reviewed = DecisionRecord.read(Path(decisions), "decision")
     assert sum(int(row["decisions"] or 0) for row in rows) == len(reviewed) > 0
 

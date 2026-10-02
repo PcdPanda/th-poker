@@ -1,10 +1,18 @@
+import csv
 import http.client
+import io
 import json
+import numpy as np
 import pytest
 from   thpoker.analysis.ev      import PROFILES
+import thpoker.analysis.review
+from   thpoker.bots.equity_bot  import public_seed
 from   thpoker.cli              import build_config, parse_args
-from   thpoker.game.cards       import card_str
+from   thpoker.game.cards       import COMBOS, card_str, parse_cards
+from   thpoker.game.engine      import observation
+from   thpoker.game.rng         import Rng
 from   thpoker.game.state       import Action, ActionType
+from   thpoker.odds             import hand_equity
 from   thpoker.storage          import read_session_log
 import thpoker.table
 from   thpoker.tests.text       import fold_to_a_bet
@@ -13,6 +21,7 @@ from   thpoker.web              import (App, Download, MAX_SESSIONS, WebError,
                                         WebTable, _decision_json, serve)
 import threading
 from   typing                   import Any
+
 
 SETUP = {"mode": "cash", "seats": 3, "tier": 1, "seed": 8}
 
@@ -232,7 +241,11 @@ def test_the_move_check_matches_the_hand_review_and_counts_as_a_hint(tmp_path):
     checked = call(app, "POST", ["sessions", key, "analyze"], {})
     hidden = hidden_cards(app, key)
     assert hidden and not any(card in checked["copy_text"] for card in hidden)
-    # Fold to any bet (checking when it is free). With seed 8 a bot folds before the user acts,
+    # The hand alone, as played so far, for the copy without the coach.
+    assert checked["hand_text"] == "\n".join(checked["history"]) + "\n"
+    hand_text = call(app, "GET", ["sessions", key], {})["hand_text"]
+    assert hand_text == checked["hand_text"] and not any(card in hand_text for card in hidden)
+    # Fold to any bet (checking when it is free): With seed 8 a bot folds before the user acts,
     # so its cards are never shown.
     while state["your_turn"]:
         kind = "fold" if state["legal"]["call"] is not None else "check"
@@ -242,9 +255,103 @@ def test_the_move_check_matches_the_hand_review_and_counts_as_a_hint(tmp_path):
     assert checked["decisions"][0] == reviewed["decisions"][0]
     hidden = hidden_cards(app, key)
     assert hidden and not any(card in reviewed["copy_text"] for card in hidden)
+    row = call(app, "GET", ["sessions", key], {})["hands"][-1]
+    assert f"your cards {pretty_cards(parse_cards(row['cards']))}" in row["history"]
+    assert not any(card in row["history"] for card in hidden)
+    *history, result = reviewed["hand_text"].splitlines()
+    assert history == reviewed["history"] and reviewed["result"].startswith(result)
+    assert "With the cards" not in result  # the all-in average is the coach's, not the hand's
     (log,) = tmp_path.glob("session-*.jsonl")
     hints = [r for r in read_session_log(log) if r["type"] == "hint"]
     assert len(hints) == 1 + went_on  # the hint, and the check if play went on
+
+
+def test_the_hand_review_reuses_the_moves_already_checked(monkeypatch):
+    app = App(None)
+    key = call(app, "POST", ["sessions"], SETUP)["id"]
+    for _ in range(20):  # Check every move in a hand with two or more
+        your_turn(app, key)
+        state, checked = call(app, "GET", ["sessions", key], {}), []
+        while state["your_turn"]:
+            kind = "check" if state["legal"]["check"] else "call"
+            state = call(app, "POST", ["sessions", key, "action"], {"kind": kind})
+            checked.append(call(app, "POST", ["sessions", key, "analyze"], {})["decisions"][0])
+        state = play_out(app, key)
+        if len(checked) >= 2:
+            break
+    else:
+        pytest.fail("no hand with two decisions")
+    app.tables[key].checked.pop(min(app.tables[key].checked))  # as if the first was not checked
+    computed = []
+    original = thpoker.analysis.review._review_decision
+
+    def counted(*args: Any) -> Any:
+        computed.append(args[0])
+        return original(*args)
+
+    monkeypatch.setattr(thpoker.analysis.review, "_review_decision", counted)
+    reviewed = call(app, "POST", ["sessions", key, "review"], {})["decisions"]
+    assert len(computed) == 1 and reviewed == checked
+
+
+def test_a_training_session_holds_the_seat_and_deals_the_chosen_hands(tmp_path):
+    app = App(tmp_path)
+    setup = {**SETUP, "mode": "training", "seats": 4, "position": "BB", "hands": "pairs"}
+    created = call(app, "POST", ["sessions"], setup)
+    key, state = created["id"], created["state"]
+    assert state["coach"] and state["training"] == {"position": "BB", "hands": "pairs"}
+    for _ in range(5):
+        me = state["seats"][0]
+        assert me["position"] == "BB" and me["cards"][0][0] == me["cards"][1][0]
+        play_out(app, key)
+        state = call(app, "POST", ["sessions", key, "next"], {})
+    assert {row["mode"] for row in state["hands"]} == {"training"}
+    (saved,) = call(app, "GET", ["history"], {})["sessions"]
+    assert saved["mode"] == "training" and saved["training"] == state["training"]
+    preview = call(app, "GET", ["hands", "0-5"], {})
+    assert preview["label"] == "best 5%" and preview["classes"][0] == 1.0  # AA
+    with pytest.raises(ValueError, match="unknown hands"):
+        call(app, "GET", ["hands", "top"], {})
+    with pytest.raises(WebError, match="seat"):
+        call(app, "POST", ["sessions"], {**setup, "position": "--seed"})
+
+
+@pytest.mark.parametrize(
+    "spec, label",
+    [
+        ("25-50", "top 25-50%"),
+        ("50-100", "worst 50%"),
+        ("0-1", "AA, KK only"),
+        ("0.5-5", "top 0.5-5%"),  # top 0.5-5%; note the best AA is left out
+        ("0-100", "any hand"),
+        ("small-aces", "small aces"),
+    ],
+)
+def test_training_hands_are_named_from_the_classes_dealt(spec, label):
+    assert call(App(None), "GET", ["hands", spec], {})["label"] == label
+
+
+def test_training_shows_the_chance_to_win_against_the_likely_hands():
+    app = App(None)
+    setup = {**SETUP, "mode": "training", "seats": 2, "position": "BTN", "hands": "0-0.1"}
+    created = call(app, "POST", ["sessions"], setup)
+    key, state = created["id"], created["state"]
+    assert state["your_turn"] and [c[0] for c in state["seats"][0]["cards"]] == ["A", "A"]
+    # First to act heads-up, so against any two cards: aces win 85.2% of the time.
+    assert call(app, "GET", ["sessions", key, "chance"], {}) == {"chance": 0.852}
+    state = call(app, "POST", ["sessions", key, "action"], {"kind": "call"})
+    # With seed 8 the big blind checks before and after the flop: weaker than any two cards.
+    hand = app.tables[key].runner.hand
+    assert state["your_turn"] and len(hand.board) == 3 and hand.hole_cards[0] is not None
+    seed = public_seed(observation(hand, 0))
+    any_two = hand_equity(hand.hole_cards[0], hand.board, [np.ones(len(COMBOS))], Rng(seed))
+    assert call(app, "GET", ["sessions", key, "chance"], {})["chance"] > any_two.value + 0.02
+    play_out(app, key)
+    with pytest.raises(WebError, match="hand being played"):
+        call(app, "GET", ["sessions", key, "chance"], {})
+    cash = call(app, "POST", ["sessions"], SETUP)["id"]
+    with pytest.raises(WebError, match="training only"):
+        call(app, "GET", ["sessions", cash, "chance"], {})
 
 
 def test_the_coach_is_off_in_tournaments_unless_asked_for():
@@ -280,7 +387,9 @@ def test_past_sessions_read_back_the_same_hands_as_the_live_table(tmp_path):
     assert review["copy_text"].startswith("No-limit Texas Hold'em cash game")
     assert review["copy_text"].count(review["result"]) == 1 and review["result"] not in review["history"]
     everything = app.handle("GET", ["history.csv"], {})
-    assert isinstance(everything, Download) and len(everything.text.splitlines()) == 2
+    assert isinstance(everything, Download)
+    (exported,) = csv.DictReader(io.StringIO(everything.text))
+    assert exported["history"] == live["hands"][0]["history"]
     download = app.handle("GET", ["history", saved["name"], "hands.csv"], {})
     assert isinstance(download, Download) and download.text.splitlines()[1].startswith(saved["name"])
     for name in ("..", "session-0"):  # only listed logs can be read

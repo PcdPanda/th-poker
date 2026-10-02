@@ -18,6 +18,7 @@ from   thpoker.game.engine      import observation, replay_states
 from   thpoker.game.state       import Action, GameState
 
 REFERENCE_FLOOR = 0.02
+_HOLDING = [[i for i, combo in enumerate(COMBOS) if card in combo] for card in range(52)]
 
 
 @dataclass(frozen=True)
@@ -71,13 +72,14 @@ def track(
     for seat in live:
         weights = np.ones(len(COMBOS))
         if seat != user_seat:
-            weights[[i for i, c in enumerate(COMBOS) if set(c) & set(user_cards)]] = 0.0
+            for card in user_cards:
+                weights[_HOLDING[card]] = 0.0
         ranges[seat] = weights
     snapshots = []
     for index, state in enumerate(states):
-        dead = set(state.board)
         for weights in ranges.values():
-            weights[[i for i, c in enumerate(COMBOS) if set(c) & set(dead)]] = 0.0
+            for card in state.board:
+                weights[_HOLDING[card]] = 0.0
         in_hand = [s for s in live if not state.folded[s]]
         snapshots.append(Snapshot(state, {s: ranges[s] / ranges[s].sum() for s in in_hand}))
         if index == len(hand.history):

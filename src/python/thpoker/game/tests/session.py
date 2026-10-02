@@ -1,8 +1,8 @@
 from   dataclasses              import replace
-
 import pytest
-
+from   thpoker.game.cards       import preflop_class
 from   thpoker.game.engine      import apply_action, new_hand
+from   thpoker.game.rng         import Rng
 from   thpoker.game.session     import (BlindLevel, Mode, SessionConfig,
                                         SessionError, TournamentConfig,
                                         begin_hand, blind_level,
@@ -19,6 +19,18 @@ def tournament(num_seats: int, hands_per_level: int = 15) -> SessionConfig:
 
 def cash(num_seats: int, **options) -> SessionConfig:
     return SessionConfig(Mode.CASH, 11, num_seats, 10_000, cash_blinds=GameConfig(num_seats), **options)
+
+
+def training(num_seats: int, **options) -> SessionConfig:
+    return SessionConfig(
+        Mode.TRAINING,
+        11,
+        num_seats,
+        10_000,
+        cash_blinds=GameConfig(num_seats),
+        reset_stacks_each_hand=True,
+        **options,
+    )
 
 
 def finished_hand(starting: tuple[int, ...], ending: tuple[int, ...], big_blind_seat: int) -> GameState:
@@ -166,10 +178,39 @@ def test_minute_levels_follow_elapsed_time_and_never_go_back():
     assert setup.config.big_blind == 400 and events == []
 
 
+def test_training_deals_the_user_only_its_chosen_hands_and_replays_from_the_seed():
+    def dealt(config):
+        state, _ = start_session(config)
+        cards = []
+        for _ in range(30):
+            state, setup, _ = begin_hand(state)
+            hand, _ = new_hand(setup.config, setup.seed, setup.button, setup.stacks, setup.dealt_in)
+            cards.append(hand.hole_cards[0])
+        return cards
+
+    suited = dealt(training(6, user_hands=("AKs",)))
+    assert {preflop_class(*c) for c in suited} == {"AKs"} and len(set(suited)) > 1
+    assert dealt(training(6, user_hands=("AKs",))) == suited
+    mixed = dealt(training(3, user_hands=("22", "T9s", "72o")))
+    assert {preflop_class(*c) for c in mixed} == {"22", "T9s", "72o"}
+
+
+def test_other_sessions_keep_the_seed_drawn_for_each_hand():
+    state, _ = start_session(cash(6))
+    for number in range(1, 6):
+        state, setup, _ = begin_hand(state)
+        assert setup.seed == Rng(11).derive("hand", number).randbelow(1 << 63)
+
+
 @pytest.mark.parametrize(
     "build, message",
     [
         (lambda: SessionConfig(Mode.CASH, 1, 9, 100, cash_blinds=GameConfig(8)), "num_seats"),
+        (lambda: cash(3, user_position=1), "training session's user"),
+        (lambda: training(3, user_seat=None, user_hands=("AA",)), "training session's user"),
+        (lambda: training(3, user_position=3), "user position"),
+        (lambda: training(3, user_hands=("AKx",)), "unknown starting hands"),
+        (lambda: replace(training(3), reset_stacks_each_hand=False), "resets stacks"),
         (lambda: SessionConfig(Mode.CASH, 1, 3, 100), "needs cash_blinds"),
         (lambda: SessionConfig(Mode.CASH, 1, 3, 100, cash_blinds=GameConfig(2)), "must equal"),
         (
