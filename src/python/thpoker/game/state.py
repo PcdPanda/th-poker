@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from   dataclasses              import dataclass, fields
-from   enum                     import Enum
+import enum
 from   typing                   import Any
 
 
-class ActionType(str, Enum):
+class ActionType(enum.StrEnum):
     FOLD = "FOLD"
     CHECK = "CHECK"
     CALL = "CALL"
@@ -15,7 +15,7 @@ class ActionType(str, Enum):
     RAISE = "RAISE"
 
 
-class Street(str, Enum):
+class Street(enum.StrEnum):
     PREFLOP = "PREFLOP"
     FLOP = "FLOP"
     TURN = "TURN"
@@ -23,7 +23,7 @@ class Street(str, Enum):
     COMPLETE = "COMPLETE"
 
 
-class AnteType(str, Enum):
+class AnteType(enum.StrEnum):
     NONE = "NONE"
     PER_PLAYER = "PER_PLAYER"
     BIG_BLIND_ANTE = "BIG_BLIND_ANTE"
@@ -265,7 +265,7 @@ class Observation:
 
 
 def _encode(value: Any) -> Any:
-    if isinstance(value, Enum):
+    if isinstance(value, enum.Enum):
         return value.value
     if hasattr(value, "to_dict"):
         return value.to_dict()

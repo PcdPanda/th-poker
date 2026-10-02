@@ -21,12 +21,11 @@ from   dataclasses              import dataclass
 from   functools                import cache, lru_cache
 import gzip
 import json
-from   pathlib                  import Path
-
 import numpy as np
-
+from   pathlib                  import Path
+import re
 from   thpoker.game.cards       import (COMBOS, COMBOS_OF_CLASS, COMBO_CARDS,
-                                        COMBO_CLASS, PREFLOP_CLASSES,
+                                        COMBO_CLASS, PREFLOP_CLASSES, RANKS,
                                         combo_index, rank_of, suit_of)
 from   thpoker.game.evaluator   import evaluate_combos
 from   thpoker.game.rng         import Rng
@@ -69,11 +68,13 @@ def _percentiles() -> tuple[float, ...]:
 PREFLOP_PERCENTILE = _percentiles()
 
 
+@lru_cache(maxsize=256)
 def ranked_range(low: float, high: float) -> Range:
     """Combos whose preflop percentile is in [low, high); (0, 0.2) is roughly the best 20%."""
     return tuple(1.0 if low <= p < high else 0.0 for p in PREFLOP_PERCENTILE)
 
 
+_COMBO_CLASSES = np.array(COMBO_CLASS)
 RUNOUT_SAMPLES = 24
 # More runouts when nobody can bet any more: the value is then all there is to estimate.
 SETTLED_FLOP_SAMPLES = 96
@@ -179,6 +180,66 @@ def equity_to_reach_top(fraction: float) -> float:
     return ordered[min(len(ordered) - 1, max(0, round(fraction * len(ordered)) - 1))]
 
 
+# Named sets of starting hands for training (`hand_range`).
+HAND_SETS = ("pairs", "small-aces", "suited-connectors")
+_WINDOW = re.compile(r"(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)")
+
+
+@cache
+def _strength_order() -> tuple[tuple[str, float, float], ...]:
+    """Every class, strongest first by equity against any two cards, with the share of all deals
+    before it and through it."""
+    by_class = _equity_vs_random_by_class()
+    order, start = [], 0
+    for klass in sorted(range(len(PREFLOP_CLASSES)), key=by_class.__getitem__, reverse=True):
+        name = PREFLOP_CLASSES[klass]
+        end = start + len(COMBOS_OF_CLASS[name])
+        order.append((name, start / len(COMBOS), end / len(COMBOS)))
+        start = end
+    return tuple(order)
+
+
+def hand_range(spec: str) -> tuple[str, ...]:
+    """Starting-hand classes for a spec: "X-Y" for the top X% to Y% of deals (a class is in when
+    the middle of its share is; a window too narrow for any class takes the nearest one), or a
+    name from `HAND_SETS`. Raises `ValueError` for anything else."""
+    if spec == "pairs":
+        return tuple(c for c in PREFLOP_CLASSES if len(c) == 2)
+    if spec == "small-aces":
+        return tuple(c for c in PREFLOP_CLASSES if c[0] == "A" and c[1] in "23456789")
+    if spec == "suited-connectors":
+        return tuple(c for c in PREFLOP_CLASSES if c[2:] == "s" and RANKS.index(c[0]) == RANKS.index(c[1]) + 1)
+    match = _WINDOW.fullmatch(spec)
+    if match is None:
+        raise ValueError(
+            f"unknown hands {spec!r}: give X-Y for the top X% to Y% of hands, or one of {', '.join(HAND_SETS)}"
+        )
+    low, high = sorted(float(x) / 100 for x in match.groups())
+    if high > 1:
+        raise ValueError("hand shares go from 0 to 100")
+    order = _strength_order()
+    chosen = tuple(name for name, start, end in order if low <= (start + end) / 2 < high)
+    if chosen:
+        return chosen
+    center = (low + high) / 2
+    return (min((abs((start + end) / 2 - center), name) for name, start, end in order)[1],)
+
+
+def hand_window(classes: Iterable[str]) -> tuple[float, float] | None:
+    """The shares of deals before and through `classes` when they are a run of the strength
+    order, else None."""
+    chosen = set(classes)
+    run = [(start, end) for name, start, end in _strength_order() if name in chosen]
+    if not run or any(a[1] != b[0] for a, b in zip(run, run[1:])):
+        return None
+    return run[0][0], run[-1][1]
+
+
+def range_share(classes: Iterable[str]) -> float:
+    """The share of all deals that fall in `classes`."""
+    return sum(len(COMBOS_OF_CLASS[c]) for c in classes) / len(COMBOS)
+
+
 @dataclass(frozen=True)
 class Classes:
     """Class-level inputs: equity of row class against column class, card-disjoint combo pairs
@@ -227,58 +288,68 @@ def caller_share(equity: np.ndarray | float, in_position: bool, behind: int = 0)
     return np.clip(equity * realization * (1 + _STRENGTH_SLOPE * (equity - 0.5)), 0.0, 1.0)
 
 
-def _share(hero: int, weights: Weights, values: dict[int, int]) -> tuple[float, float]:
-    """The part of a range the hero beats (ties count half), and the range weight still
-    possible on this board."""
-    total = won = 0.0
-    for index, value in values.items():
-        weight = weights[index]
-        if weight:
-            total += weight
-            won += weight if hero > value else weight / 2 if hero == value else 0.0
-    return (won / total if total else 0.0), total
+def _total(values: np.ndarray) -> float:
+    """The sum added left to right, like a plain loop: `np.sum` adds pairwise and can differ in
+    the last bit, which would move bot decisions that sit on a threshold."""
+    return float(np.cumsum(values)[-1]) if len(values) else 0.0
 
 
-def _live_combos(dead: set[int], ranges: Sequence[Weights]) -> list[int]:
+def _arrays(ranges: Sequence[Weights]) -> list[np.ndarray]:
+    return [np.asarray(weights, dtype=float) for weights in ranges]
+
+
+def _live_combos(dead: set[int], ranges: list[np.ndarray]) -> np.ndarray:
     """Combos that avoid `dead` and have weight in at least one range."""
-    return [
-        index
-        for index, (a, b) in enumerate(COMBOS)
-        if a not in dead and b not in dead and any(weights[index] for weights in ranges)
-    ]
+    keep = np.zeros(len(COMBOS), dtype=bool)
+    for weights in ranges:
+        keep |= weights != 0
+    keep &= ~np.isin(COMBO_CARDS, list(dead)).any(axis=1)
+    return np.flatnonzero(keep)
+
+
+@lru_cache(maxsize=128)
+def _value_array(board: tuple[int, ...]) -> np.ndarray:
+    """`_board_values` by combo index, -1 for combos that use a board card."""
+    values = np.full(len(COMBOS), -1, dtype=np.int64)
+    board_values = _board_values(board)
+    values[list(board_values)] = list(board_values.values())
+    values.flags.writeable = False  # shared by the cache
+    return values
 
 
 def _board_equity(
-    hole: tuple[int, int], board: tuple[int, ...], ranges: Sequence[Weights], live: list[int]
+    hole: tuple[int, int], board: tuple[int, ...], ranges: list[np.ndarray], live: np.ndarray
 ) -> tuple[float, float]:
     """Equity on one complete board, and that board's weight: the product of the opponents'
     range weight still possible on it. Weighting boards this way makes the average over boards
-    match drawing the opponents' hands and the board together."""
-    board_values = _board_values(board)
-    values = {i: board_values[i] for i in live if i in board_values}
-    hero = board_values[combo_index(*hole)]
+    match drawing the opponents' hands and the board together. Ties count half."""
+    values = _value_array(board)
+    hero = values[combo_index(*hole)]
+    live_values = values[live]
+    possible = live[live_values >= 0]
+    live_values = live_values[live_values >= 0]
+    beaten, tied = live_values < hero, live_values == hero
     equity = weight = 1.0
     for weights in ranges:
-        share, total = _share(hero, weights, values)
-        equity *= share
+        mass = weights[possible]
+        total = _total(mass)
+        won = _total(np.where(beaten, mass, np.where(tied, mass / 2, 0.0)))
+        equity *= won / total if total else 0.0
         weight *= total
     return equity, weight
 
 
-def _preflop_equity(hole: tuple[int, int], ranges: Sequence[Weights]) -> Equity:
+def _preflop_equity(hole: tuple[int, int], ranges: list[np.ndarray]) -> Equity:
     table, table_stderr = preflop_table()
-    row = table[COMBO_CLASS[combo_index(*hole)]]
+    row = np.asarray(table[COMBO_CLASS[combo_index(*hole)]])[_COMBO_CLASSES]
+    blocked = np.isin(COMBO_CARDS, hole).any(axis=1)
     equity = 1.0
     for weights in ranges:
-        total = won = 0.0
-        for index, (a, b) in enumerate(COMBOS):
-            weight = weights[index]
-            if weight and a not in hole and b not in hole:
-                total += weight
-                won += weight * row[COMBO_CLASS[index]]
+        kept = (weights != 0) & ~blocked
+        total = _total(weights[kept])
         if not total:
             raise ValueError("an opponent range is empty after card removal")
-        equity *= won / total
+        equity *= _total(weights[kept] * row[kept]) / total
     return Equity(equity, table_stderr, exact=False)
 
 
@@ -295,16 +366,17 @@ def hand_equity(hole: tuple[int, int], board: tuple[int, ...], ranges: Sequence[
         raise ValueError("equity needs at least one opponent range")
     if len(board) not in (0, 3, 4, 5):
         raise ValueError(f"board must have 0, 3, 4, or 5 cards, got {len(board)}")
+    arrays = _arrays(ranges)
     if not board:
-        return _preflop_equity(hole, ranges)
-    live = _live_combos(set(hole) | set(board), ranges)
+        return _preflop_equity(hole, arrays)
+    live = _live_combos(set(hole) | set(board), arrays)
     if len(board) == 5:
-        equity, weight = _board_equity(hole, board, ranges, live)
+        equity, weight = _board_equity(hole, board, arrays, live)
         if not weight:
             raise ValueError("an opponent range is empty after card removal")
         # Against several opponents the per-opponent product is still an approximation.
         return Equity(equity, 0.0, exact=len(ranges) == 1)
-    return _sampled_equity(hole, _completions(board, RUNOUT_SAMPLES, rng), ranges, live)
+    return _sampled_equity(hole, _completions(board, RUNOUT_SAMPLES, rng), arrays, live)
 
 
 def _completions(board: tuple[int, ...], count: int, rng: Rng) -> list[tuple[int, ...]]:
@@ -323,7 +395,7 @@ def _completions(board: tuple[int, ...], count: int, rng: Rng) -> list[tuple[int
 
 
 def _sampled_equity(
-    hole: tuple[int, int], boards: list[tuple[int, ...]], ranges: Sequence[Weights], live: list[int]
+    hole: tuple[int, int], boards: list[tuple[int, ...]], ranges: list[np.ndarray], live: np.ndarray
 ) -> Equity:
     """The board-weighted mean over sampled complete boards; a board that uses one of this
     hand's cards is skipped for this hand."""
@@ -346,11 +418,12 @@ def settled_equity(hole: tuple[int, int], board: tuple[int, ...], ranges: Sequen
         return hand_equity(hole, board, ranges, rng)
     if not ranges:
         raise ValueError("equity needs at least one opponent range")
-    live = _live_combos(set(hole) | set(board), ranges)
+    arrays = _arrays(ranges)
+    live = _live_combos(set(hole) | set(board), arrays)
     if len(board) == 3:
-        return _sampled_equity(hole, _completions(board, SETTLED_FLOP_SAMPLES, rng), ranges, live)
+        return _sampled_equity(hole, _completions(board, SETTLED_FLOP_SAMPLES, rng), arrays, live)
     rivers = [board + (c,) for c in range(52) if c not in board and c not in hole]
-    samples = [_board_equity(hole, full, ranges, live) for full in rivers]
+    samples = [_board_equity(hole, full, arrays, live) for full in rivers]
     total = sum(w for _, w in samples)
     if not total:
         raise ValueError("an opponent range is empty after card removal")

@@ -5,16 +5,19 @@ and `end_hand` folds a finished hand back into the session.
 """
 
 from   dataclasses              import dataclass, replace
-from   enum                     import Enum
-
+import enum
+from   thpoker.game.cards       import (COMBO_CLASS, PREFLOP_CLASSES,
+                                        combo_index)
+from   thpoker.game.engine      import dealt_hole_cards
 from   thpoker.game.rng         import Rng
 from   thpoker.game.state       import (AnteType, ConfigError, Event,
                                         GameConfig, GameState, Street)
 
 
-class Mode(str, Enum):
+class Mode(enum.StrEnum):
     CASH = "CASH"
     TOURNAMENT = "TOURNAMENT"
+    TRAINING = "TRAINING"
 
 
 class SessionError(ValueError):
@@ -31,7 +34,7 @@ class BlindLevel:
 # Big blind per level as a multiple of the level-1 big blind; levels past the end double.
 _LEVEL_MULTIPLES = (1, 1.5, 2, 3, 4, 6, 8, 10, 15, 20, 30, 40, 60, 80, 100)
 _FIRST_ANTE_LEVEL = 4  # zero-based: antes start at level 5
-
+MAX_DEALS = 20_000
 # preset name -> (starting stack in level-1 big blinds, hands per level)
 TOURNAMENT_PRESETS = {"turbo": (50, 8), "regular": (100, 15), "deep": (150, 25)}
 
@@ -100,7 +103,9 @@ class TournamentConfig:
 @dataclass(frozen=True)
 class SessionConfig:
     """Rules of a session. `user_seat` None means a bot-only session. Cash blinds live in
-    `cash_blinds`; a tournament takes its blinds from `tournament` instead."""
+    `cash_blinds`; a tournament takes its blinds from `tournament` instead. Training may keep
+    the user `user_position` dealt-in seats left of the button every hand (0 is the button) and
+    deal it only the classes in `user_hands` ("AA", "AKs", ...; empty for any hand)."""
 
     mode: Mode
     seed: int
@@ -112,6 +117,8 @@ class SessionConfig:
     auto_rebuy: bool = False
     rebuy_threshold: int = 0
     tournament: TournamentConfig | None = None
+    user_position: int | None = None
+    user_hands: tuple[str, ...] = ()
 
     def __post_init__(self):
         if not 2 <= self.num_seats <= 8:
@@ -120,7 +127,17 @@ class SessionConfig:
             raise ConfigError(f"user seat {self.user_seat} is outside 0..{self.num_seats - 1}")
         if self.starting_stack <= 0:
             raise ConfigError(f"starting stack must be > 0, got {self.starting_stack}")
-        if self.mode == Mode.CASH:
+        if self.user_position is not None or self.user_hands:
+            if self.mode != Mode.TRAINING or self.user_seat is None:
+                raise ConfigError("a fixed seat and chosen hands need a training session's user")
+            if self.user_position is not None and not 0 <= self.user_position < self.num_seats:
+                raise ConfigError(f"user position must be 0..{self.num_seats - 1}")
+            unknown = set(self.user_hands) - set(PREFLOP_CLASSES)
+            if unknown:
+                raise ConfigError(f"unknown starting hands {sorted(unknown)}")
+        if self.mode != Mode.TOURNAMENT:
+            if self.mode == Mode.TRAINING and not self.reset_stacks_each_hand:
+                raise ConfigError("training resets stacks every hand")
             if self.cash_blinds is None or self.tournament is not None:
                 raise ConfigError("a cash session needs cash_blinds and no tournament")
             if self.cash_blinds.num_seats != self.num_seats:
@@ -210,7 +227,7 @@ def begin_hand(state: SessionState, elapsed_minutes: float = 0.0) -> tuple[Sessi
     stacks = list(state.stacks)
     buy_ins = list(state.buy_ins)
     level = state.level
-    if config.mode == Mode.CASH:
+    if config.mode != Mode.TOURNAMENT:
         assert config.cash_blinds is not None  # checked by SessionConfig
         game_config = config.cash_blinds
         for seat in range(n):
@@ -252,7 +269,7 @@ def begin_hand(state: SessionState, elapsed_minutes: float = 0.0) -> tuple[Sessi
     number = state.hand_number + 1
     setup = HandSetup(
         config=game_config,
-        seed=Rng(config.seed).derive("hand", number).randbelow(1 << 63),
+        seed=_hand_seed(config, number, button, dealt_in),
         button=button,
         stacks=tuple(stacks),
         dealt_in=dealt_in,
@@ -269,8 +286,31 @@ def begin_hand(state: SessionState, elapsed_minutes: float = 0.0) -> tuple[Sessi
     return new_state, setup, events
 
 
+def _hand_seed(config: SessionConfig, number: int, button: int, dealt_in: tuple[bool, ...]) -> int:
+    """The seed of hand `number`. With chosen hands it is redrawn until the user is dealt one;
+    every try derives from the session seed, so the session still replays from it."""
+    rng = Rng(config.seed)
+    seed = rng.derive("hand", number).randbelow(1 << 63)
+    user = config.user_seat
+    if not config.user_hands or user is None or not dealt_in[user]:
+        return seed
+    wanted = {PREFLOP_CLASSES.index(name) for name in config.user_hands}
+    tries = 1
+    while COMBO_CLASS[combo_index(*dealt_hole_cards(seed, button, dealt_in, user))] not in wanted:
+        if tries == MAX_DEALS:
+            raise SessionError(f"no hand from {len(wanted)} chosen classes in {MAX_DEALS} deals")
+        seed = rng.derive("hand", number, tries).randbelow(1 << 63)
+        tries += 1
+    return seed
+
+
 def _next_button(state: SessionState, dealt_in: tuple[bool, ...]) -> int:
     n = state.config.num_seats
+    user = state.config.user_seat
+    if state.config.user_position is not None and user is not None and dealt_in[user]:
+        # The button sits `user_position` dealt-in seats to the user's right.
+        right = [s for s in ((user - k) % n for k in range(n)) if dealt_in[s]]
+        return right[state.config.user_position % len(right)]
     if state.button is None:
         start = Rng(state.config.seed).derive("button").randbelow(n)
         return next(s for s in ((start + k) % n for k in range(n)) if dealt_in[s])

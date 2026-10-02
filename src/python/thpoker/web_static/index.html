@@ -8,33 +8,55 @@
 </head>
 <body>
   <header id="bar">
-    <span class="brand">Hold'em trainer</span>
+    <span class="brand">♠ Hold'em trainer</span>
+    <span id="training-pill" class="pill" hidden title="Stacks reset every hand; these hands don't count in your results"></span>
     <label class="toggle" id="helpers-toggle" hidden title="Hide pot odds, hand names, chips-in-the-pot totals and player stats, as at a real table">
       <input type="checkbox" id="hide-helpers"> Hide helpers
     </label>
+    <a href="#glossary" id="words-link">Poker words</a>
     <button type="button" id="new-game" class="link" hidden>New game</button>
   </header>
   <main>
     <section id="setup">
       <h1>Play Texas Hold'em against computer players</h1>
-      <p class="lead">A coach can explain any decision, during the hand or after it. New to poker? The poker words are explained at the bottom of the page.</p>
       <form id="setup-form">
-        <fieldset>
+        <fieldset class="tiles">
           <legend>Game</legend>
-          <label class="choice"><input type="radio" name="mode" value="cash" checked> Cash game <small>play as long as you like</small></label>
-          <label class="choice"><input type="radio" name="mode" value="tournament"> Tournament <small>the last player with chips wins</small></label>
+          <label class="choice"><input type="radio" name="mode" value="cash" checked><span>Cash game <small>play as long as you like</small></span></label>
+          <label class="choice"><input type="radio" name="mode" value="tournament"><span>Tournament <small>the last player with chips wins</small></span></label>
+          <label class="choice"><input type="radio" name="mode" value="training"><span>Training <small>pick your seat and your cards</small></span></label>
+        </fieldset>
+        <fieldset id="training-options" hidden>
+          <legend>Training</legend>
+          <label>Your seat <select name="position" id="position"></select></label>
+          <label>Your cards
+            <select id="hands-preset">
+              <option value="">Any hand</option>
+              <option value="0-5">Best 5%</option>
+              <option value="0-25">Best 25%</option>
+              <option value="25-50">Middle 25–50%</option>
+              <option value="50-100">Bottom half</option>
+              <option value="pairs">Pairs</option>
+              <option value="small-aces">Small aces (A2–A9)</option>
+              <option value="suited-connectors">Suited connectors (like 8♥7♥)</option>
+              <option value="custom">Custom</option>
+            </select>
+          </label>
+          <p class="range-fields">From the top <input id="hands-low" type="number" min="0" max="100" step="any" value="5" aria-label="From the top, percent">%
+            to <input id="hands-high" type="number" min="0" max="100" step="any" value="25" aria-label="To, percent">% of hands</p>
+          <div id="hands-preview"></div>
         </fieldset>
         <label>Players at the table <input name="seats" type="number" min="2" max="8" value="6"></label>
         <label>Opponents
           <select name="tier"><option value="1">Easy</option><option value="2" selected>Medium</option><option value="3">Hard</option></select>
         </label>
-        <label class="inline"><input name="coach" type="checkbox" checked> Coach: hints and checks of your moves while you play</label>
+        <label class="inline" title="Hints and checks of your moves while you play"><input name="coach" type="checkbox" checked> Coach</label>
         <details class="more">
           <summary>More options</summary>
-          <label id="blinds-field">Blinds <small>the two forced bets each hand, small/big</small>
+          <label id="blinds-field" title="The two forced bets each hand: small/big">Blinds
             <input name="blinds" value="50/100" pattern="\d+(\.\d+)?/\d+(\.\d+)?" title="Like 50/100: the small blind, a slash, then the big blind">
           </label>
-          <label>Starting chips, in big blinds <small>empty for 100: 10,000 chips with 50/100 blinds</small>
+          <label title="Empty for 100: 10,000 chips with 50/100 blinds">Starting chips (big blinds)
             <input name="stack" type="number" min="1" step="1" placeholder="100">
           </label>
         </details>
@@ -45,14 +67,15 @@
     </section>
 
     <section id="table" hidden>
-      <div id="opponents" class="seats"></div>
-      <div id="middle">
-        <div id="board" class="cards"></div>
-        <div id="pot"></div>
-        <p id="status" aria-live="polite"></p>
-        <p id="odds" class="helper"></p>
+      <div id="felt">
+        <div id="seats"></div>
+        <div id="middle">
+          <div id="board" class="cards"></div>
+          <div id="pot"></div>
+          <p id="status" aria-live="polite"></p>
+          <p id="odds" class="helper"></p>
+        </div>
       </div>
-      <div id="me"></div>
       <div id="controls">
         <div id="actions"></div>
         <div id="sizing" hidden>
@@ -62,33 +85,32 @@
         </div>
         <div id="between"></div>
         <p class="error" id="table-error" role="alert"></p>
-        <p class="keys">Keys: F fold, K check, C call, R bet or raise, H coach, N next hand</p>
       </div>
       <div id="panels">
         <section class="panel">
-          <h2>Hand log</h2>
+          <h2>Hand log <span class="tools" id="log-tools"></span></h2>
           <div id="log"></div>
         </section>
         <section class="panel" id="coach-panel" hidden>
-          <h2>Coach</h2>
+          <h2>Coach <span class="tools" id="coach-tools"></span></h2>
           <div id="coach"></div>
         </section>
       </div>
       <details id="your-hands">
-        <summary>Your hands <span id="net"></span></summary>
+        <summary>Your hands <span id="net" title="Since you sat down"></span></summary>
         <div id="hands-table"></div>
-        <a id="csv" href="#">Download all hands of this session as CSV</a>
+        <a id="csv" class="download" href="#" title="Download all hands of this session as a CSV file">CSV</a>
       </details>
     </section>
 
     <section id="history" hidden>
       <h1>Past sessions</h1>
-      <p><button type="button" id="history-back" class="secondary">Back</button> <a href="/api/history.csv">Download every saved hand as CSV</a></p>
+      <p><button type="button" id="history-back" class="secondary">Back</button> <a class="download" href="/api/history.csv" title="Download every saved hand as a CSV file">CSV</a></p>
       <p class="error" id="history-error" role="alert"></p>
       <div id="sessions"></div>
       <div id="session-hands"></div>
       <section class="panel" id="history-coach-panel" hidden>
-        <h2>Review</h2>
+        <h2>Review <span class="tools" id="history-tools"></span></h2>
         <div id="history-coach"></div>
       </section>
     </section>
@@ -104,8 +126,8 @@
         <dt>Bet, raise</dt><dd>Put chips in first (bet), or more than the current bet (raise). The others must then call, raise or fold.</dd>
         <dt>Fold</dt><dd>Give up the hand. You lose the chips you have already put in, but nothing more.</dd>
         <dt>All-in</dt><dd>Bet every chip you have left.</dd>
-        <dt>Dealer</dt><dd>The button marks the dealer. The dealer acts last after the flop, which is an advantage: you see what the others do first.</dd>
-        <dt>Position</dt><dd>Where you sit relative to the dealer. Acting later is better, because you know more when you decide.</dd>
+        <dt>Dealer</dt><dd>The button (D) marks the dealer. The dealer acts last after the flop, which is an advantage: you see what the others do first.</dd>
+        <dt>Position</dt><dd>Where you sit relative to the dealer. Acting later is better, because you know more when you decide. First to act is called UTG, then come the hijack (HJ), the cutoff (CO), the dealer (BTN) and the blinds (SB, BB).</dd>
         <dt>Flop, turn, river</dt><dd>The shared cards: three at once (the flop), then a fourth (the turn), then a fifth (the river). There is a round of betting before and after each.</dd>
         <dt>Pot odds</dt><dd>What a call costs compared with what you can win. If calling 100 into a pot of 200 needs you to win 1 time in 3 (33%), and you win more often than that, the call pays.</dd>
         <dt>Chance to win</dt><dd>How often your hand would win against the hands the others likely hold, if all the cards were dealt. Also called equity.</dd>
@@ -114,6 +136,7 @@
         <dt>Strong player</dt><dd>The trainer's model of a solid opponent. Your moves are judged by how they do against it.</dd>
         <dt>Tight, loose, aggressive</dt><dd>Tight players play few hands, loose players many. Aggressive players bet and raise a lot; passive ones mostly call.</dd>
         <dt>Showdown</dt><dd>When the betting is over and more than one player is left, the hands are shown and the best one wins.</dd>
+        <dt>Training</dt><dd>Practise one spot: sit in the same seat every hand, and get dealt only the starting hands you pick, ranked by how often they win against a random hand. Stacks reset every hand, and these hands don't count in your results.</dd>
       </dl>
     </details>
   </main>

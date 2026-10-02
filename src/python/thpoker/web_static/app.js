@@ -10,13 +10,24 @@ const RANK_NAMES = {
   6: "six", 5: "five", 4: "four", 3: "three", 2: "two",
 };
 const RANKS = "AKQJT98765432";
-const BADGES = { BTN: "Dealer", SB: "Small blind", BB: "Big blind" };
+const BADGES = { SB: "small blind", BB: "big blind" };
 const POSITIONS = { HJ: "hijack", CO: "cutoff", BTN: "dealer", SB: "small blind", BB: "big blind" };
+const SEAT_WORDS = {
+  UTG: "First to act", "UTG+1": "Second to act", "UTG+2": "Third to act", HJ: "Hijack",
+  CO: "Cutoff", BTN: "Dealer", SB: "Small blind", BB: "Big blind",
+};
 const DIFFICULTY = { 1: "Easy", 2: "Medium", 3: "Hard" };
 const STREETS = { preflop: "Before the flop", flop: "Flop", turn: "Turn", river: "River" };
 const PRESETS = [["⅓ pot", 1 / 3], ["½ pot", 1 / 2], ["⅔ pot", 2 / 3], ["Pot", 1]];
 const CARD = /^[2-9TJQKA][cdhs]$/;
 const HELPERS_KEY = "thpoker.hideHelpers";
+const SVG = "http://www.w3.org/2000/svg";
+const ICONS = {
+  copy: ["M9 9h11v11H9z", "M5 15H4V4h11v1"],
+  chat: ["M4 4h16v11H9l-5 4z", "M8 9h8", "M8 12h5"],
+  download: ["M12 4v11", "M7 10l5 5 5-5", "M4 20h16"],
+  done: ["M5 12l5 5 9-10"],
+};
 let session = null;
 let state = null;
 let busy = false;
@@ -47,6 +58,62 @@ function element(tag, className, text) {
   if (className) node.className = className;
   if (text !== undefined && text !== null) node.textContent = text;
   return node;
+}
+
+function icon(name) {
+  const svg = document.createElementNS(SVG, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("aria-hidden", "true");
+  svg.setAttribute("class", "icon");
+  for (const d of ICONS[name]) {
+    const path = document.createElementNS(SVG, "path");
+    path.setAttribute("d", d);
+    svg.append(path);
+  }
+  return svg;
+}
+
+function copyIcon(name, tip, text) {
+  // Copies `text`; the icon turns into a tick for a moment. If the browser refuses the
+  // clipboard, the text appears in a box at the foot of the panel to copy by hand.
+  const node = element("button", "icon-button");
+  node.type = "button";
+  node.title = tip;
+  node.setAttribute("aria-label", tip);
+  node.append(icon(name));
+  node.addEventListener("click", async () => {
+    const panel = node.closest(".panel");
+    try {
+      await navigator.clipboard.writeText(text);
+      node.replaceChildren(icon("done"));
+      setTimeout(() => node.replaceChildren(icon(name)), 1500);
+    } catch (error) {
+      const box = element("textarea", "copy-box");
+      box.readOnly = true;
+      box.value = text;
+      const fallback = element("div", "copy-fallback");
+      fallback.append(element("p", "", "Copying was blocked; select this text and copy it:"), box);
+      panel.querySelector(".copy-fallback")?.remove();
+      panel.append(fallback);
+      box.select();
+    }
+  });
+  return node;
+}
+
+function tools(id) {
+  // A panel's copy icons, emptied along with any copy box they left behind.
+  const target = document.getElementById(id);
+  target.closest(".panel").querySelector(".copy-fallback")?.remove();
+  target.replaceChildren();
+  return target;
+}
+
+function copyTools(id, answer) {
+  tools(id).append(
+    copyIcon("copy", "Copy this hand: the moves and the cards you saw", answer.hand_text),
+    copyIcon("chat", "Copy this hand with the coach's analysis, for an AI chat", answer.copy_text),
+  );
 }
 
 function card(text, small) {
@@ -92,7 +159,10 @@ function button(label, handler, className, key) {
   const node = element("button", className || "", label);
   node.type = "button";
   node.addEventListener("click", handler);
-  if (key) node.dataset.key = key;
+  if (key) {
+    node.dataset.key = key;
+    node.title = "Key: " + key.toUpperCase();
+  }
   return node;
 }
 
@@ -134,17 +204,33 @@ function show(view) {
   for (const id of ["setup", "table", "history"]) document.getElementById(id).hidden = id !== view;
   document.getElementById("new-game").hidden = view !== "table";
   document.getElementById("helpers-toggle").hidden = view !== "table";
+  document.getElementById("training-pill").hidden = view !== "table" || !state || !state.training;
+}
+
+function seatNames(players) {
+  // Positions in the order they act before the flop, as the server names them (charts.seat_names).
+  if (players === 2) return ["BTN", "BB"];
+  const others = players - 3;
+  const late = others >= 2 ? ["HJ", "CO"] : others === 1 ? ["CO"] : [];
+  const early = Array.from({ length: others - late.length }, (_, i) => (i ? "UTG+" + i : "UTG"));
+  return [...early, ...late, "BTN", "SB", "BB"];
+}
+
+function seatWords(code, players) {
+  if (players === 2 && code === "BTN") return "Dealer and small blind";
+  return SEAT_WORDS[code] + " (" + code + ")";
+}
+
+function trainingText(training, players) {
+  const parts = ["Training"];
+  if (training.position) parts.push(seatWords(training.position, players));
+  if (training.hands) parts.push(training.hands);
+  return parts.join(" · ");
 }
 
 // The table
 
-function hudText(hud) {
-  if (hud.hands < state.hud_min_hands) return "Watching: " + hud.hands + " of " + state.hud_min_hands + " hands";
-  return "Plays " + percent(hud.plays) + " of hands · raises " + percent(hud.raises);
-}
-
 function hudTip(hud) {
-  if (hud.hands < state.hud_min_hands) return "After " + state.hud_min_hands + " hands these numbers start to mean something.";
   const parts = [
     "Plays " + percent(hud.plays) + " of hands: how often it puts chips in before the flop by choice.",
     "Raises " + percent(hud.raises) + ": how often it raises before the flop.",
@@ -156,26 +242,17 @@ function hudTip(hud) {
 
 function renderSeat(seat, mine) {
   const out = seat.dealt_in === false || seat.folded;
-  const box = element("div", "seat" + (mine ? " you" : "") + (out ? " out" : ""));
+  const box = element("div", "seat" + (mine ? " you" : "") + (out ? " out" : "") + (mine && state.your_turn ? " turn" : ""));
   const head = element("div", "head");
   head.append(element("span", "name", seat.name));
-  if (seat.position && BADGES[seat.position]) {
-    const heads = state.seats.filter((s) => s.dealt_in).length === 2 && seat.position === "BTN";
-    head.append(element("span", "badge", heads ? "Dealer · Small blind" : BADGES[seat.position]));
+  const players = state.seats.filter((s) => s.dealt_in).length;
+  if (seat.position === "BTN") {
+    const dealer = element("span", "dealer", "D");
+    dealer.title = players === 2 ? "Dealer, also the small blind" : "Dealer: acts last after the flop";
+    head.append(dealer);
   }
-  if (seat.style) {
-    const tag = element("span", "tag helper", seat.style);
-    tag.title = seat.tip;
-    head.append(tag);
-  }
+  if (BADGES[seat.position]) head.append(element("span", "badge", BADGES[seat.position]));
   box.append(head);
-  const line = element("div", "chips");
-  line.append(element("span", "stack", chips(seat.stack) + " chips"));
-  if (seat.committed) line.append(element("span", "bet", "Bet " + chips(seat.committed)));
-  box.append(line);
-  if (seat.in_pot) box.append(element("div", "in-pot helper", "In the pot this hand: " + chips(seat.in_pot)));
-  const status = seat.folded ? "Folded" : seat.all_in ? "All-in" : seat.last_action ? seat.last_action.charAt(0).toUpperCase() + seat.last_action.slice(1) : "";
-  if (status) box.append(element("div", "last", status));
   const cards = element("div", "cards");
   for (const text of seat.cards || []) cards.append(card(text));
   if (!mine && seat.dealt_in && !seat.folded && !seat.cards && state.board !== undefined) {
@@ -183,11 +260,25 @@ function renderSeat(seat, mine) {
   }
   box.append(cards);
   if (mine && state.your_hand) box.append(element("div", "hand-name helper", state.your_hand));
-  if (seat.hud) {
-    const hud = element("div", "hud helper", hudText(seat.hud));
-    hud.title = hudTip(seat.hud);
-    box.append(hud);
+  const line = element("div", "chips");
+  line.append(element("span", "stack", chips(seat.stack)));
+  if (seat.committed) line.append(element("span", "bet", chips(seat.committed)));
+  box.append(line);
+  const status = seat.folded ? "Folded" : seat.all_in ? "All-in" : seat.last_action ? seat.last_action.charAt(0).toUpperCase() + seat.last_action.slice(1) : "";
+  if (status) box.append(element("div", "last", status));
+  const note = element("div", "note helper");
+  if (seat.style) {
+    const tag = element("span", "tag", seat.style);
+    tag.title = seat.tip;
+    note.append(tag);
   }
+  if (seat.in_pot) note.append(element("span", "", "In pot " + chips(seat.in_pot)));
+  if (seat.hud && seat.hud.hands >= state.hud_min_hands) {
+    const hud = element("span", "", "Plays " + percent(seat.hud.plays) + " · raises " + percent(seat.hud.raises));
+    hud.title = hudTip(seat.hud);
+    note.append(hud);
+  }
+  if (note.childNodes.length) box.append(note);
   return box;
 }
 
@@ -195,43 +286,82 @@ function you() {
   return state.seats.find((seat) => seat.is_user);
 }
 
+function ring(count) {
+  // Points spaced evenly along the oval's edge from the bottom, clockwise, as fractions of its
+  // half-width and half-height: equal angles would crowd the seats at the narrow ends.
+  const felt = document.getElementById("felt");
+  const ratio = felt.clientHeight / felt.clientWidth || 0.5;
+  const steps = 720;
+  const points = [[0, 1]];
+  const lengths = [0];
+  for (let i = 1; i <= steps; i++) {
+    const angle = Math.PI / 2 + (2 * Math.PI * i) / steps;
+    points.push([Math.cos(angle), Math.sin(angle)]);
+    const [x, y] = points[i - 1];
+    lengths.push(lengths[i - 1] + Math.hypot(points[i][0] - x, (points[i][1] - y) * ratio));
+  }
+  const result = [];
+  for (let k = 0, i = 0; k < count; k++) {
+    while (lengths[i] < (lengths[steps] * k) / count) i++;
+    result.push(points[i]);
+  }
+  return result;
+}
+
 function renderTable() {
-  const opponents = document.getElementById("opponents");
-  opponents.replaceChildren(...state.seats.filter((s) => !s.is_user).map((s) => renderSeat(s, false)));
-  document.getElementById("me").replaceChildren(renderSeat(you(), true));
+  // Seats sit round the oval in playing order, starting on your left, with you at the bottom.
+  const seats = state.seats;
+  const mine = seats.findIndex((seat) => seat.is_user);
+  const places = ring(seats.length);
+  const boxes = seats.map((seat, index) => {
+    const box = renderSeat(seat, index === mine);
+    const [x, y] = places[(index - mine + seats.length) % seats.length];
+    box.style.setProperty("--x", (50 + 50 * x).toFixed(2) + "%");
+    box.style.setProperty("--y", (50 + 54 * y).toFixed(2) + "%");  // a little past the rail
+    return box;
+  });
+  document.getElementById("seats").replaceChildren(...boxes);
   const board = document.getElementById("board");
   board.replaceChildren();
   if (state.board !== undefined) {
     for (const text of state.board) board.append(card(text));
     for (let i = state.board.length; i < 5; i++) board.append(element("span", "card empty"));
   }
-  document.getElementById("pot").textContent = state.pot === undefined ? "" : "Pot " + chips(state.pot);
+  const pot = document.getElementById("pot");
+  pot.replaceChildren();
+  if (state.pot !== undefined) pot.append(element("span", "chip-stack", chips(state.pot)));
+  pot.title = "The pot";
 }
 
 function statusText() {
   if (state.your_turn) {
     const call = state.legal.call;
-    return call !== null ? "Your turn: " + chips(call) + " to call." : "Your turn: nobody has bet, so you can check.";
+    return call !== null ? "Your turn · " + chips(call) + " to call" : "Your turn";
   }
-  if (state.session_over) return "The session is over.";
-  if (state.awaiting_rebuy) return "You are out of chips.";
-  if (state.knocked_out) return "You are out of the tournament.";
+  if (state.session_over) return "The session is over";
+  if (state.awaiting_rebuy) return "You are out of chips";
+  if (state.knocked_out) return "You are out of the tournament";
   if (state.hand_over && state.hand_result !== undefined) {
     const net = state.hand_result;
-    const hand = net > 0 ? "you won " + chips(net) : net < 0 ? "you lost " + chips(-net) : "you broke even";
-    return "Hand over: " + hand + " this hand.";
+    return net > 0 ? "You won " + chips(net) : net < 0 ? "You lost " + chips(-net) : "You broke even";
   }
-  return state.hand_over ? "Hand over." : "Waiting for the others.";
+  return state.hand_over ? "Hand over" : "Waiting for the others";
 }
 
 function renderStatus() {
   document.getElementById("status").textContent = statusText();
+  document.body.classList.toggle("your-turn", Boolean(state.your_turn));
   const odds = document.getElementById("odds");
   odds.textContent = "";
+  odds.title = "";
   if (state.your_turn && state.call_needs) {
-    odds.textContent = "Pot odds: call " + chips(state.legal.call) + " into a pot of " + chips(state.pot)
+    odds.textContent = "Calling needs " + percent(state.call_needs) + " to win";
+    odds.title = "Pot odds: call " + chips(state.legal.call) + " into a pot of " + chips(state.pot)
       + ", so calling pays if you win more than " + percent(state.call_needs) + " of the time.";
   }
+  const pill = document.getElementById("training-pill");
+  pill.hidden = !state.training;
+  if (state.training) pill.textContent = trainingText(state.training, state.seats.length);
 }
 
 function raiseLabel(kind, amount) {
@@ -270,7 +400,6 @@ function renderSizing(raise, raiseButton) {
   }
   presets.append(button("All-in", () => set(raise.max), "chip all-in"));
 }
-
 function renderActions() {
   const actions = document.getElementById("actions");
   const between = document.getElementById("between");
@@ -279,10 +408,10 @@ function renderActions() {
   if (state.your_turn) {
     const legal = state.legal;
     if (legal.fold && !legal.check) actions.append(button("Fold", () => act({ kind: "fold" }), "neutral", "f"));
-    if (legal.check) actions.append(button("Check", () => act({ kind: "check" }), "primary", "k"));
+    if (legal.check) actions.append(button("Check", () => act({ kind: "check" }), "call", "k"));
     if (legal.call !== null) {
       const allIn = legal.call >= you().stack ? " (all-in)" : "";
-      actions.append(button("Call " + chips(legal.call) + allIn, () => act({ kind: "call" }), "primary", "c"));
+      actions.append(button("Call " + chips(legal.call) + allIn, () => act({ kind: "call" }), "call", "c"));
     }
     let raiseButton = null;
     if (legal.raise) {
@@ -328,6 +457,8 @@ function renderLog() {
     }
   }
   log.scrollTop = log.scrollHeight;
+  const logTools = tools("log-tools");
+  if (state.hand_text) logTools.append(copyIcon("copy", "Copy this hand: the moves and the cards you saw", state.hand_text));
 }
 
 function handsTable(rows, reviewer) {
@@ -354,8 +485,7 @@ function handsTable(rows, reviewer) {
 }
 
 function renderHands() {
-  const net = document.getElementById("net");
-  net.textContent = state.session_net === undefined ? "" : "· since you sat down: " + signed(state.session_net);
+  document.getElementById("net").textContent = state.session_net ? "· " + signed(state.session_net) : "";
   document.getElementById("hands-table").replaceChildren(handsTable(state.hands, null));
   document.getElementById("csv").href = "/api/sessions/" + session + "/hands.csv";
 }
@@ -370,6 +500,7 @@ function render() {
 
 function clearCoach() {
   document.getElementById("coach").replaceChildren();
+  tools("coach-tools");
   document.getElementById("coach-panel").hidden = true;
 }
 
@@ -416,10 +547,13 @@ async function coach(path, waiting) {
     const panel = document.getElementById("coach-panel");
     const target = document.getElementById("coach");
     panel.hidden = false;
+    tools("coach-tools");
     target.replaceChildren(element("p", "waiting", waiting));
     try {
       const answer = await api("sessions/" + session + "/" + path, {});
-      if (current()) target.replaceChildren(coachView(answer, path === "review"));
+      if (!current()) return;
+      target.replaceChildren(coachView(answer, path === "review"));
+      copyTools("coach-tools", answer);
     } catch (error) {
       target.replaceChildren();
       panel.hidden = true;
@@ -433,11 +567,11 @@ function hint() {
 }
 
 function analyze() {
-  return coach("analyze", "Checking your last move (a second or two)...");
+  return coach("analyze", "Checking your last move...");
 }
 
 function review() {
-  return coach("review", "Reviewing the hand (a few seconds)...");
+  return coach("review", "Reviewing the hand...");
 }
 
 // The coach's answers
@@ -446,8 +580,16 @@ function optionsTable(decision) {
   const table = element("table", "options");
   const head = element("tr");
   const unit = decision.unit === "chips" ? "" : " (" + decision.unit + ")";
-  for (const title of ["Option", "A strong player does it", "Average result vs these opponents" + unit, "vs a strong player" + unit]) {
-    head.append(element("th", "", title));
+  const titles = [
+    ["Option", ""],
+    ["Strong player", "How often a strong player makes this move here"],
+    ["vs these players" + unit, "Average result against the players at this table"],
+    ["vs a strong player" + unit, "Average result against a strong player"],
+  ];
+  for (const [title, tip] of titles) {
+    const cell = element("th", "", title);
+    if (tip) cell.title = tip;
+    head.append(cell);
   }
   table.append(head);
   const value = (worth, noise) => {
@@ -470,19 +612,19 @@ function optionsTable(decision) {
   return table;
 }
 
-function rangeGrid(range) {
+function rangeGrid(classes, label) {
   const grid = element("div", "grid");
   grid.setAttribute("role", "img");
-  grid.setAttribute("aria-label", range.name + " likely holds about " + percent(range.width) + " of hands");
+  grid.setAttribute("aria-label", label);
   for (let row = 0; row < 13; row++) {
     for (let column = 0; column < 13; column++) {
       const a = RANKS[Math.min(row, column)];
       const b = RANKS[Math.max(row, column)];
-      const label = row === column ? a + b : a + b + (row < column ? "s" : "o");
-      const weight = range.classes[row * 13 + column];
-      const cell = element("span", "cell", label);
+      const name = row === column ? a + b : a + b + (row < column ? "s" : "o");
+      const weight = classes[row * 13 + column];
+      const cell = element("span", "cell", name);
       cell.style.setProperty("--w", String(weight));
-      cell.title = label + ": " + percent(weight);
+      cell.title = name + ": " + percent(weight);
       grid.append(cell);
     }
   }
@@ -510,32 +652,15 @@ function decisionView(decision, open) {
   details.append(list);
   for (const range of decision.ranges) {
     if (range.width >= 0.6) continue;  // nearly every hand: the grid would be solid colour
-    details.append(element("p", "grid-title", range.name + "'s likely hands (brighter means more likely):"), rangeGrid(range));
+    const label = range.name + " likely holds about " + percent(range.width) + " of hands";
+    details.append(element("p", "grid-title", range.name + "'s likely hands (brighter means more likely):"), rangeGrid(range.classes, label));
   }
   box.append(details);
   return box;
 }
 
-function copyButton(text) {
-  const node = button("Copy for AI chat", async () => {
-    try {
-      await navigator.clipboard.writeText(text);
-      node.textContent = "Copied: paste it into a chat assistant";
-    } catch (error) {
-      const box = element("textarea", "copy-box");
-      box.readOnly = true;
-      box.value = text;
-      node.replaceWith(element("p", "", "Copying was blocked; select this text and copy it:"), box);
-      box.select();
-    }
-  }, "secondary");
-  node.title = "Copies the whole hand and this analysis as plain text";
-  return node;
-}
-
 function coachView(answer, full) {
   const view = element("div", "coach-view");
-  view.append(copyButton(answer.copy_text));
   const story = element("details", "story");
   story.open = full;
   story.append(element("summary", "", full ? "The hand" : "The hand so far"));
@@ -548,6 +673,11 @@ function coachView(answer, full) {
 }
 
 // Past sessions
+
+function gameName(saved) {
+  if (saved.mode === "training") return trainingText(saved.training, saved.players);
+  return saved.mode === "cash" ? "Cash game" : "Tournament";
+}
 
 async function openHistory() {
   show("history");
@@ -570,12 +700,14 @@ async function openHistory() {
     table.append(head);
     for (const saved of answer.sessions) {
       const tr = element("tr");
-      tr.append(element("td", "", saved.date), element("td", "", saved.mode === "cash" ? "Cash game" : "Tournament"));
+      tr.append(element("td", "", saved.date), element("td", "", gameName(saved)));
       tr.append(element("td", "", saved.players), element("td", "", DIFFICULTY[saved.difficulty]), element("td", "", saved.hands));
-      tr.append(element("td", saved.net > 0 ? "up" : saved.net < 0 ? "down" : "", signed(saved.net)));
+      const training = saved.mode === "training";
+      const result = element("td", training ? "muted" : saved.net > 0 ? "up" : saved.net < 0 ? "down" : "", signed(saved.net));
+      if (training) result.title = "Training: not counted in your results";
+      tr.append(result);
       const open = element("td");
-      const label = (saved.mode === "cash" ? "Cash game" : "Tournament") + " on " + saved.date;
-      open.append(button("Open", () => openSession(saved.name, label), "small"));
+      open.append(button("Open", () => openSession(saved.name, gameName(saved) + " on " + saved.date), "small"));
       tr.append(open);
       table.append(tr);
     }
@@ -587,8 +719,10 @@ async function openSession(name, label) {
   await run("history-error", async () => {
     const answer = await api("history/" + encodeURIComponent(name));
     const target = document.getElementById("session-hands");
-    const link = element("a", "", "Download this session as CSV");
+    const link = element("a", "download", "CSV");
     link.href = "/api/history/" + encodeURIComponent(name) + "/hands.csv";
+    link.title = "Download this session as a CSV file";
+    link.prepend(icon("download"));
     target.replaceChildren(element("h2", "", "Hands: " + label), link, handsTable(answer.rows, (hand) => reviewSaved(name, hand)));
   });
 }
@@ -598,10 +732,12 @@ async function reviewSaved(name, hand) {
     const panel = document.getElementById("history-coach-panel");
     const target = document.getElementById("history-coach");
     panel.hidden = false;
-    target.replaceChildren(element("p", "waiting", "Reviewing hand " + hand + " (a few seconds)..."));
+    tools("history-tools");
+    target.replaceChildren(element("p", "waiting", "Reviewing hand " + hand + "..."));
     try {
       const answer = await api("history/" + encodeURIComponent(name) + "/review", { hand });
       target.replaceChildren(coachView(answer, true));
+      copyTools("history-tools", answer);
       panel.scrollIntoView({ behavior: "smooth" });
     } catch (error) {
       target.replaceChildren();
@@ -613,15 +749,91 @@ async function reviewSaved(name, hand) {
 
 // Setup and page-wide controls
 
+const setupForm = document.getElementById("setup-form");
+let preview = 0;
+
+function selectedMode() {
+  return document.querySelector("input[name=mode]:checked").value;
+}
+
+function handsSpec() {
+  // The training hands as the server reads them: a preset, "low-high" for a custom window, or
+  // "" for any hand.
+  const preset = document.getElementById("hands-preset").value;
+  if (preset !== "custom") return preset;
+  const low = document.getElementById("hands-low").value || "0";
+  const high = document.getElementById("hands-high").value || "100";
+  return low + "-" + high;
+}
+
+function fillSeats() {
+  const select = document.getElementById("position");
+  const players = Number(setupForm.elements.seats.value);
+  if (!(players >= 2 && players <= 8)) return;  // mid-typing: keep the list and the choice
+  const kept = select.value;
+  const options = [["", "Change seat every hand"]];
+  for (const code of seatNames(players)) options.push([code, seatWords(code, players)]);
+  select.replaceChildren(...options.map(([value, text]) => {
+    const option = element("option", "", text);
+    option.value = value;
+    return option;
+  }));
+  select.value = options.some(([value]) => value === kept) ? kept : "";
+}
+
+async function showHands() {
+  // The preview grid for the chosen hands, from the server's own rules; a slower answer that
+  // arrives after a newer choice is dropped.
+  const preset = document.getElementById("hands-preset").value;
+  // The two numbers belong to a window of the strength order, not to "any hand" or pairs.
+  document.querySelector(".range-fields").hidden = preset !== "custom" && !/^\d/.test(preset);
+  const target = document.getElementById("hands-preview");
+  const spec = handsSpec();
+  const mine = ++preview;
+  if (!spec) {
+    target.replaceChildren(element("p", "hint-line", "Any two cards, as in a normal game."));
+    return;
+  }
+  try {
+    const answer = await api("hands/" + encodeURIComponent(spec));
+    if (mine !== preview) return;
+    const words = answer.count + " hand types, about " + percent(answer.share) + " of deals";
+    target.replaceChildren(element("p", "hint-line", words), rangeGrid(answer.classes, "Hands you will be dealt: " + words));
+  } catch (error) {
+    if (mine === preview) target.replaceChildren(element("p", "error", error.message));
+  }
+}
+
+function presetChanged() {
+  const preset = document.getElementById("hands-preset").value;
+  const bounds = /^(\d+)-(\d+)$/.exec(preset);
+  if (bounds) {
+    document.getElementById("hands-low").value = bounds[1];
+    document.getElementById("hands-high").value = bounds[2];
+  }
+  showHands();
+}
+
+function rangeTyped() {
+  document.getElementById("hands-preset").value = "custom";
+  showHands();
+}
+
 function modeChanged() {
-  const tournament = document.querySelector("input[name=mode]:checked").value === "tournament";
-  document.getElementById("blinds-field").hidden = tournament;
-  document.querySelector("input[name=coach]").checked = !tournament;  // DESIGN 7.8: off in tournaments
+  const mode = selectedMode();
+  document.getElementById("blinds-field").hidden = mode === "tournament";
+  document.getElementById("training-options").hidden = mode !== "training";
+  setupForm.elements.coach.checked = mode !== "tournament";  // DESIGN 7.8: off in tournaments
+  if (mode === "training") showHands();
 }
 
 for (const radio of document.querySelectorAll("input[name=mode]")) radio.addEventListener("change", modeChanged);
+setupForm.elements.seats.addEventListener("input", fillSeats);
+document.getElementById("hands-preset").addEventListener("change", presetChanged);
+for (const id of ["hands-low", "hands-high"]) document.getElementById(id).addEventListener("input", rangeTyped);
+fillSeats();
 
-document.getElementById("setup-form").addEventListener("submit", (event) => {
+setupForm.addEventListener("submit", (event) => {
   event.preventDefault();
   const form = new FormData(event.target);
   const options = {
@@ -630,8 +842,12 @@ document.getElementById("setup-form").addEventListener("submit", (event) => {
     tier: Number(form.get("tier")),
     coach: form.get("coach") === "on",
   };
-  if (options.mode === "cash") options.blinds = form.get("blinds");
+  if (options.mode !== "tournament") options.blinds = form.get("blinds");
   if (form.get("stack")) options.stack = Number(form.get("stack"));
+  if (options.mode === "training") {
+    if (form.get("position")) options.position = form.get("position");
+    if (handsSpec()) options.hands = handsSpec();
+  }
   run("setup-error", async () => {
     const created = await api("sessions", options);
     session = created.id;
@@ -645,6 +861,8 @@ document.getElementById("setup-form").addEventListener("submit", (event) => {
 document.getElementById("new-game").addEventListener("click", newGame);
 document.getElementById("open-history").addEventListener("click", openHistory);
 document.getElementById("history-back").addEventListener("click", () => show("setup"));
+document.getElementById("words-link").addEventListener("click", () => { document.getElementById("glossary").open = true; });
+for (const link of document.querySelectorAll("a.download")) link.prepend(icon("download"));
 
 const hideHelpers = document.getElementById("hide-helpers");
 hideHelpers.checked = window.localStorage.getItem(HELPERS_KEY) === "1";

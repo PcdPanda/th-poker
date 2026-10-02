@@ -31,6 +31,7 @@ from   thpoker.analysis.training \
                                         mistake_keys, parse_mistake_key,
                                         questions, score)
 from   thpoker.bots.bot         import PRESETS
+from   thpoker.charts           import seats_from_button
 from   thpoker.game.cards       import cards_str
 from   thpoker.game.engine      import is_terminal
 from   thpoker.game.rng         import Rng, new_seed
@@ -41,6 +42,7 @@ from   thpoker.game.session     import (Mode, SessionConfig, SessionError,
 from   thpoker.game.state       import (Action, ActionType, AnteType,
                                         ConfigError, Event, GameConfig,
                                         GameState, Street)
+from   thpoker.odds             import hand_range
 from   thpoker.storage          import (SessionLog, default_decisions_log,
                                         default_log_dir, default_training_log,
                                         read_session_log)
@@ -63,7 +65,9 @@ HELP = """Actions:
   ?            show legal actions              q   quit"""
 
 
-def full_review(runner: TableRunner, hand: GameState, profile: Profile) -> HandReview:
+def full_review(
+    runner: TableRunner, hand: GameState, profile: Profile, reviewed: dict[int, DecisionReview] | None = None
+) -> HandReview:
     user = runner.user_seat
     assert user is not None
     return review_hand(
@@ -74,6 +78,7 @@ def full_review(runner: TableRunner, hand: GameState, profile: Profile) -> HandR
         runner.config.payouts,
         profile.min_branch,
         profile.solver_seconds,
+        reviewed,
     )
 
 
@@ -155,7 +160,7 @@ class PlaySession:
         if self.log is not None:
             self.log.append("hint", {"hand_id": hand.hand_id, "index": len(hand.history)})
         return decision
-    
+
     def review_lines(self, hand: GameState) -> list[str]:
         review = full_review(self.runner, hand, self.profile)
         return render_hand(review, self.runner.bot_labels(), self.scale, grids=True)
@@ -357,9 +362,10 @@ def record_decisions(
     paid_places: int | None,
     path: Path,
     hinted: set[tuple[str, int]],
+    training: bool = False,
 ):
     """Append each reviewed decision's record for leak statistics, once per decision; decisions
-    made after a coach hint are left out."""
+    made after a coach hint are left out, and training decisions are tagged as such."""
     known = {(r.session, r.hand_id, r.index) for r in DecisionRecord.read(path, "decision")}
     log = SessionLog(path)
     for review in reviews:
@@ -369,7 +375,7 @@ def record_decisions(
                 known.add((session, *key))
                 log.append(
                     "decision",
-                    record(decision, session, review.hand.hand_id, paid_places).to_dict(),
+                    record(decision, session, review.hand.hand_id, paid_places, training).to_dict(),
                 )
 
 
@@ -464,6 +470,10 @@ def build_config(args: argparse.Namespace) -> tuple[TableConfig, int]:
         "--hands-per-level": args.hands_per_level,
         "--minutes-per-level": args.minutes_per_level,
     }
+    training = args.mode == "training"
+    if not training and (args.position or args.hands):
+        raise ConfigError("--position and --hands apply to training only")
+        
     if args.mode == "tournament":
         misplaced = [name for name, value in cash_only.items() if value]
         if misplaced:
@@ -493,15 +503,23 @@ def build_config(args: argparse.Namespace) -> tuple[TableConfig, int]:
             bb_ante = args.ante_type == "bb-ante"
             ante_type = AnteType.BIG_BLIND_ANTE if bb_ante else AnteType.PER_PLAYER
         stack = round((args.stack if args.stack is not None else 100) * big_blind)
+        position = None
+        if args.position:
+            names = seats_from_button(args.seats)
+            if args.position.upper() not in names:
+                raise ConfigError(f"--position with {args.seats} players is noe of {', '.join(names)}")
+            position = names.index(args.position.upper())
         session = SessionConfig(
-            Mode.CASH,
+            Mode.TRAINING if training else Mode.CASH,
             seed,
             args.seats,
             stack,
             cash_blinds=GameConfig(args.seats, small_blind, big_blind, ante, ante_type),
-            reset_stacks_each_hand=args.reset_stacks,
+            reset_stacks_each_hand=args.reset_stacks or training,
             auto_rebuy=args.auto_rebuy is not None,
             rebuy_threshold=round((args.auto_rebuy or 0) * big_blind),
+            user_position=position,
+            user_hands=hand_range(args.hands) if args.hands else (),
         )
     styles = tuple(args.style for _ in range(args.seats))
     return TableConfig(session, styles, args.panel, args.hide_styles, args.tier), scale
@@ -509,7 +527,7 @@ def build_config(args: argparse.Namespace) -> tuple[TableConfig, int]:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="bin/run_thpoker.py", description="No-Limit Hold'em practice table.")
-    parser.add_argument("--mode", choices=("cash", "tournament"), default="cash")
+    parser.add_argument("--mode", choices=("cash", "tournament", "training"), default="cash")
     parser.add_argument("--seats", type=int, default=6, help="2 to 8 seats including you (default 6)")
     parser.add_argument("--blinds", default="50/100", help="SB/BB in your chip units (default 50/100)")
     parser.add_argument("--ante", type=float, default=0, help="ante in your chip units (cash)")
@@ -517,6 +535,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--stack", type=float, help="starting stack in big blinds (default 100; tournament: preset)")
     parser.add_argument("--preset", choices=sorted(TOURNAMENT_PRESETS), help="tournament (default regular)")
     parser.add_argument("--hands-per-level", type=int, help="tournament level length in hands")
+    parser.add_argument("--position", help="training: always sit here (BTN, SB, BB, UTG, ..., CO)")
+    parser.add_argument(
+        "--hands",
+        help="training: deal you only X-Y (the top X%% to Y%% of hands), pairs, small-aces or suited-connectors",
+    )
     parser.add_argument("--minutes-per-level", type=float, help="tournament level length in minutes")
     parser.add_argument("--style", help="give every bot this style instead of drawing from the panel")
     parser.add_argument("--panel", default="online_micro", help="population panel for bot styles")
@@ -630,7 +653,14 @@ def review_main(argv: list[str]) -> int:
     print(file=sys.stderr)
     payouts = config.payouts
     hinted = {(r["hand_id"], r["index"]) for r in records if r["type"] == "hint"}
-    record_decisions(reviews, args.log.stem, len(payouts) if payouts else None, args.decisions_log, hinted)
+    record_decisions(
+        reviews,
+        args.log.stem,
+        len(payouts) if payouts else None,
+        args.decisions_log,
+        hinted,
+        config.session.mode == Mode.TRAINING,
+    )
     summary = summarize(reviews, args.top)
     print("\n".join(render_summary(summary, scale)))
     if args.quiz:
@@ -872,7 +902,7 @@ def session_rows(
     """One CSV row per hand of a logged session, dated by the log's last write."""
     user = config.session.user_seat
     assert user is not None  # checked by load_session
-    mode = "tournament" if config.session.mode == Mode.TOURNAMENT else "cash"
+    mode = config.session.mode.value.lower()
     day = date.fromtimestamp(path.stat().st_mtime).isoformat()
     return hand_rows(hands, user, scale, path.stem, day, mode, decisions)
 
@@ -936,7 +966,7 @@ def main(argv: list[str] | None = None) -> int:
         training = SessionLog(args.training_log)
         print(f"Logging to {log.path}")
     show_hud = args.hud if args.hud is not None else not args.hide_styles
-    hints = args.hints if args.hints is not None else session.mode == Mode.CASH
+    hints = args.hints if args.hints is not None else session.mode != Mode.TOURNAMENT
     table = Table(runner, scale, log, show_hud, hints, pick_profile(args.device))
     print(f"{session.mode.value.title()} session, {session.num_seats} seats, seed {session.seed}. Type ? for help.")
     try:
@@ -968,7 +998,7 @@ def main(argv: list[str] | None = None) -> int:
     ended = runner.finish()
     table.record(ended)
     net = ended[0].data["net"]
-    if session.user_seat is not None and session.mode == Mode.CASH:
+    if session.user_seat is not None and session.mode != Mode.TOURNAMENT:
         print(
             f"Session over after {runner.session.hand_number} hands. Net: {table.chips(net[session.user_seat])} chips."
         )

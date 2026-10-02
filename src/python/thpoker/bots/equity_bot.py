@@ -8,9 +8,9 @@ also bluff at a controlled rate when checked to.
 """
 
 from   dataclasses              import dataclass
+from   functools                import lru_cache
 import hashlib
 import math
-
 from   thpoker.bots.abstraction import (AbstractAction, NEVER_FOLD_EQUITY,
                                         acts_last, bet_sizes, call_price,
                                         effective_stack, finish,
@@ -96,9 +96,11 @@ def preflop_range(view: Observation, seat: int) -> Range:
     return strongest if strongest is not None else FULL_RANGE
 
 
+@lru_cache(maxsize=128)
 def strength_weighted(weights: Range, board: tuple[int, ...]) -> Range:
     """Shift a range toward hands that are strong on `board`: weight times 0.25 + 0.75 * rank,
-    where rank is the hand's made-hand percentile (0 weakest, 1 strongest) within the range."""
+    where rank is the hand's made-hand percentile (0 weakest, 1 strongest) within the range.
+    Cached: every bot decision on a street rebuils the same seat ranges."""
     live = [i for i, (a, b) in enumerate(COMBOS) if weights[i] and a not in board and b not in board]
     if len(live) < 2:
         return weights

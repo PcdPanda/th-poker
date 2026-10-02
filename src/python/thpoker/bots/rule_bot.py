@@ -6,8 +6,7 @@ strong, medium, draw, weak) that map to fixed action frequencies scaled by the s
 """
 
 from   dataclasses              import dataclass
-from   typing                   import Any
-
+from   functools                import lru_cache
 from   thpoker.bots.abstraction import (AbstractAction, bet_sizes, call_price,
                                         fit_to_legal, legal_abstract_actions,
                                         players_behind, position_width,
@@ -18,6 +17,7 @@ from   thpoker.game.evaluator   import (HIGH_CARD, PAIR, QUADS, STRAIGHT,
                                         TRIPS, TWO_PAIR, category, evaluate)
 from   thpoker.game.state       import Observation, Street
 from   thpoker.odds             import PREFLOP_PERCENTILE
+from   typing                   import Any
 
 MONSTER, STRONG, MEDIUM, DRAW, WEAK = "MONSTER", "STRONG", "MEDIUM", "DRAW", "WEAK"
 
@@ -52,8 +52,10 @@ def _has_draw(hole: tuple[int, int], board: tuple[int, ...]) -> bool:
     return False
 
 
+@lru_cache(maxsize=1 << 16)
 def classify(hole: tuple[int, int], board: tuple[int, ...]) -> str:
-    """Postflop strength bucket of the hole cards on this board."""
+    """Postflop strength bucket of the hole cards on this board. Cached: an EV walk asks for
+    every hand on the same board at each of its nodes."""
     value = evaluate(list(hole) + list(board))
     cat = category(value)
     board_cat = _board_category(board)

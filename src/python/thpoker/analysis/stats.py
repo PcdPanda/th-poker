@@ -49,14 +49,20 @@ class DecisionRecord(Record):
     bet_fraction: float | None
 
 
-def record(review: DecisionReview, session: str, hand_id: str, paid_places: int | None = None) -> DecisionRecord:
+def record(
+    review: DecisionReview,
+    session: str,
+    hand_id: str,
+    paid_places: int | None = None,
+    training: bool = False,
+) -> DecisionRecord:
     loss, stderr = review.loss(review.reference)
     assert review.chosen is not None
     return DecisionRecord(
         session,
         hand_id,
         review.index,
-        tags(review, review.tournament, paid_places),
+        tags(review, review.tournament, paid_places, training),
         loss,
         stderr,
         review.verdict(),
@@ -157,12 +163,18 @@ def hand_class(review: DecisionReview) -> str:
     return "marginal" if made or percentile >= 0.4 else "air"
 
 
-def tags(review: DecisionReview, tournament: bool, paid_places: int | None = None) -> dict[str, str]:
-    """The decision's tags. `paid_places` (tournaments) sets the stage."""
+def tags(
+    review: DecisionReview,
+    tournament: bool,
+    paid_places: int | None = None,
+    training: bool = False,
+) -> dict[str, str]:
+    """The decision's tags. `paid_places` (tournaments) sets the stage. Training decisions get
+    their own mode, so the cash measures leave them out."""
     spot = review.situation
     table = "heads-up" if spot.dealt == 2 else "3-5" if spot.dealt <= 5 else "6-8"
     result = {
-        "mode": "tournament" if tournament else "cash",
+        "mode": "training" if training else "tournament" if tournament else "cash",
         "table": table,
         "pot": "heads-up" if spot.players == 2 else "multiway",
         "street": spot.street.value.lower(),

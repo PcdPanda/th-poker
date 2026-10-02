@@ -1,13 +1,16 @@
 """The small abstract action set bots choose from, and its mapping to legal chip amounts."""
 
-from   enum                     import Enum
+from   collections.abc          import Mapping
+import enum
+from   functools                import lru_cache
 import math
 from   thpoker.game.rules       import legal_actions
 from   thpoker.game.state       import (Action, ActionType, GameState,
                                         LegalActions, Observation, Street)
+from   types                    import MappingProxyType
 
 
-class AbstractAction(str, Enum):
+class AbstractAction(enum.StrEnum):
     FOLD = "FOLD"
     CHECK = "CHECK"
     CALL = "CALL"
@@ -200,19 +203,30 @@ def fit_to_legal(
     check when raising is not allowed. `legal` saves recomputing `legal_abstract_actions`."""
     if legal is None:
         legal = legal_abstract_actions(view)
-    result: dict[AbstractAction, float] = {a: 0.0 for a in legal}
-    aggressive_legal = [a for a in legal if a in AGGRESSIVE]
+    targets = _targets(tuple(legal))
+    result: dict[AbstractAction, float] = dict.fromkeys(legal, 0.0)
+
     for action, weight in weights.items():
-        if weight <= 0:
-            continue
-        if action in result:
-            target = action
-        elif action in AGGRESSIVE and aggressive_legal:
-            target = aggressive_legal[0]
-        else:
-            target = AbstractAction.CALL if AbstractAction.CALL in result else AbstractAction.CHECK
-        result[target] += weight
+        if weight > 0:
+            result[targets[action]] += weight
     return result
+
+
+@lru_cache(maxsize=64)
+def _targets(legal: tuple[AbstractAction, ...]) -> Mapping[AbstractAction, AbstractAction]:
+    """Where `fit_to_legal` moves each abstract action's weight (read-only: the cache shares it)."""
+    aggressive_legal = [a for a in legal if a in AGGRESSIVE]
+    passive = AbstractAction.CALL if AbstractAction.CALL in legal else AbstractAction.CHECK
+    return MappingProxyType(
+        {
+            action: action
+            if action in legal
+            else aggressive_legal[0]
+            if action in AGGRESSIVE and aggressive_legal
+            else passive
+            for action in AbstractAction
+        }
+    )
 
 
 # Facing a bet, hands at least this far ahead of their range never fold.

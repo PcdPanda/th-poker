@@ -9,7 +9,7 @@ opponents; the loss against the actual bot is shown next to it, and a large gap 
 marks an exploit spot. Tournament decisions are ranked by ICM loss instead of chips.
 """
 
-from   collections.abc          import Sequence
+from   collections.abc          import Mapping, Sequence
 from   dataclasses              import dataclass, replace
 import itertools
 import math
@@ -509,29 +509,33 @@ def review_hand(
     payouts: Sequence[float] | None = None,
     min_branch: float = MIN_BRANCH,
     solver_seconds: float | None = SOLVER_BUDGET,
+    reviewed: Mapping[int, DecisionReview] | None = None,
 ) -> HandReview:
     """Review every decision `user` made in the finished `hand` played against `bots`. With a
     tournament's `payouts`, decisions are judged in ICM equity; `min_branch` is passed to
     `option_values`; `solver_seconds` is the time for each heads-up cash river solve (None for
-    the walk alone, as in the triage pass)."""
-    exploitative_track = track(hand, user, bots, reference)
-    reference_track = track(hand, user, bots, reference, reference_view=True)
-    decisions = [
-        _review_decision(
-            index,
-            exploitative_track[index],
-            reference_track[index],
-            user,
-            bots,
-            reference,
-            payouts,
-            min_branch,
-            solver_seconds,
-            entry.action,
-        )
-        for index, entry in enumerate(hand.history)
-        if entry.seat == user
-    ]
+    the walk alone, as in the triage pass). `reviewed` holds decisions already reviewed with
+    the same settings, by history index (a decision depends only on the actions before it)."""
+    indices = [index for index, entry in enumerate(hand.history) if entry.seat == user]
+    found = dict(reviewed or {})
+    missing = [index for index in indices if index not in found]
+    if missing:
+        exploitative_track = track(hand, user, bots, reference)
+        reference_track = track(hand, user, bots, reference, reference_view=True)
+        for index in missing:
+            found[index] = _review_decision(
+                index,
+                exploitative_track[index],
+                reference_track[index],
+                user,
+                bots,
+                reference,
+                payouts,
+                min_branch,
+                solver_seconds,
+                hand.history[index].action,
+            )
+    decisions = [found[index] for index in indices]
     big_blind = hand.config.big_blind
     net = hand.stacks[user] - hand.starting_stacks[user]
     expected = all_in_net(hand, user)

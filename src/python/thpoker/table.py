@@ -130,6 +130,8 @@ class TableConfig:
             tournament["ante_type"] = AnteType(tournament["ante_type"])
             tournament["payouts"] = tuple(tournament["payouts"])
             session["tournament"] = TournamentConfig(**tournament)
+        if "user_hands" in session:
+            session["user_hands"] = tuple(session["user_hands"])
         return cls(
             SessionConfig(**session),
             tuple(data["bot_styles"]),

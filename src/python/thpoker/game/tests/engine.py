@@ -3,16 +3,15 @@ from   dataclasses              import replace
 import hashlib
 from   itertools                import combinations
 import json
-
 import pytest
-
 from   thpoker.game.cards       import (COMBOS, COMBOS_OF_CLASS,
                                         CardParseError, PREFLOP_CLASSES,
                                         card_str, combo_index, parse_card,
                                         parse_cards, preflop_class)
 from   thpoker.game.engine      import (Pot, apply_action, build_pots,
-                                        is_terminal, net_results, new_hand,
-                                        observation, replay_states, split_pot)
+                                        dealt_hole_cards, is_terminal,
+                                        net_results, new_hand, observation,
+                                        replay_states, split_pot)
 from   thpoker.game.evaluator   import (CATEGORY_NAMES, category, describe,
                                         evaluate, evaluate_combos)
 from   thpoker.game.rng         import Rng
@@ -190,6 +189,16 @@ def test_observation_hides_other_cards_deck_and_seed_until_showdown():
     assert "987654" not in json.dumps(view.to_dict())
     state = play(state, CALL, CHECK, CHECK, CHECK, CHECK, CHECK, CHECK, CHECK)
     assert observation(state, 0).hole_cards[1] == tuple(parse_cards("KhKd"))
+
+
+@pytest.mark.parametrize("dealt_in", [(True, True), (True,) * 6, (True, False, True, True, False, True, True, True)])
+def test_dealt_hole_cards_are_the_cards_the_hand_deals(dealt_in):
+    seats = range(len(dealt_in))
+    for seed in range(4):
+        for button in (s for s in seats if dealt_in[s]):
+            hand, _ = new_hand(GameConfig(len(dealt_in)), seed, button, (100,) * len(dealt_in), dealt_in)
+            for seat in (s for s in seats if dealt_in[s]):
+                assert dealt_hole_cards(seed, button, dealt_in, seat) == hand.hole_cards[seat]
 
 
 def test_finished_hand_observation_and_events_round_trip_through_json():
