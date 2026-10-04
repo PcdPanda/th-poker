@@ -13,9 +13,8 @@ from   collections.abc          import Mapping, Sequence
 from   dataclasses              import dataclass, replace
 import itertools
 import math
-
 import numpy as np
-
+from   functools                import lru_cache
 from   thpoker.analysis.ev      import (MIN_BRANCH, OptionValue, PROFILES,
                                         Profile, icm_value_of, option_values)
 from   thpoker.analysis.solver  import solve_river
@@ -229,6 +228,7 @@ def situation(view: Observation) -> Situation:
     )
 
 
+@lru_cache(maxsize=1 << 15)
 def hand_group(hole: tuple[int, int], board: tuple[int, ...]) -> str:
     """The make-up group of a hand: a made hand counts only when a hole card improves on the
     board, so a pair on the board is not everyone's pair."""
@@ -268,7 +268,7 @@ def hand_group(hole: tuple[int, int], board: tuple[int, ...]) -> str:
     return "air"
 
 
-def range_view(weights: np.ndarray, board: tuple[int, ...]) -> RangeView:
+def range_view(weights: np.ndarray, board: tuple[int, ...], make_up: bool = True) -> RangeView:
     possible = np.array([not (a in board or b in board) for a, b in COMBOS])
     top = weights.max()
     relative = weights / top if top > 0 else weights
@@ -277,7 +277,7 @@ def range_view(weights: np.ndarray, board: tuple[int, ...]) -> RangeView:
     counts = np.bincount(classes_of, minlength=len(PREFLOP_CLASSES))
     classes = tuple(float(v) for v in np.divide(by_class, counts, out=np.zeros_like(by_class), where=counts > 0))
     groups = None
-    if board:
+    if board and make_up:
         groups = dict.fromkeys(GROUPS, 0.0)
         total = weights.sum()
         for index in np.flatnonzero(weights):

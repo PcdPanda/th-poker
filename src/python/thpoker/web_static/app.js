@@ -33,6 +33,9 @@ let session = null;
 let state = null;
 let busy = false;
 let chanceAsked = 0;
+let chance = null;
+let guess = null;
+let revealed = false;
 const openMoves = new Set(); // "session/hand" of the rows showing their moves, across re-renders
 
 async function api(path, body) {
@@ -208,7 +211,7 @@ function show(view) {
   document.getElementById("new-game").hidden = view !== "table";
   document.getElementById("helpers-toggle").hidden = view !== "table";
   document.getElementById("training-pill").hidden = view !== "table" || !state || !state.training;
-  document.getElementById("chance-toggle").hidden = view !== "table" || !state || !state.training;
+  document.getElementById("chance-mode").hidden = view !== "table" || !state || !state.training;
 }
 
 function seatNames(players) {
@@ -319,6 +322,7 @@ function renderTable() {
   const places = ring(seats.length);
   const boxes = seats.map((seat, index) => {
     const box = renderSeat(seat, index === mine);
+    box.dataset.seat = String(index);
     const [x, y] = places[(index - mine + seats.length) % seats.length];
     box.style.setProperty("--x", (50 + 50 * x).toFixed(2) + "%");
     box.style.setProperty("--y", (50 + 54 * y).toFixed(2) + "%");  // a little past the rail
@@ -366,22 +370,125 @@ function renderStatus() {
   const pill = document.getElementById("training-pill");
   pill.hidden = !state.training;
   if (state.training) pill.textContent = trainingText(state.training, state.seats.length);
-  document.getElementById("chance-toggle").hidden = !state.training;
+  document.getElementById("chance-mode").hidden = !state.training;
+}
+
+function chanceMode() {
+  return document.querySelector("input[name=chance]:checked").value;
 }
 
 async function showChance() {
-  // An answer that arrives after the table has moved on is dropped.
-  const target = document.getElementById("chance");
+  // Either an answer for the start of the turn, or a guess is answered all at once; an answer that arrives
+  // after the table has moved on is dropped.
   const mine = ++chanceAsked;
-  target.textContent = "";
-  if (!state || !state.training || !state.your_turn || !document.getElementById("show-chance").checked) return;
+  chance = null;
+  guess = null;
+  revealed = false;
+  drawChance();
+  if (!state || !state.training || !state.your_turn || chanceMode() === "off") return;
   try {
     const answer = await api("sessions/" + session + "/chance");
-    if (mine === chanceAsked) target.textContent = "Chance to win " + percent(answer.chance);
+    if (mine === chanceAsked) chance = answer;
   } catch (error) {
-    if (mine === chanceAsked) target.textContent = error.message;
+    if (mine === chanceAsked) chance = { error: error.message };
   }
+  if (mine === chanceAsked) drawChance();
 }
+
+function drawChance() {
+  // Only the line is read out to screen readers, not the guess buttons.
+  const line = document.getElementById("chance-line");
+  const more = document.getElementById("chance-more");
+  line.textContent = "";
+  line.classList.remove("error");
+  more.replaceChildren();
+  for (const chip of document.querySelectorAll(".seat-chance")) chip.remove();
+  const mode = chanceMode();
+  if (!state || !state.training || !state.your_turn || mode === "off") return;
+  if (mode === "guess" && !revealed) {
+    const guesses = element("div", "guesses");
+    for (let tenth = 1; tenth <= 9; tenth++) {
+      const chip = button(tenth * 10 + "%", () => reveal(tenth / 10), "chip", String(tenth));
+      chip.title = "Guess " + tenth * 10 + "% -- key: " + tenth;
+      guesses.append(chip);
+    }
+    const skip = button("Show", () => reveal(null), "chip quiet", "s");
+    skip.title = "See it without guessing -- key: S";
+    guesses.append(skip);
+    line.textContent = "Guess your chance to win:";
+    more.append(guesses);
+    return;
+  }
+  if (chance === null) {
+    line.textContent = "Working it out...";
+    return;
+  }
+  if (chance.error) {
+    line.textContent = chance.error;
+    line.classList.add("error");
+    return;
+  }
+  const names = chance.opponents.map((opponent) => state.seats[opponent.seat].name);
+  const against = names.length === 1 ? names[0] : names.length === 2 ? "both " + names.join(" and ") : names.length + " opponents";
+  line.textContent = "Chance to win " + percent(chance.chance) + " against " + against;
+  if (guess !== null) line.textContent += " -- you guessed " + percent(guess) + " (" + guessWords(guess, chance.chance) + ")";
+  if (chance.opponents.some((opponent) => !opponent.acted)) {
+    more.append(element("p", "still", "Players still to act count as holding any two cards; most of them will fold."));
+  }
+  chance.opponents.forEach((opponent, index) => seatChance(opponent, names[index]));
+}
+
+function reveal(choice) {
+  guess = choice;
+  revealed = true;
+  drawChance();
+}
+
+function guessWords(guessed, actual) {
+  const off = Math.round(100 * guessed) - Math.round(100 * actual);
+  if (Math.abs(off) <= 5) return "close";
+  return (Math.abs(off) <= 15 ? "a bit " : "too ") + (off > 0 ? "high" : "low");
+}
+
+function seatChance(opponent, name) {
+  const text = "Your chance " + percent(opponent.chance);
+  let chip;
+  if (!opponent.acted) {
+    chip = element("span", "seat-chance muted", text);
+    chip.title = name + " hasn't acted yet, so this counts any two cards";
+  } else if (opponent.width > 0.6) {
+    // (where 1.0 is every hand) the grid would be unhelpful
+    chip = element("span", "seat-chance muted", text);
+    chip.title = name + " could still hold almost any hand";
+  } else {
+    chip = button(text, () => openRange(opponent, name), "seat-chance");
+    chip.title = "Your chance to win against " + name + " alone, who likely holds about " +
+      percent(opponent.width) + " of hands. Click to see them.";
+  }
+  document.querySelector(".seat[data-seat='" + opponent.seat + "']").append(chip);
+}
+
+function openRange(opponent, name) {
+  const dialog = document.getElementById("range-dialog");
+  const box = document.getElementById("range-box");
+  const width = percent(opponent.width);
+  box.replaceChildren(
+    element("h3", "", name + "'s likely hands"),
+    element("p", "", "About " + width + " of all hands, given how " + name + " has played. Brighter means more likely."),
+  );
+  if (state.board.length) {
+    const board = element("p", "", "Board: ");
+    for (const text of state.board) board.append(card(text, true));
+    box.append(board);
+  }
+  box.append(
+    rangeGrid(opponent.classes, name + " likely holds about " + width + " of hands"),
+    element("p", "", "Your chance against " + name + " alone: " + percent(opponent.chance)),
+    button("Close", () => dialog.close(), "secondary"),
+  );
+  dialog.showModal();
+}
+
 
 function raiseLabel(kind, amount) {
   return (kind === "bet" ? "Bet " : "Raise to ") + chips(amount);

@@ -525,10 +525,114 @@ a.download {
 }
 
 #chance {
+  min-height: 1.5em;
+  margin: 0.15rem 0 0;
+}
+
+#chance-line {
   color: var(--gold);
   font-weight: 600;
-  margin: 0.15rem 0 0;
+  margin: 0;
   cursor: help;
+}
+
+#chance-line.error {
+  color: var(--bad);
+}
+
+.still {
+  color: var(--muted);
+  font-size: 0.8rem;
+  margin: 0.1rem 0 0;
+}
+
+.guesses {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.2rem;
+  margin-top: 0.2rem;
+}
+
+button.chip.quiet {
+  background: none;
+  color: var(--muted);
+}
+
+.seat-chance {
+  font-size: 0.75rem;
+  font-weight: 600;
+  border: 1px solid var(--gold);
+  border-radius: 999px;
+  color: var(--gold);
+  background: none;
+  padding: 0 0.5rem;
+  margin: 0;
+}
+
+.seat-chance.muted {
+  border: 1px dashed var(--muted);
+  color: var(--muted);
+  cursor: help;
+}
+
+#chance-mode {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 0.4rem;
+  margin: 0 0 1rem;
+  font-size: 0.9rem;
+}
+
+#chance-mode span {
+  color: var(--muted);
+}
+
+#chance-mode label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.15rem 0.6rem;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  cursor: pointer;
+}
+
+#chance-mode label:has(input:checked) {
+  border-color: var(--gold);
+  color: var(--gold);
+}
+
+#chance-mode input {
+  accent-color: var(--gold);
+}
+
+#range-dialog {
+  padding: 0;
+  width: min(30rem, calc(100% - 1rem));
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--panel);
+  color: var(--text);
+}
+
+#range-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+
+#range-box {
+  padding: 0.8rem 1rem;
+}
+
+#range-box .grid {
+  max-width: none;
+}
+
+#range-box button {
+  min-height: 44px;
 }
 
 #controls {

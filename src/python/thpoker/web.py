@@ -20,8 +20,8 @@ import secrets
 from   thpoker.analysis.ev      import (OptionValue, PROFILES, Profile,
                                         pick_profile)
 from   thpoker.analysis.review  import (DecisionReview, REFERENCE, best_option,
-                                        position_names, review_decision,
-                                        thresholds)
+                                        position_names, range_view,
+                                        review_decision, thresholds)
 from   thpoker.analysis.stats   import (DecisionRecord, hand_rows,
                                         write_hands_csv)
 from   thpoker.analysis.tracking \
@@ -525,7 +525,8 @@ class WebTable(PlaySession):
 
     def chance(self) -> dict[str, Any]:
         """A training helper: the user's chance to win now against the hands the others likely
-        hold, read from their play with their own policies, as the coach reads them."""
+        hold, read from their play with their own policies as the coach reads them, overall and
+        against each opponent alone, with each one's likely hands."""
         runner = self.runner
         if runner.config.session.mode != Mode.TRAINING:
             raise WebError("the chance to win is shown in training only")
@@ -535,9 +536,23 @@ class WebTable(PlaySession):
         hole = hand.hole_cards[user]
         assert hole is not None
         ranges = track(hand, user, runner.bots, REFERENCE)[-1].ranges
-        opponents = [weights for seat, weights in ranges.items() if seat != user]
+        opponents = {seat: weights for seat, weights in ranges.items() if seat != user}
         seed = public_seed(observation(hand, user))
-        return {"chance": round(hand_equity(hole, hand.board, opponents, Rng(seed)).value, 3)}
+        acted = {entry.seat for entry in hand.history}
+        entries = []
+        for seat, weights in opponents.items():
+            view = range_view(weights, hand.board, make_up=False)
+            entries.append(
+                {
+                    "seat": seat,
+                    "chance": round(hand_equity(hole, hand.board, [weights], Rng(seed)).value, 3),
+                    "acted": seat in acted,
+                    "width": round(view.width, 3),
+                    "classes": [round(w, 3) for w in view.classes],
+                }
+            )
+        overall = hand_equity(hole, hand.board, list(opponents.values()), Rng(seed))
+        return {"chance": round(overall.value, 3), "opponents": entries}
 
     def hands_csv(self) -> Download:
         return _csv(self.rows, f"{self.name}.csv")

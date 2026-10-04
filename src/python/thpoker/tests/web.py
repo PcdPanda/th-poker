@@ -2,17 +2,16 @@ import csv
 import http.client
 import io
 import json
-import numpy as np
 import pytest
 from   thpoker.analysis.ev      import PROFILES
 import thpoker.analysis.review
 from   thpoker.bots.equity_bot  import public_seed
 from   thpoker.cli              import build_config, parse_args
-from   thpoker.game.cards       import COMBOS, card_str, parse_cards
+from   thpoker.game.cards       import card_str, parse_cards
 from   thpoker.game.engine      import observation
 from   thpoker.game.rng         import Rng
 from   thpoker.game.state       import Action, ActionType
-from   thpoker.odds             import hand_equity
+from   thpoker.odds             import FULL_RANGE, hand_equity
 from   thpoker.storage          import read_session_log
 import thpoker.table
 from   thpoker.tests.text       import fold_to_a_bet
@@ -333,19 +332,25 @@ def test_training_hands_are_named_from_the_classes_dealt(spec, label):
 
 def test_training_shows_the_chance_to_win_against_the_likely_hands():
     app = App(None)
-    setup = {**SETUP, "mode": "training", "seats": 2, "position": "BTN", "hands": "0-0.1"}
-    created = call(app, "POST", ["sessions"], setup)
-    key, state = created["id"], created["state"]
+    setup = {**SETUP, "mode": "training", "position": "BTN", "hands": "0-0.1"}
+    three = call(app, "POST", ["sessions"], {**setup, "seats": 3})
+    state = three["state"]
     assert state["your_turn"] and [c[0] for c in state["seats"][0]["cards"]] == ["A", "A"]
-    # First to act heads-up, so against any two cards: aces win 85.2% of the time.
-    assert call(app, "GET", ["sessions", key, "chance"], {}) == {"chance": 0.852}
+    # First to act, so against any two cards (published): aces win 73.4% against two players,
+    # 85.2% against one.
+    first = call(app, "GET", ["sessions", three["id"], "chance"], {})
+    assert first["chance"] == pytest.approx(0.734, abs=0.02)
+    seats = [(o["seat"], o["chance"], o["acted"]) for o in first["opponents"]]
+    assert seats == [(1, 0.852, False), (2, 0.852, False)]
+    key = call(app, "POST", ["sessions"], {**setup, "seats": 2})["id"]
     state = call(app, "POST", ["sessions", key, "action"], {"kind": "call"})
     # With seed 8 the big blind checks before and after the flop: weaker than any two cards.
     hand = app.tables[key].runner.hand
     assert state["your_turn"] and len(hand.board) == 3 and hand.hole_cards[0] is not None
     seed = public_seed(observation(hand, 0))
-    any_two = hand_equity(hand.hole_cards[0], hand.board, [np.ones(len(COMBOS))], Rng(seed))
-    assert call(app, "GET", ["sessions", key, "chance"], {})["chance"] > any_two.value + 0.02
+    any_two = hand_equity(hand.hole_cards[0], hand.board, [FULL_RANGE], Rng(seed))
+    answer = call(app, "GET", ["sessions", key, "chance"], {})
+    assert answer["chance"] > any_two.value + 0.02 and answer["opponents"][0]["acted"]
     play_out(app, key)
     with pytest.raises(WebError, match="hand being played"):
         call(app, "GET", ["sessions", key, "chance"], {})

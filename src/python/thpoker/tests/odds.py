@@ -166,11 +166,15 @@ def test_flop_estimate_agrees_with_brute_force():
 
 
 def test_preflop_equities_match_published_values():
-    # Published all-in equities: AA vs KK 82%, QQ vs AKo 57%, AA vs any two cards 85%.
+    # Published all-in equities: AA vs KK 82%, QQ vs AKo 57%, AA vs any two cards 85%, and vs
+    # two and five players with any two cards 73.4% and 49.2%.
     assert hand_equity(cards("AhAd"), (), [of_class("KK")], Rng(1)).value == pytest.approx(0.82, abs=0.02)
     assert hand_equity(cards("QhQd"), (), [of_class("AKo")], Rng(1)).value == pytest.approx(0.57, abs=0.02)
     assert equity_vs_random(cards("AhAd")) == pytest.approx(0.85, abs=0.01)
     assert hand_equity(cards("AhAd"), (), [FULL_RANGE], Rng(1)).value == pytest.approx(0.85, abs=0.01)
+    for players, published in ((2, 0.734), (5, 0.492)):
+        equity = hand_equity(cards("AhAd"), (), [FULL_RANGE] * players, Rng(1))
+        assert equity.value == pytest.approx(published, abs=0.02)
 
 
 @pytest.mark.parametrize(

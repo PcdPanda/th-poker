@@ -17,10 +17,6 @@
       title="Hide pot odds, hand names, chips-in-the-pot totals and player stats, as at a real table">
       <input type="checkbox" id="hide-helpers"> Hide helpers
     </label>
-    <label class="toggle" id="chance-toggle" hidden
-      title="On your turn, your chance to win against the hands the others likely hold, given how they have played">
-      <input type="checkbox" id="show-chance"> Chance to win
-    </label>
     <a href="#glossary" id="words-link">Poker words</a>
     <button type="button" id="new-game" class="link" hidden>New game</button>
   </header>
@@ -92,9 +88,11 @@
           <div id="board" class="cards"></div>
           <div id="pot"></div>
           <p id="status" aria-live="polite"></p>
-          <p id="chance"
+          <div id="chance"
             title="Against the hands the others likely hold, given how they have played so far (the coach's read). Ties count half.">
-          </p>
+            <p id="chance-line" aria-live="polite"></p>
+            <div id="chance-more"></div>
+          </div>
           <p id="odds" class="helper"></p>
         </div>
       </div>
@@ -108,6 +106,13 @@
         <div id="between"></div>
         <p class="error" id="table-error" role="alert"></p>
       </div>
+      <div id="chance-mode" role="radiogroup" aria-labelledby="chance-mode-title" hidden>
+        <span id="chance-mode-title">Chance to win</span>
+        <label title="Don't show it"><input type="radio" name="chance" value="off" checked> Off</label>
+        <label title="Show it on every turn"><input type="radio" name="chance" value="show"> Show</label>
+        <label title="Guess it on every turn, then see it. Your guesses aren't saved."><input type="radio" name="chance"
+            value="guess"> Guess first</label>
+      </div>
       <div id="panels">
         <section class="panel">
           <h2>Hand log <span class="tools" id="log-tools"></span></h2>
@@ -118,6 +123,9 @@
           <div id="coach"></div>
         </section>
       </div>
+      <dialog id="range-dialog">
+        <div id="range-box"></div>
+      </dialog>
       <details id="your-hands">
         <summary>Your hands <span id="net" title="Since you sat down"></span></summary>
         <div id="hands-table"></div>
@@ -175,7 +183,7 @@
           in 3 (33%), and you win more often than that, the call pays.</dd>
         <dt>Chance to win</dt>
         <dd>How often your hand would win against the hands the others likely hold, if all the cards were dealt. Also
-          called equity.</dd>
+          called equity. On each player you'll also see your chance against that player alone.</dd>
         <dt>Likely hands</dt>
         <dd>The hands a player could have, given what they have done so far. Also called a range.</dd>
         <dt>Average result</dt>

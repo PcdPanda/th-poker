@@ -78,6 +78,7 @@ _COMBO_CLASSES = np.array(COMBO_CLASS)
 RUNOUT_SAMPLES = 24
 # More runouts when nobody can bet any more: the value is then all there is to estimate.
 SETTLED_FLOP_SAMPLES = 96
+PREFLOP_BOARDS = 512
 PREFLOP_TABLE = Path(__file__).resolve().parent / "data" / "preflop_equity.json.gz"
 
 
@@ -339,6 +340,45 @@ def _board_equity(
     return equity, weight
 
 
+@cache
+def _preflop_boards() -> tuple[np.ndarray, np.ndarray]:
+    """A fixed sample of complete boards: their cards, and every combo's value on each."""
+    boards = _completions((), PREFLOP_BOARDS, Rng(0))
+    cards = np.array(boards)
+    values = np.stack([_value_array(board) for board in boards])
+    cards.flags.writeable = values.flags.writeable = False  # shared by the cache
+    return cards, values
+
+
+@lru_cache(maxsize=1)
+def _preflop_scores(hole: tuple[int, int]) -> tuple[np.ndarray, np.ndarray]:
+    """On each preflop board without `hole`'s cards: the combos still possible (1 or 0), and
+    each combo's score against `hole` (1 when beaten, 0.5 when tied). A review asks about one
+    hole with many ranges."""
+    cards, values = _preflop_boards()
+    values = values[~np.isin(cards, hole).any(axis=1)]
+    hero = values[:, combo_index(*hole)][:, None]
+    possible = (values >= 0) & ~np.isin(COMBO_CARDS, hole).any(axis=1)
+    score = np.where(values < hero, 1.0, np.where(values == hero, 0.5, 0.0)) * possible
+    possible = possible.astype(float)
+    possible.flags.writeable = score.flags.writeable = False  # shared by the cache
+    return possible, score
+
+
+def _multiway_preflop_equity(hole: tuple[int, int], ranges: list[np.ndarray]) -> Equity:
+    """`_sampled_equity` over the fixed preflop boards, for all boards and ranges at once."""
+    possible, score = _preflop_scores(hole)
+    weights = np.stack(ranges, axis=1)
+    totals = possible @ weights
+    shares = np.divide(score @ weights, totals, out=np.zeros_like(totals), where=totals > 0)
+    equity, weight = shares.prod(axis=1), totals.prod(axis=1)
+    if not weight.sum():
+        raise ValueError("an opponent range is empty after card removal")
+    mean = float((equity * weight).sum() / weight.sum())
+    stderr = float(np.sqrt(((weight * (equity - mean)) ** 2).sum()) / weight.sum())
+    return Equity(mean, stderr, exact=False)
+
+
 def _preflop_equity(hole: tuple[int, int], ranges: list[np.ndarray]) -> Equity:
     table, table_stderr = preflop_table()
     row = np.asarray(table[COMBO_CLASS[combo_index(*hole)]])[_COMBO_CLASSES]
@@ -359,6 +399,7 @@ def hand_equity(hole: tuple[int, int], board: tuple[int, ...], ranges: Sequence[
     On the river the result is exact against one opponent. On the flop and turn, `RUNOUT_SAMPLES` completions of the
     board are drawn from `rng`; seeding `rng` from public information only makes every
     hypothetical hand see the same boards, which keeps bot play and range tracking consistent.
+    Preflop it reads the heads-up table against one opponent and uses the fixed `PREFLOP_BOARDS` against several.
     Raises `ValueError` without opponents, with a board of 1, 2, or more than 5 cards, or when
     card removal leaves an opponent's range empty.
     """
@@ -368,6 +409,8 @@ def hand_equity(hole: tuple[int, int], board: tuple[int, ...], ranges: Sequence[
         raise ValueError(f"board must have 0, 3, 4, or 5 cards, got {len(board)}")
     arrays = _arrays(ranges)
     if not board:
+        if len(arrays) > 1:
+            return _multiway_preflop_equity(hole, arrays)
         return _preflop_equity(hole, arrays)
     live = _live_combos(set(hole) | set(board), arrays)
     if len(board) == 5:
