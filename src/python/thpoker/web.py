@@ -978,12 +978,15 @@ class App:
                 except (OSError, ValueError):
                     continue
             return _csv(rows, "thpoker-hands.csv")
+        if method == "POST" and parts == ["history", "delete"]:
+            names = payload.get("names")
+            if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+                raise WebError("the delete needs a list of session names")
+            return self._delete([logs[name] for name in names])
         if len(parts) < 2:
             raise KeyError(parts)
         path = logs[parts[1]]
         command = parts[2] if len(parts) > 2 else None
-        if method == "POST" and command == "delete":
-            return self._delete(path)
         if method == "GET" and command in (None, "hands.csv"):
             rows = self._rows(path)
             if command is None:
@@ -1008,18 +1011,19 @@ class App:
         rated = saved.ratings.get(hand.hand_id)
         return _coach_json(saved.runner, saved.scale, hand, review.decisions, shows, review, kept=rated)
 
-    def _delete(self, path: Path) -> dict[str, Any]:
-        """Delete a saved session. A table still writing it is dropped first, its reviews
+    def _delete(self, paths: list[Path]) -> dict[str, Any]:
+        """Delete saved sessions. A table still writing one is dropped first, its reviews
         cancelled, so nothing brings the file back."""
-        for key, table in list(self.tables.items()):
-            if table in self._live(path):
-                for jobs in table.jobs.values():
-                    jobs.cancel()
-                assert table.log is not None
-                table.log.delete()
-                del self.tables[key]
-        path.unlink(missing_ok=True)
-        self.saved.pop(path, None)
+        for path in paths:
+            for key, table in list(self.tables.items()):
+                if table in self._live(path):
+                    for jobs in table.jobs.values():
+                        jobs.cancel()
+                    assert table.log is not None
+                    table.log.delete()
+                    del self.tables[key]
+            path.unlink(missing_ok=True)
+            self.saved.pop(path, None)
         listed = self._history("GET", ["history"], {})
         assert isinstance(listed, dict)
         return listed

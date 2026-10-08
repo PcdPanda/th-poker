@@ -343,7 +343,7 @@ def test_a_request_waiting_for_a_review_holds_up_no_one_and_ends_with_its_table(
         state = call(app, "GET", ["sessions", key], {})
         assert state["your_turn"] and asking.is_alive() and not outcome
         (saved,) = call(app, "GET", ["history"], {})["sessions"]
-        call(app, "POST", ["history", saved["name"], "delete"], {})  # while the hint waits
+        call(app, "POST", ["history", "delete"], {"names": [saved["name"]]})  # while the hint waits
     finally:
         release.set()
         if asking.ident is not None:
@@ -481,23 +481,26 @@ def test_past_sessions_read_back_the_same_hands_as_the_live_table(tmp_path):
             app.handle("GET", ["history", name], {})
 
 
-def test_a_saved_session_can_be_deleted_and_nothing_brings_it_back(tmp_path):
+def test_saved_sessions_can_be_deleted_together_and_nothing_brings_them_back(tmp_path):
     app = App(tmp_path)
-    key = call(app, "POST", ["sessions"], SETUP)["id"]
+    keys = [call(app, "POST", ["sessions"], {**SETUP, "seed": seed})["id"] for seed in (8, 9)]
     hold = threading.Event()
-    REVIEWS.submit(hold.wait)  # the hand's rating has not run when the session is deleted
+    REVIEWS.submit(hold.wait)  # the hands' ratings have not run when the sessions are deleted
     try:
-        play_out(app, key)
-        (saved,) = call(app, "GET", ["history"], {})["sessions"]
-        listed = call(app, "POST", ["history", saved["name"], "delete"], {})
+        for key in keys:
+            play_out(app, key)
+        names = [saved["name"] for saved in call(app, "GET", ["history"], {})["sessions"]]
+        with pytest.raises(KeyError):  # only listed logs can be deleted, and then none is
+            app.handle("POST", ["history", "delete"], {"names": [names[0], "session-1"]})
+        assert len(call(app, "GET", ["history"], {})["sessions"]) == 2
+        listed = call(app, "POST", ["history", "delete"], {"names": names})
     finally:
         hold.set()
     REVIEWS.submit(int).result()
     assert listed["sessions"] == [] and not list(tmp_path.glob("session-*.jsonl"))
-    with pytest.raises(KeyError):  # the table writing it went with it
-        call(app, "GET", ["sessions", key], {})
-    with pytest.raises(KeyError):  # only listed logs can be deleted
-        app.handle("POST", ["history", saved["name"], "delete"], {})
+    for key in keys:
+        with pytest.raises(KeyError):  # the tables writing them went with them
+            call(app, "GET", ["sessions", key], {})
 
 
 def test_the_state_counts_the_chips_in_the_pot_the_pot_odds_and_the_hand_result():

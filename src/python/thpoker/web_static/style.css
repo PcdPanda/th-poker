@@ -1095,6 +1095,15 @@ button.danger {
   border-color: var(--bad);
 }
 
+button.danger:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+table.hands label.inline {
+  white-space: nowrap;
+}
+
 @media (max-width: 720px) {
   table.hands .wide-only {
     display: none;
@@ -1102,5 +1111,10 @@ button.danger {
 
   button.danger {
     min-height: 44px;
+  }
+
+  table.hands input[type=checkbox] {
+    width: 1.25rem;
+    height: 1.25rem;
   }
 }

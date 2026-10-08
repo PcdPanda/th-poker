@@ -941,38 +941,70 @@ async function openHistory() {
   show("history");
   document.getElementById("session-hands").replaceChildren();
   document.getElementById("history-coach-panel").hidden = true;
-  await run("history-error", async () => {
-    const answer = await api("history");
-    const target = document.getElementById("sessions");
-    if (!answer.logging) {
-      target.replaceChildren(element("p", "", "Sessions aren't saved: the table was started with --no-log."));
-      return;
-    }
-    if (!answer.sessions.length) {
-      target.replaceChildren(element("p", "", "No saved sessions yet. Play a game and it will show up here."));
-      return;
-    }
-    const table = element("table", "hands");
-    const head = element("tr");
-    for (const title of ["Date", "Game", "Players", "Opponents", "Hands", "Result", ""]) head.append(element("th", "", title));
-    table.append(head);
-    for (const saved of answer.sessions) {
-      const tr = element("tr");
-      tr.append(element("td", "", saved.date), element("td", "", gameName(saved)));
-      tr.append(element("td", "", saved.players), element("td", "", DIFFICULTY[saved.difficulty]), element("td", "", saved.hands));
-      const training = saved.mode === "training";
-      const result = element("td", training ? "muted" : saved.net > 0 ? "up" : saved.net < 0 ? "down" : "", signed(saved.net));
-      if (training) result.title = "Training: not counted in your results";
-      tr.append(result);
-      const open = element("td");
-      open.append(button("Open", () => openSession(saved), "small"));
-      tr.append(open);
-      table.append(tr);
-    }
-    const scroll = element("div", "table-scroll");
-    scroll.append(table);
-    target.replaceChildren(scroll);
+  await run("history-error", async () => listSessions(await api("history")));
+}
+
+function listSessions(answer) {
+  const target = document.getElementById("sessions");
+  if (!answer.logging) {
+    target.replaceChildren(element("p", "", "Sessions aren't saved: the table was started with --no-log."));
+    return;
+  }
+  if (!answer.sessions.length) {
+    target.replaceChildren(element("p", "", "No saved sessions yet. Play a game and it will show up here."));
+    return;
+  }
+  const picks = [];
+  const remove = button("Delete selected", () => deleteSessions(picks.filter((pick) => pick.checked).map((pick) => pick.value)), "danger");
+  remove.disabled = true;
+  const all = element("input");
+  all.type = "checkbox";
+  all.setAttribute("aria-label", "Select all sessions");
+  const update = () => {
+    const count = picks.filter((pick) => pick.checked).length;
+    remove.disabled = !count;
+    all.checked = count === picks.length;
+    all.indeterminate = count > 0 && count < picks.length;
+  };
+  all.addEventListener("change", () => {
+    for (const pick of picks) pick.checked = all.checked;
+    update();
   });
+  const table = element("table", "hands");
+  const head = element("tr");
+  const dateHead = element("th");
+  dateHead.append(all, " Date");
+  head.append(dateHead);
+  for (const title of ["Game", "Players", "Opponents", "Hands", "Result", ""]) head.append(element("th", "", title));
+  table.append(head);
+  for (const saved of answer.sessions) {
+    const tr = element("tr");
+    const pick = element("input");
+    pick.type = "checkbox";
+    pick.value = saved.name;
+    pick.setAttribute("aria-label", "Select " + gameName(saved) + " on " + saved.date);
+    pick.addEventListener("change", update);
+    picks.push(pick);
+    const date = element("td");
+    const label = element("label", "inline");
+    label.append(pick, saved.date);
+    date.append(label);
+    tr.append(date, element("td", "", gameName(saved)));
+    tr.append(element("td", "", saved.players), element("td", "", DIFFICULTY[saved.difficulty]), element("td", "", saved.hands));
+    const training = saved.mode === "training";
+    const result = element("td", training ? "muted" : saved.net > 0 ? "up" : saved.net < 0 ? "down" : "", signed(saved.net));
+    if (training) result.title = "Training: not counted in your results";
+    tr.append(result);
+    const open = element("td");
+    open.append(button("Open", () => openSession(saved), "small"));
+    tr.append(open);
+    table.append(tr);
+  }
+  const actions = element("p", "session-tools");
+  actions.append(remove);
+  const scroll = element("div", "table-scroll");
+  scroll.append(table);
+  target.replaceChildren(actions, scroll);
 }
 
 async function openSession(saved) {
@@ -981,31 +1013,30 @@ async function openSession(saved) {
   await run("history-error", async () => {
     const answer = await api("history/" + encodeURIComponent(name));
     const target = document.getElementById("session-hands");
+    target.dataset.name = name;
     const link = element("a", "download", "CSV");
     link.href = "/api/history/" + encodeURIComponent(name) + "/hands.csv";
     link.title = "Download this session as a CSV file";
     link.prepend(icon("download"));
-    const remove = button("Delete session", () => deleteSession(saved, label), "danger");
     const actions = element("p", "session-tools");
-    actions.append(link, remove);
+    actions.append(link);
     target.replaceChildren(element("h2", "", "Hands: " + label), actions, handsTable(answer.rows, (hand) => reviewSaved(name, hand)));
     refreshRows("history/" + encodeURIComponent(name), target, answer.pending);
   });
 }
 
-async function deleteSession(saved, label) {
-  const question = "Delete this session (" + label + ", " + saved.hands + " hands, " + signed(saved.net) + ")? This can't be undone.";
-  if (!window.confirm(question)) return;
-  let deleted = false;
+async function deleteSessions(names) {
   await run("history-error", async () => {
-    await api("history/" + encodeURIComponent(saved.name) + "/delete", {});
-    deleted = true;
-    for (const key of [...openMoves]) if (key.startsWith(saved.name + "/")) openMoves.delete(key);
-    document.getElementById("session-hands").replaceChildren();
-    document.getElementById("history-coach-panel").hidden = true;
-    tools("history-tools");
+    const answer = await api("history/delete", { names });
+    for (const key of [...openMoves]) if (names.some((name) => key.startsWith(name + "/"))) openMoves.delete(key);
+    const hands = document.getElementById("session-hands");
+    if (names.includes(hands.dataset.name)) {
+      show("history");
+      hands.replaceChildren();
+      document.getElementById("history-coach-panel").hidden = true;
+    }
+    listSessions(answer);
   });
-  if (deleted) await openHistory();  // after a failed delete its error stays on screen
 }
 
 async function reviewSaved(name, hand) {
