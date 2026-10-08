@@ -1,6 +1,8 @@
 import functools
 from   thpoker.analysis.ev      import OptionValue
-from   thpoker.analysis.review  import DecisionReview, Situation, Thresholds
+from   thpoker.analysis.review  import (DecisionReview, MoveRating, Situation,
+                                        Thresholds)
+from   thpoker.game.cards       import parse_cards
 from   thpoker.game.engine      import new_hand
 from   thpoker.game.state       import (Action, ActionType, AnteType, Event,
                                         GameConfig, Street)
@@ -8,7 +10,8 @@ from   thpoker.game.tests.decks import CALL, CHECK, FOLD, play, stacked_deck
 from   thpoker.odds             import Equity
 from   thpoker.text             import (decision_headline, decision_summary,
                                         format_chips, hand_history_text,
-                                        narrate, plain_decision_text)
+                                        hand_summary_text, narrate,
+                                        plain_decision_text, rated_moves_text)
 
 LABELS = {0: "You", 1: "Blake"}
 RAISE_300 = Action(ActionType.RAISE, 300)
@@ -122,6 +125,7 @@ def fold_to_a_bet(tournament: bool) -> DecisionReview:
         "caller",
         0.5,
         100.0,
+        2.0,
     )
     return DecisionReview(
         3,
@@ -130,6 +134,7 @@ def fold_to_a_bet(tournament: bool) -> DecisionReview:
         spot,
         {},
         Equity(0.4, 0.01, False),
+        Equity(0.35, 0.01, False),
         0.8,
         Thresholds(0.25, 0.6, {}),
         Action(ActionType.FOLD),
@@ -143,16 +148,48 @@ def fold_to_a_bet(tournament: bool) -> DecisionReview:
 
 def test_coach_amounts_are_chips_on_the_table_or_shares_of_the_prize_pool():
     cash, tournament = fold_to_a_bet(False), fold_to_a_bet(True)
-    # Blinds 50/100 shown as they are (scale 1); blinds 0.5/1 are kept as 50/100 internally (scale 100).
+    # Blinds 50/100 shown as they are (scale 1); blinds 0.5/1 are kept as 50/100 internally (scale 100)
     assert decision_headline(cash, 1, 100, {}) == (
         "Costly. Best option: call; your fold gave up about 150 chips on average."
     )
     assert decision_headline(cash, 100, 100, {}).endswith("about 1.50 chips on average.")
     assert decision_headline(tournament, 1, 100, {}).endswith("about 3.00% of the prize pool on average.")
-    assert decision_summary(cash, 1, 100)[1] == "Calling costs 200: it pays if you win at least 25% of the time."
+    # Folding gave up 1.5 big blinds (1.3 beyond the noise) of the 4 being played for.
+    assert decision_summary(cash, 1, 100)[0] == "Rated 0.36 of 1 (1 is the best option you had)."
+    assert decision_summary(tournament, 1, 100)[0] == decision_summary(cash, 1, 100)[0]
+    assert decision_summary(cash, 1, 100)[2] == "Calling costs 200: it pays if you win at least 25% of the time."
     options = plain_decision_text(1, cash, {}, 1, 100, {Action(ActionType.CALL): 0.75})[-3:]
     assert options == [
         "  fold: 0 | 0 | 0% (your choice)",
         "  call: +150 ± 10 | +150 ± 10 | 75% (best)",
         "  raise to 900: +25 ± 10 | +25 ± 10 | 0%",
     ]
+
+
+def test_the_rated_moves_and_the_summary_read_like_the_hand():
+    hand = play(queens_against_ace_king(), RAISE_300, CALL, CHECK, CHECK)
+    moves = (MoveRating(0, 1.0, 2.5, False), MoveRating(3, 0.8, 6.0, True))
+    lines = rated_moves_text(hand, 0, moves, 1)
+    assert lines[0].startswith("Your moves, rated from 0 to 1: 1.00 is the best option you had, 0.75 to 0.99 is close")
+    assert lines[1:] == [
+        "  Before the flop: you raise to 300, rated 1.00",
+        "  Flop: you check, rated 0.80 (after a hint)",
+    ]
+    aces, three_two = parse_cards("AsAh"), parse_cards("3c2d")
+    assert hand_summary_text((aces[0], aces[1]), 0.8512, 0.94, 2, True) == (
+        "Your cards (A♠ A♥) are in the best 0.5% of starting hands. At your last move your chance "
+        "to win at showdown was about 85%, reading the others' hands from their play the way a "
+        "strong player would. Your moves this hand rate 0.94 overall, with moves in bigger pots "
+        "counting for more."
+    )
+    worst = (three_two[0], three_two[1])
+    assert hand_summary_text(worst, None, None, 0, True) == (
+        "Your cards (3♣ 2♦) are in the worst 1% of starting hands. You made no decision this hand."
+    )
+    assert hand_summary_text(worst, 0.2, 0.5, 1, False).endswith(
+        "At your latest move your chance to win at showdown was about 20%, reading the others' "
+        "hands from their play the way a strong player would. Your move so far rates 0.50."
+    )
+    assert hand_summary_text(worst, None, None, 2, True) == (
+        "Your cards (3♣ 2♦) are in the worst 1% of starting hands."
+    )

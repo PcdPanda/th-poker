@@ -1,8 +1,11 @@
 """Command-line table: `bin/run_thpoker.py` starts a quick cash game with sensible defaults."""
 
 import argparse
-from   collections.abc          import Callable
-from   dataclasses              import asdict, replace
+from   collections.abc          import Callable, Sequence
+from   concurrent.futures       import (CancelledError, Future,
+                                        ThreadPoolExecutor)
+from   contextlib               import suppress
+from   dataclasses              import asdict, dataclass, field, replace
 from   datetime                 import date
 from   functools                import partial
 import math
@@ -19,9 +22,11 @@ from   thpoker.analysis.drills  import (ChartQuestion, DrillResult, ICM,
                                         new_threshold_question,
                                         threshold_question)
 from   thpoker.analysis.ev      import PROFILES, Profile, pick_profile
-from   thpoker.analysis.review  import (DecisionReview, HandReview, REFERENCE,
-                                        hint, review_decision, review_hand,
-                                        summarize, triaged_review)
+from   thpoker.analysis.review  import (DecisionReview, HandRating, HandReview,
+                                        MoveRating, REFERENCE, hint,
+                                        move_ratings, review_decision,
+                                        review_hand, summarize, triaged_review,
+                                        with_choice)
 from   thpoker.analysis.stats   import (DecisionRecord, hand_rows, loss_by_tag,
                                         patterns, progress, record,
                                         write_hands_csv)
@@ -30,7 +35,7 @@ from   thpoker.analysis.training \
                                         best_action, calibration, grade_option,
                                         mistake_keys, parse_mistake_key,
                                         questions, score)
-from   thpoker.bots.bot         import PRESETS
+from   thpoker.bots.bot         import Bot, PRESETS
 from   thpoker.charts           import seats_from_button
 from   thpoker.game.cards       import cards_str
 from   thpoker.game.engine      import is_terminal
@@ -52,8 +57,9 @@ from   thpoker.text             import (describe_action, format_chips,
                                         hand_history_text, narrate,
                                         render_calibration, render_decision,
                                         render_hand, render_summary)
+import threading
 import time
-from   typing                   import Any
+from   typing                   import Any, Generic, TypeVar
 
 HELP = """Actions:
   f            fold
@@ -64,6 +70,10 @@ HELP = """Actions:
   a            all-in
   h            coach hint (the five steps for this decision)
   ?            show legal actions              q   quit"""
+
+
+T = TypeVar("T")
+REVIEWS = ThreadPoolExecutor(max_workers=1, thread_name_prefix="review")
 
 
 def full_review(
@@ -83,12 +93,152 @@ def full_review(
     )
 
 
+class Task(Generic[T]):
+    """Background work that runs exactly once: on the review thread, or at once in whichever
+    thread asks for its result first, so nobody waits behind the queue for it."""
+
+    def __init__(self, work: Callable[[], T]):
+        self.work = work
+        self.future: Future[T] = Future()
+        self.lock = threading.Lock()
+        self.claimed = False
+
+    def _claim(self) -> bool:
+        with self.lock:
+            claimed, self.claimed = self.claimed, True
+        return not claimed
+
+    def run(self):
+        if self._claim():
+            try:
+                self.future.set_result(self.work())
+            except BaseException as error:  # noqa: BLE001 - kept for whoever asks for the result
+                self.future.set_exception(error)
+
+    def result(self) -> T:
+        self.run()
+        return self.future.result()
+
+    def cancel(self):
+        if self._claim():
+            self.future.cancel()
+
+
+def background(work: Callable[[], T]) -> Task[T]:
+    task = Task(work)
+    REVIEWS.submit(task.run)
+    return task
+
+
+def _settled(task: Task[T]) -> T | None:
+    """A task's result, or None if it failed; a cancellation goes on up, so nothing is computed
+    again for a session being closed."""
+    try:
+        return task.result()
+    except CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - the caller computes it again
+        return None
+
+
+def result_or(task: Task[T] | None, work: Callable[[], T]) -> T:
+    """What the user asked for: the task's result, or `work` done now without a task or when
+    the task failed. A cancelled task, its session closed, is not done again."""
+    if task is not None:
+        try:
+            return task.result()
+        except CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - done again below
+            pass
+    return work()
+
+
+@dataclass
+class HandJobs:
+    """One hand's background reviews by history index: of each user decision from the moment it
+    is the user's turn (`ahead`, with the state then), of each move once made, and of the whole
+    hand once it ends (`rating`). `hinted` holds the decisions made after a coach hint."""
+
+    ahead: dict[int, tuple[GameState, Task[DecisionReview]]] = field(default_factory=dict)
+    moves: dict[int, Task[DecisionReview]] = field(default_factory=dict)
+    hinted: set[int] = field(default_factory=set)
+    rating: Task[HandReview] | None = None
+
+    def cancel(self):
+        """Newest first, so a task never starts on an input about to be cancelled."""
+        tasks: list[Task[Any]] = [] if self.rating is None else [self.rating]
+        tasks += [self.moves[i] for i in sorted(self.moves, reverse=True)]
+        tasks += [self.ahead[i][1] for i in sorted(self.ahead, reverse=True)]
+        for task in tasks:
+            task.cancel()
+
+
+def _move_review(
+    ahead: tuple[GameState, Task[DecisionReview]] | None,
+    hand: GameState,
+    user: int,
+    bots: dict[int, Bot],
+    payouts: Sequence[float] | None,
+    profile: Profile,
+    index: int,
+) -> DecisionReview:
+    """The user's move at `index`: the review made before acting, when it priced the action
+    taken, else a review of its own."""
+    if ahead is not None:
+        before, task = ahead
+        early = _settled(task)
+        done = with_choice(early, before, hand.history[index].action) if early else None
+        if done is not None:
+            return done
+    return review_decision(hand, user, bots, REFERENCE, index, payouts, profile.min_branch, profile.solver_seconds)
+
+
+def _rate_hand(
+    jobs: HandJobs,
+    hand: GameState,
+    user: int,
+    bots: dict[int, Bot],
+    payouts: Sequence[float] | None,
+    profile: Profile,
+    log: SessionLog | None,
+    ratings: dict[str, HandRating],
+) -> HandReview:
+    """The finished hand's review from its move reviews (a failed one is made again), kept in
+    `ratings` and the log as the chance at the last move and each move's rating."""
+    reviewed = {}
+    for index, task in jobs.moves.items():
+        review = _settled(task)
+        if review is not None:
+            reviewed[index] = review
+    hand_review = review_hand(
+        hand, user, bots, REFERENCE, payouts, profile.min_branch, profile.solver_seconds, reviewed
+    )
+    chance = hand_review.chance()
+    assert chance is not None
+    rated = HandRating(chance, move_ratings(hand_review.decisions, jobs.hinted))
+    ratings[hand.hand_id] = rated
+    if log is not None:
+        with suppress(OSError):
+            log.append(
+                "rating",
+                {
+                    "hand_id": hand.hand_id,
+                    "chance": rated.chance,
+                    "moves": [asdict(m) for m in rated.moves],
+                },
+            )
+    return hand_review
+
+
 class PlaySession:
     """What the command line and the web table share around a TableRunner: narration, the
     session log, the level clock, hints and reviews. `scale` is internal chip units per
-    displayed chip, so user-entered blinds like 1/2 keep enough precision for pot-sized bets."""
+    displayed chip, so user-entered blinds like 1/2 keep enough precision for pot-sized bets.
+    Every user decision is reviewed in the background from the moment it is the user's turn,
+    so the coach answers and each hand's rating are ready when asked for."""
 
-    plain = False
+    plain = False  # True words the pot line for newcomers (see `text.narrate`)
 
     def __init__(self, runner: TableRunner, scale: int, log: SessionLog | None, profile: Profile):
         self.runner = runner
@@ -97,6 +247,8 @@ class PlaySession:
         self.profile = profile
         self.started = time.monotonic()  # minute-based tournament levels follow the clock
         self.finished: GameState | None = None  # the user's last finished hand, for review
+        self.jobs: dict[str, HandJobs] = {}  # background reviews by hand id, until rated
+        self.ratings: dict[str, HandRating] = {}  # rated hands by hand id
         if log is not None:
             log.append("table_config", {"config": asdict(runner.config), "scale": scale})
         self.record(runner.opening_events)
@@ -120,15 +272,78 @@ class PlaySession:
                 self.log.append("event", {"hand_id": hand.hand_id if hand else None, "event": event.to_dict()})
             for line in narrate(event, self.label, self.chips, self.runner.user_seat, self.plain):
                 self.say(line)
+        self.queue_reviews()
+
+    def queue_reviews(self):
+        """Start the reviews the hand now calls for: what the user waits for when a turn starts
+        (`turn_started`), each new move of the user's, then the decision the user faces, so a
+        move check never waits behind the next decision."""
+        runner, hand, user = self.runner, self.runner.hand, self.runner.user_seat
+        if hand is None or user is None or not hand.dealt_in[user]:
+            return
+        if hand.hand_id not in self.jobs:
+            # Drop the reviews of hands rated or never to be, but the last finished hand's,
+            # which its review reads.
+            keep = self.finished.hand_id if self.finished is not None else None
+            for hand_id, old in list(self.jobs.items()):
+                if hand_id != keep and (old.rating is None or old.rating.future.done()):
+                    old.cancel()
+                    del self.jobs[hand_id]
+            self.jobs[hand.hand_id] = HandJobs()
+        jobs = self.jobs[hand.hand_id]
+        now = len(hand.history)
+        starting = runner.user_to_act() and now not in jobs.ahead
+        if starting:
+            self.turn_started(hand, user)
+        bots, payouts, profile = runner.bots, runner.config.payouts, self.profile
+        for index, entry in enumerate(hand.history):
+            if entry.seat == user and index not in jobs.moves:
+                ahead = jobs.ahead.get(index)
+                work = partial(_move_review, ahead, hand, user, bots, payouts, profile, index)
+                jobs.moves[index] = background(work)
+        if starting:
+            jobs.ahead[now] = (hand, background(self._review_now(hand, user)))
+
+    def turn_started(self, hand: GameState, user: int):
+        """A hook for quick work to start first on the review thread when it becomes the user's
+        turn."""
 
     def hand_over(self):
-        """Keep and log the user's hand once it ends (the log a review reads)."""
+        """Keep and log the user's hand once it ends (the log a review reads), and rate it in
+        the background once its moves are reviewed."""
         hand = self.runner.hand
         if hand is None or not is_terminal(hand):
             return
         self.finished = hand
         if self.log is not None:
             self.log.append("hand", {"hand": hand.to_dict()})
+        jobs, user = self.jobs.get(hand.hand_id), self.runner.user_seat
+        if jobs is not None and jobs.moves and jobs.rating is None:
+            assert user is not None
+            runner = self.runner
+            work = partial(
+                _rate_hand,
+                jobs,
+                hand,
+                user,
+                runner.bots,
+                runner.config.payouts,
+                self.profile,
+                self.log,
+                self.ratings,
+            )
+            jobs.rating = background(work)
+
+    def close(self, wait: bool):
+        """Stop the reviews nobody will read: an unfinished hand's, and in an unsaved session
+        every one still to run. With `wait`, a saved session's finished hands are rated first,
+        so its log is complete."""
+        for jobs in self.jobs.values():
+            if jobs.rating is None or self.log is None:
+                jobs.cancel()
+            elif wait:
+                with suppress(Exception):
+                    jobs.rating.result()
 
     def knocked_out(self) -> bool:
         runner = self.runner
@@ -143,27 +358,75 @@ class PlaySession:
         self.record([e for e in events if e.kind in ("PlayerEliminated", "TournamentFinished")])
 
     def hint_lines(self) -> list[str]:
-        return render_decision(self.hint_review(), self.runner.bot_labels(), self.scale)
+        _, work = self.hint_work()
+        return render_decision(work(), self.runner.bot_labels(), self.scale)
 
-    def hint_review(self) -> DecisionReview:
-        """The five steps for the decision the user faces now (DESIGN.md Section 7.8); logged,
-        so the decision can be left out of the statistics."""
+    def note_hint(self, hand_id: str, index: int):
+        """Log that the decision at `index` follows a coach hint, so the statistics leave it out
+        and its rating says so."""
+        if self.log is not None:
+            self.log.append("hint", {"hand_id": hand_id, "index": index})
+        jobs = self.jobs.get(hand_id)
+        if jobs is not None:
+            jobs.hinted.add(index)
+
+    def hint_work(self) -> tuple[GameState, Callable[[], DecisionReview]]:
+        """The five steps for the decision the user faces now (DESIGN.md Section 7.8): noted as
+        hinted at once, with the call that gives the review already started for it."""
         hand, user = self.runner.hand, self.runner.user_seat
         assert hand is not None and user is not None
-        decision = hint(
+        now = len(hand.history)
+        self.note_hint(hand.hand_id, now)
+        jobs = self.jobs.get(hand.hand_id)
+        ahead = jobs.ahead.get(now) if jobs is not None else None
+        return hand, partial(result_or, ahead[1] if ahead else None, self._review_now(hand, user))
+
+    def _review_now(self, hand: GameState, user: int) -> Callable[[], DecisionReview]:
+        """The full review of the decision the user faces now, before acting."""
+        runner, profile = self.runner, self.profile
+        return partial(
+            hint,
             hand,
             user,
-            self.runner.bots,
+            runner.bots,
             REFERENCE,
-            self.runner.config.payouts,
-            self.profile.triage_branch,
+            runner.config.payouts,
+            profile.min_branch,
+            profile.solver_seconds,
         )
-        if self.log is not None:
-            self.log.append("hint", {"hand_id": hand.hand_id, "index": len(hand.history)})
-        return decision
+
+    def move_work(self, hand: GameState, index: int) -> Callable[[], DecisionReview]:
+        """The call that gives the review of the user's move at `index`, normally the one the
+        background has made or is making."""
+        user = self.runner.user_seat
+        assert user is not None
+        jobs = self.jobs.get(hand.hand_id)
+        runner, profile = self.runner, self.profile
+        work = partial(
+            review_decision,
+            hand,
+            user,
+            runner.bots,
+            REFERENCE,
+            index,
+            runner.config.payouts,
+            profile.min_branch,
+            profile.solver_seconds,
+        )
+        return partial(result_or, jobs.moves.get(index) if jobs is not None else None, work)
+
+    def review_work(self, hand: GameState) -> Callable[[], HandReview]:
+        """The call that gives the finished hand's review: the background one, or one made then
+        if it failed."""
+        jobs = self.jobs.get(hand.hand_id)
+        task = jobs.rating if jobs is not None else None
+        return partial(result_or, task, partial(full_review, self.runner, hand, self.profile))
+
+    def hand_review(self, hand: GameState) -> HandReview:
+        return self.review_work(hand)()
 
     def review_lines(self, hand: GameState) -> list[str]:
-        review = full_review(self.runner, hand, self.profile)
+        review = self.hand_review(hand)
         return render_hand(review, self.runner.bot_labels(), self.scale, grids=True)
 
 
@@ -349,7 +612,7 @@ class Table(PlaySession):
             return
         print("  Reviewing (a few seconds)...")
         if quiz:
-            review = full_review(self.runner, hand, self.profile)
+            review = self.hand_review(hand)
             decisions = [(hand.hand_id, d) for d in review.decisions]
             quiz_decisions(decisions, self.runner.bot_labels(), self.scale, training)
             return
@@ -624,6 +887,18 @@ def logged_shows(records: list[dict[str, Any]]) -> dict[str, dict[int, tuple[int
     shows: dict[str, dict[int, tuple[int, int]]] = {}
     collect_shows(events, shows)
     return shows
+
+
+def logged_ratings(records: list[dict[str, Any]]) -> dict[str, HandRating]:
+    """The hands rated in a session log, by hand id. Raises `ValueError` on a damaged record."""
+    try:
+        return {
+            r["hand_id"]: HandRating(r["chance"], tuple(MoveRating(**m) for m in r["moves"]))
+            for r in records
+            if r["type"] == "rating"
+        }
+    except (KeyError, TypeError) as error:
+        raise ValueError(f"damaged log: {error!r}") from error
 
 
 def plain_history(runner: TableRunner, hand: GameState, scale: int, shown: dict[int, tuple[int, int]]) -> list[str]:
@@ -956,13 +1231,14 @@ def session_rows(
     hands: list[GameState],
     decisions: list[DecisionRecord],
     histories: dict[str, str],
+    ratings: dict[str, HandRating],
 ) -> list[dict[str, Any]]:
     """One CSV row per hand of a logged session, dated by the log's last write."""
     user = config.session.user_seat
     assert user is not None  # checked by load_session
     mode = config.session.mode.value.lower()
     day = date.fromtimestamp(path.stat().st_mtime).isoformat()
-    return hand_rows(hands, user, scale, path.stem, day, mode, decisions, histories)
+    return hand_rows(hands, user, scale, path.stem, day, mode, decisions, histories, ratings)
 
 
 def export_main(argv: list[str]) -> int:
@@ -984,10 +1260,11 @@ def export_main(argv: list[str]) -> int:
         try:
             config, scale, runner, hands, records = load_session(path)
             histories = session_histories(runner, scale, hands, logged_shows(records))
+            ratings = logged_ratings(records)
         except (OSError, ValueError) as error:
             print(f"Skipping {path}: {error}", file=sys.stderr)
             continue
-        rows += session_rows(path, config, scale, hands, decisions, histories)
+        rows += session_rows(path, config, scale, hands, decisions, histories, ratings)
     if args.out is None:
         write_hands_csv(rows, sys.stdout)
     else:
@@ -1056,6 +1333,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Session stopped: {error}", file=sys.stderr)
     ended = runner.finish()
     table.record(ended)
+    table.close(wait=True)
     net = ended[0].data["net"]
     if session.user_seat is not None and session.mode != Mode.TOURNAMENT:
         print(

@@ -6,14 +6,14 @@ import pytest
 from   thpoker.analysis.ev      import PROFILES
 import thpoker.analysis.review
 from   thpoker.bots.equity_bot  import public_seed
-from   thpoker.cli              import build_config, parse_args
+from   thpoker.cli              import REVIEWS, build_config, parse_args
 from   thpoker.game.cards       import card_str, parse_cards
 from   thpoker.game.engine      import observation
 from   thpoker.game.rng         import Rng
 from   thpoker.game.state       import Action, ActionType
 from   thpoker.odds             import FULL_RANGE, hand_equity
 from   thpoker.storage          import read_session_log
-import thpoker.table
+from   thpoker.table            import STYLE_WORDS
 from   thpoker.tests.text       import fold_to_a_bet
 from   thpoker.text             import pretty_cards
 from   thpoker.web              import (App, Download, MAX_SESSIONS, WebError,
@@ -240,11 +240,16 @@ def test_the_move_check_matches_the_hand_review_and_counts_as_a_hint(tmp_path):
     checked = call(app, "POST", ["sessions", key, "analyze"], {})
     hidden = hidden_cards(app, key)
     assert hidden and not any(card in checked["copy_text"] for card in hidden)
-    # The hand alone, as played so far, for the copy without the coach.
-    assert checked["hand_text"] == "\n".join(checked["history"]) + "\n"
-    hand_text = call(app, "GET", ["sessions", key], {})["hand_text"]
-    assert hand_text == checked["hand_text"] and not any(card in hand_text for card in hidden)
-    # Fold to any bet (checking when it is free): With seed 8 a bot folds before the user acts,
+    # The hand as played so far with the move rated, for the copy without the coach; the log's
+    # copy has every move rated so far.
+    played = "\n".join(checked["history"]) + "\n"
+    rated = "rated " + checked["decisions"][0]["summary"][0].split()[1]  # "Rated 0.97 of 1 ..."
+    assert checked["hand_text"].startswith(played) and rated in checked["hand_text"]
+    number = call(app, "GET", ["sessions", key], {})["hand_number"]
+    copied = call(app, "GET", ["sessions", key, "hands", str(number), "copy"], {})["text"]
+    assert copied.startswith(played) and rated in copied
+    assert not any(card in copied for card in hidden)
+    # Fold to any bet (checking when it is free). With seed 8 a bot folds before the user acts,
     # so its cards are never shown.
     while state["your_turn"]:
         kind = "fold" if state["legal"]["call"] is not None else "check"
@@ -257,21 +262,38 @@ def test_the_move_check_matches_the_hand_review_and_counts_as_a_hint(tmp_path):
     row = call(app, "GET", ["sessions", key], {})["hands"][-1]
     assert f"your cards {pretty_cards(parse_cards(row['cards']))}" in row["history"]
     assert not any(card in row["history"] for card in hidden)
-    *history, result = reviewed["hand_text"].splitlines()
-    assert history == reviewed["history"] and reviewed["result"].startswith(result)
-    assert "With the cards" not in result  # the all-in average is the coach's, not the hand's
+    lines = reviewed["hand_text"].splitlines()
+    assert lines[: len(reviewed["history"])] == reviewed["history"]
+    assert lines[-2] == reviewed["summary"] and reviewed["result"].startswith(lines[-1])
+    assert "With the cards" not in lines[-1]  # the all-in average is the coach's, not the hand's
+    # The player's view: no option values, ranges or styles, only the ratings.
+    words = ("Options", "likely hold", *STYLE_WORDS.values())
+    assert not any(word in reviewed["hand_text"] for word in words)
+    assert reviewed["summary"] in reviewed["copy_text"]
     (log,) = tmp_path.glob("session-*.jsonl")
     hints = [r for r in read_session_log(log) if r["type"] == "hint"]
     assert len(hints) == 1 + went_on  # the hint, and the check if play went on
 
 
-def test_the_hand_review_reuses_the_moves_already_checked(monkeypatch):
+def test_no_move_is_reviewed_twice(monkeypatch):
     app = App(None)
     key = call(app, "POST", ["sessions"], SETUP)["id"]
-    for _ in range(20):  # Check every move in a hand with two or more
-        your_turn(app, key)
-        state, checked = call(app, "GET", ["sessions", key], {}), []
+    play_out(app, key)
+    REVIEWS.submit(int).result()  # reviews of the first hand are not counted
+    computed: list[tuple[str, int]] = []
+    original = thpoker.analysis.review._review_decision
+
+    def counted(*args: Any) -> Any:
+        computed.append((args[1].state.hand_id, args[0]))
+        return original(*args)
+
+    monkeypatch.setattr(thpoker.analysis.review, "_review_decision", counted)
+    for _ in range(20):  # a hand with two or more decisions: the first hinted, each checked
+        state = call(app, "POST", ["sessions", key, "next"], {})
+        checked: list[dict] = []
         while state["your_turn"]:
+            if not checked:
+                call(app, "POST", ["sessions", key, "hint"], {})
             kind = "check" if state["legal"]["check"] else "call"
             state = call(app, "POST", ["sessions", key, "action"], {"kind": kind})
             checked.append(call(app, "POST", ["sessions", key, "analyze"], {})["decisions"][0])
@@ -280,17 +302,53 @@ def test_the_hand_review_reuses_the_moves_already_checked(monkeypatch):
             break
     else:
         pytest.fail("no hand with two decisions")
-    app.tables[key].checked.pop(min(app.tables[key].checked))  # as if the first was not checked
-    computed = []
+    reviewed = call(app, "POST", ["sessions", key, "review"], {})["decisions"]
+    REVIEWS.submit(int).result()
+    assert reviewed == checked
+    hand = app.tables[key].finished
+    assert hand is not None and len(computed) == len(set(computed))
+    mine = [i for i, e in enumerate(hand.history) if e.seat == 0]
+    assert sorted(i for hand_id, i in computed if hand_id == hand.hand_id) == mine
+
+
+def test_a_request_waiting_for_a_review_holds_up_no_one_and_ends_with_its_table(monkeypatch, tmp_path):
+    app = App(tmp_path)
+    key = call(app, "POST", ["sessions"], SETUP)["id"]
+    play_out(app, key)
+    REVIEWS.submit(int).result()
+    entered, release = threading.Event(), threading.Event()
     original = thpoker.analysis.review._review_decision
 
-    def counted(*args: Any) -> Any:
-        computed.append(args[0])
+    def held(*args: Any) -> Any:
+        entered.set()
+        release.wait(60)
         return original(*args)
 
-    monkeypatch.setattr(thpoker.analysis.review, "_review_decision", counted)
-    reviewed = call(app, "POST", ["sessions", key, "review"], {})["decisions"]
-    assert len(computed) == 1 and reviewed == checked
+    monkeypatch.setattr(thpoker.analysis.review, "_review_decision", held)
+    outcome: list[object] = []
+
+    def ask():
+        try:
+            outcome.append(call(app, "POST", ["sessions", key, "hint"], {}))
+        except KeyError as error:
+            outcome.append(error)
+
+    asking = threading.Thread(target=ask)
+    # With the review thread kept busy, the hint request reviews the decision itself.
+    REVIEWS.submit(release.wait, 60)
+    try:
+        your_turn(app, key)
+        asking.start()
+        assert entered.wait(60)
+        state = call(app, "GET", ["sessions", key], {})
+        assert state["your_turn"] and asking.is_alive() and not outcome
+        (saved,) = call(app, "GET", ["history"], {})["sessions"]
+        call(app, "POST", ["history", saved["name"], "delete"], {})  # while the hint waits
+    finally:
+        release.set()
+        if asking.ident is not None:
+            asking.join(60)
+    assert isinstance(outcome[0], KeyError)
 
 
 def test_a_training_session_holds_the_seat_and_deals_the_chosen_hands(tmp_path):
@@ -377,29 +435,69 @@ def test_past_sessions_read_back_the_same_hands_as_the_live_table(tmp_path):
     decisions = tmp_path / "decisions.jsonl"
     app = App(tmp_path, decisions_log=decisions)
     key = call(app, "POST", ["sessions"], SETUP)["id"]
-    live = play_out(app, key)
+    hold = threading.Event()
+    REVIEWS.submit(hold.wait)  # the hand's reviews wait until it is over
+    try:
+        live = play_out(app, your_turn(app, key))
+        row = live["hands"][-1]
+        assert row["acted"] and live["pending"] == 1 and row["pending"] and row["review"] is None
+        (saved,) = call(app, "GET", ["history"], {})["sessions"]
+        assert call(app, "GET", ["history", saved["name"]], {})["pending"] == 1
+    finally:
+        hold.set()
+    REVIEWS.submit(int).result()
+    # The rating landed after the hand: the next read of the table shows it, as the log has it.
+    live = call(app, "GET", ["sessions", key], {})
+    row = live["hands"][-1]
+    (log,) = tmp_path.glob("session-*.jsonl")
+    (logged,) = [r for r in read_session_log(log) if r["type"] == "rating"]
+    moves = logged["moves"]
+    weighted = sum(m["rating"] * m["stake"] for m in moves) / sum(m["stake"] for m in moves)
+    assert live["pending"] == 0 and not row["pending"]
+    assert (row["win_chance"], row["rating"]) == (round(logged["chance"], 3), round(weighted, 2))
+    assert row["review"][-1].startswith("Your cards") and f"{row['rating']:.2f}" in row["review"][-1]
     # Damaged logs are left out rather than breaking the page; a damaged decisions log only
     # leaves the review columns blank.
     (tmp_path / "session-98.jsonl").write_text("[1]\n")
     (tmp_path / "session-99.jsonl").write_text('{"type": "table_config", "config": {}}\n')
     decisions.write_text('{"schema_version": 1}\n')
     (saved,) = call(app, "GET", ["history"], {})["sessions"]
-    assert saved["hands"] == 1 and saved["net"] == live["session_net"]
+    assert saved["hands"] == len(live["hands"]) and saved["net"] == live["session_net"]
     undated = [{k: v for k, v in row.items() if k != "date"} for row in live["hands"]]
     rows = call(app, "GET", ["history", saved["name"]], {})["rows"]
     assert [{k: v for k, v in row.items() if k != "date"} for row in rows] == undated
-    review = call(app, "POST", ["history", saved["name"], "review"], {"hand": 1})
+    review = call(app, "POST", ["history", saved["name"], "review"], {"hand": row["hand"]})
     assert review["copy_text"].startswith("No-limit Texas Hold'em cash game")
     assert review["copy_text"].count(review["result"]) == 1 and review["result"] not in review["history"]
     everything = app.handle("GET", ["history.csv"], {})
     assert isinstance(everything, Download)
-    (exported,) = csv.DictReader(io.StringIO(everything.text))
-    assert exported["history"] == live["hands"][0]["history"]
+    *_, exported = csv.DictReader(io.StringIO(everything.text))
+    assert exported["history"] == row["history"]
+    assert exported["rating"] == str(row["rating"]) and exported["win_chance"] == str(row["win_chance"])
     download = app.handle("GET", ["history", saved["name"], "hands.csv"], {})
     assert isinstance(download, Download) and download.text.splitlines()[1].startswith(saved["name"])
     for name in ("..", "session-0"):  # only listed logs can be read
         with pytest.raises(KeyError):
             app.handle("GET", ["history", name], {})
+
+
+def test_a_saved_session_can_be_deleted_and_nothing_brings_it_back(tmp_path):
+    app = App(tmp_path)
+    key = call(app, "POST", ["sessions"], SETUP)["id"]
+    hold = threading.Event()
+    REVIEWS.submit(hold.wait)  # the hand's rating has not run when the session is deleted
+    try:
+        play_out(app, key)
+        (saved,) = call(app, "GET", ["history"], {})["sessions"]
+        listed = call(app, "POST", ["history", saved["name"], "delete"], {})
+    finally:
+        hold.set()
+    REVIEWS.submit(int).result()
+    assert listed["sessions"] == [] and not list(tmp_path.glob("session-*.jsonl"))
+    with pytest.raises(KeyError):  # the table writing it went with it
+        call(app, "GET", ["sessions", key], {})
+    with pytest.raises(KeyError):  # only listed logs can be deleted
+        app.handle("POST", ["history", saved["name"], "delete"], {})
 
 
 def test_the_state_counts_the_chips_in_the_pot_the_pot_odds_and_the_hand_result():

@@ -37,6 +37,20 @@ let chance = null;
 let guess = null;
 let revealed = false;
 const openMoves = new Set(); // "session/hand" of the rows showing their moves, across re-renders
+const latestRows = new Map();  // each shown hand's row as last read, by "session/hand"
+let refreshTimer = null;
+let refreshes = 0;  // counts what the hands tables show, so a re-read for an older view is dropped
+const COPY_TIP = "Copy the hand as you saw it, with your moves rated 0 to 1, for an AI chat";
+const ANALYSIS_TIP = "Copy the hand with the coach's full analysis and ratings, for an AI chat";
+const COLUMNS = [
+  ["Hand"], ["Seat"], ["Your cards"],
+  ["Strength", "How your two starting cards rank among all starting hands: best 6% means only 6% are as strong or stronger"],
+  ["Board", null, "wide-only"],
+  ["Chance to win", "Your chance to win at showdown at your last move, reading the others' hands from their play the way a strong player would, so it can differ from the chance shown during play"],
+  ["Put in", null, "wide-only"], ["Result"],
+  ["Rating", "Your moves this hand, rated 0 to 1, with moves in bigger pots counting for more: 1 means you picked the best option every time"],
+  [""],
+];
 
 async function api(path, body) {
   const options = body === undefined ? {} : {
@@ -80,28 +94,43 @@ function icon(name) {
 }
 
 function copyIcon(name, tip, text) {
-  // Copies `text`; the icon turns into a tick for a moment. If the browser refuses the
-  // clipboard, the text appears in a box at the foot of the panel to copy by hand.
+  // Copies `text`, or the text a function fetches; the icon turns into a tick for a moment.
+  // If the browser refuses the clipboard, the text appears in a box at the foot of the panel
+  // to copy by hand.
   const node = element("button", "icon-button");
   node.type = "button";
   node.title = tip;
   node.setAttribute("aria-label", tip);
   node.append(icon(name));
   node.addEventListener("click", async () => {
+    if (node.classList.contains("waiting")) return;
     const panel = node.closest(".panel");
+    const pending = Promise.resolve(typeof text === "function" ? text() : text);
+    node.classList.add("waiting");
     try {
-      await navigator.clipboard.writeText(text);
+      try {
+        // Started in the click itself, so a browser that ties copying to the click (Safari)
+        // still copies text that arrives a moment later.
+        const blob = pending.then((value) => new Blob([value], { type: "text/plain" }));
+        await navigator.clipboard.write([new ClipboardItem({ "text/plain": blob })]);
+      } catch (error) {
+        await navigator.clipboard.writeText(await pending);
+      }
       node.replaceChildren(icon("done"));
       setTimeout(() => node.replaceChildren(icon(name)), 1500);
     } catch (error) {
       const box = element("textarea", "copy-box");
       box.readOnly = true;
-      box.value = text;
+      box.value = await pending.catch(() => "");
       const fallback = element("div", "copy-fallback");
-      fallback.append(element("p", "", "Copying was blocked; select this text and copy it:"), box);
+      const words = box.value ? "Copying was blocked; select this text and copy it:" : "Couldn't get the hand to copy. Try again.";
+      fallback.append(element("p", "", words));
+      if (box.value) fallback.append(box);
       panel.querySelector(".copy-fallback")?.remove();
       panel.append(fallback);
-      box.select();
+      if (box.value) box.select();
+    } finally {
+      node.classList.remove("waiting");
     }
   });
   return node;
@@ -116,11 +145,9 @@ function tools(id) {
 }
 
 function copyTools(id, answer) {
-  tools(id).append(
-    copyIcon("copy", "Copy this hand: the moves and the cards you saw", answer.hand_text),
-    copyIcon("chat", "Copy this hand with the coach's analysis, for an AI chat", answer.copy_text),
-  );
+  tools(id).append(copyIcon("copy", COPY_TIP, answer.hand_text), copyIcon("chat", ANALYSIS_TIP, answer.copy_text));
 }
+
 
 function card(text, small) {
   const node = element("span", "card suit-" + text[1] + (small ? " small" : ""));
@@ -207,6 +234,7 @@ async function run(id, work) {
 }
 
 function show(view) {
+  refreshRows(null, null, 0);
   for (const id of ["setup", "table", "history"]) document.getElementById(id).hidden = id !== view;
   document.getElementById("new-game").hidden = view !== "table";
   document.getElementById("helpers-toggle").hidden = view !== "table";
@@ -584,25 +612,34 @@ function renderLog() {
   }
   log.scrollTop = log.scrollHeight;
   const logTools = tools("log-tools");
-  if (state.hand_text) logTools.append(copyIcon("copy", "Copy this hand: the moves and the cards you saw", state.hand_text));
+  if (state.hand_number) {
+    const path = "sessions/" + session + "/hands/" + state.hand_number + "/copy";
+    logTools.append(copyIcon("copy", COPY_TIP, () => api(path).then((answer) => answer.text)));
+  }
 }
 
 function handsTable(rows, reviewer) {
   if (!rows.length) return element("p", "", "No finished hands yet.");
   const table = element("table", "hands");
   const head = element("tr");
-  for (const title of ["Hand", "Seat", "Your cards", "Board", "Put in", "Result", ""]) head.append(element("th", "", title));
+  for (const [title, tip, className] of COLUMNS) {
+    const th = element("th", className, title);
+    if (tip) th.title = tip;
+    head.append(th);
+  }
   table.append(head);
   for (const row of rows.slice().reverse()) {
     const tr = element("tr");
     const key = row.session + "/" + row.hand;
+    tr.dataset.key = key;
+    latestRows.set(key, row);
     const number = element("td");
     const toggle = button(String(row.hand), () => {
       if (openMoves.delete(key)) {
         tr.nextElementSibling.remove();
       } else {
         openMoves.add(key);
-        tr.after(movesRow(row));
+        tr.after(movesRow(latestRows.get(key)));
       }
       toggle.setAttribute("aria-expanded", String(openMoves.has(key)));
     }, "moves-toggle");
@@ -612,32 +649,101 @@ function handsTable(rows, reviewer) {
     tr.append(number, element("td", "", POSITIONS[row.position] || "early"));
     const cards = element("td");
     for (const text of row.cards.split(" ").filter(Boolean)) cards.append(card(text, true));
-    const board = element("td");
+    const board = element("td", "wide-only");
     for (const text of row.board.split(" ").filter(Boolean)) board.append(card(text, true));
-    tr.append(cards, board, element("td", "", chips(row.put_in)));
-    tr.append(element("td", row.result > 0 ? "up" : row.result < 0 ? "down" : "", signed(row.result)));
+    const chance = element("td", "number chance");
+    const rating = element("td", "number rating");
+    fillRated(chance, rating, row);
+    tr.append(cards, element("td", "number strength", row.strength), board, chance, element("td", "wide-only", chips(row.put_in)));
+    tr.append(element("td", row.result > 0 ? "up" : row.result < 0 ? "down" : "", signed(row.result)), rating);
     const action = element("td");
     if (reviewer) action.append(button("Review", () => reviewer(row.hand), "small"));
     tr.append(action);
     table.append(tr);
     if (openMoves.has(key)) table.append(movesRow(row));
   }
-  return table;
+  const scroll = element("div", "table-scroll");
+  scroll.append(table);
+  return scroll;
+}
+
+function fillRated(chance, rating, row) {
+  // Empty while the hand is still being rated, a muted dash when there is nothing to show.
+  for (const cell of [chance, rating]) {
+    cell.replaceChildren();
+    cell.classList.remove("muted");
+    cell.removeAttribute("title");
+  }
+  if (row.pending) return;
+  if (row.rating === "") {
+    for (const cell of [chance, rating]) {
+      cell.textContent = "–";
+      cell.classList.add("muted");
+      cell.title = row.acted ? "Not rated" : "You made no move this hand";
+    }
+    return;
+  }
+  chance.textContent = row.chance;
+  rating.textContent = row.rating.toFixed(2);
+  rating.title = row.moves;
 }
 
 function movesRow(row) {
+  // The moves stay in view when a narrow screen scrolls the table sideways.
   const tr = element("tr", "moves");
   const cell = element("td");
-  cell.colSpan = 7;
-  for (const line of row.history.split("\n")) cell.append(prettyLine(line, line.startsWith(" ") ? "story-line" : "story-head"));
+  cell.colSpan = COLUMNS.length;
+  const box = element("div", "moves-box");
+  for (const line of row.history.split("\n")) box.append(prettyLine(line, line.startsWith(" ") ? "story-line" : "story-head"));
+  box.append(rowReview(row));
+  cell.append(box);
   tr.append(cell);
   return tr;
+}
+
+function rowReview(row) {
+  const box = element("div", "row-review");
+  if (row.review === null) {
+    box.append(element("p", "waiting", "Loading…"));
+  } else {
+    for (const line of row.review) box.append(prettyLine(line.trim(), line.startsWith(" ") ? "story-line" : "story-head"));
+  }
+  return box;
+}
+
+function refreshRows(path, container, pending) {
+  // While hands are still being rated, re-read them once a second, until none are left or the
+  // tables show something else.
+  clearTimeout(refreshTimer);
+  const asked = ++refreshes;
+  if (!pending) return;
+  refreshTimer = setTimeout(async () => {
+    let answer;
+    try {
+      answer = await api(path);
+    } catch (error) {
+      return;
+    }
+    if (asked !== refreshes) return;
+    // Only the rated cells and the opened rows change, so nothing else moves.
+    for (const row of answer.hands || answer.rows) {
+      const key = row.session + "/" + row.hand;
+      latestRows.set(key, row);
+      const tr = container.querySelector(`tr[data-key="${CSS.escape(key)}"]`);
+      if (!tr) continue;
+      fillRated(tr.querySelector("td.chance"), tr.querySelector("td.rating"), row);
+      const opened = tr.nextElementSibling;
+      if (opened && opened.classList.contains("moves")) opened.querySelector(".row-review").replaceWith(rowReview(row));
+    }
+    refreshRows(path, container, answer.pending);
+  }, 1000);
 }
 
 function renderHands() {
   document.getElementById("net").textContent = state.session_net ? "· " + signed(state.session_net) : "";
   document.getElementById("hands-table").replaceChildren(handsTable(state.hands, null));
   document.getElementById("csv").href = "/api/sessions/" + session + "/hands.csv";
+  refreshRows("sessions/" + session, document.getElementById("hands-table"), state.pending);
 }
 
 function render() {
@@ -819,6 +925,7 @@ function coachView(answer, full) {
   view.append(story);
   if (!answer.decisions.length) view.append(element("p", "", "You made no decision in that hand."));
   for (const decision of answer.decisions) view.append(decisionView(decision, false));
+  if (answer.summary) view.append(prettyLine(answer.summary, "hand-summary"));
   if (answer.result) view.append(element("p", "result", answer.result));
   return view;
 }
@@ -858,15 +965,19 @@ async function openHistory() {
       if (training) result.title = "Training: not counted in your results";
       tr.append(result);
       const open = element("td");
-      open.append(button("Open", () => openSession(saved.name, gameName(saved) + " on " + saved.date), "small"));
+      open.append(button("Open", () => openSession(saved), "small"));
       tr.append(open);
       table.append(tr);
     }
-    target.replaceChildren(table);
+    const scroll = element("div", "table-scroll");
+    scroll.append(table);
+    target.replaceChildren(scroll);
   });
 }
 
-async function openSession(name, label) {
+async function openSession(saved) {
+  const name = saved.name;
+  const label = gameName(saved) + " on " + saved.date;
   await run("history-error", async () => {
     const answer = await api("history/" + encodeURIComponent(name));
     const target = document.getElementById("session-hands");
@@ -874,8 +985,27 @@ async function openSession(name, label) {
     link.href = "/api/history/" + encodeURIComponent(name) + "/hands.csv";
     link.title = "Download this session as a CSV file";
     link.prepend(icon("download"));
-    target.replaceChildren(element("h2", "", "Hands: " + label), link, handsTable(answer.rows, (hand) => reviewSaved(name, hand)));
+    const remove = button("Delete session", () => deleteSession(saved, label), "danger");
+    const actions = element("p", "session-tools");
+    actions.append(link, remove);
+    target.replaceChildren(element("h2", "", "Hands: " + label), actions, handsTable(answer.rows, (hand) => reviewSaved(name, hand)));
+    refreshRows("history/" + encodeURIComponent(name), target, answer.pending);
   });
+}
+
+async function deleteSession(saved, label) {
+  const question = "Delete this session (" + label + ", " + saved.hands + " hands, " + signed(saved.net) + ")? This can't be undone.";
+  if (!window.confirm(question)) return;
+  let deleted = false;
+  await run("history-error", async () => {
+    await api("history/" + encodeURIComponent(saved.name) + "/delete", {});
+    deleted = true;
+    for (const key of [...openMoves]) if (key.startsWith(saved.name + "/")) openMoves.delete(key);
+    document.getElementById("session-hands").replaceChildren();
+    document.getElementById("history-coach-panel").hidden = true;
+    tools("history-tools");
+  });
+  if (deleted) await openHistory();  // after a failed delete its error stays on screen
 }
 
 async function reviewSaved(name, hand) {

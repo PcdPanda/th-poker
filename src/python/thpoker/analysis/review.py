@@ -11,10 +11,10 @@ marks an exploit spot. Tournament decisions are ranked by ICM loss instead of ch
 
 from   collections.abc          import Mapping, Sequence
 from   dataclasses              import dataclass, replace
+from   functools                import lru_cache
 import itertools
 import math
 import numpy as np
-from   functools                import lru_cache
 from   thpoker.analysis.ev      import (MIN_BRANCH, OptionValue, PROFILES,
                                         Profile, icm_value_of, option_values)
 from   thpoker.analysis.solver  import solve_river
@@ -42,6 +42,10 @@ from   thpoker.odds             import (Equity, Texture, hand_equity,
                                         texture)
 
 MISTAKE_BB = 0.5
+RATING_POT_SHARE = 0.4
+RATING_CLOSE = 0.75
+RATING_CORRECT_WEIGHT = 0.7
+RATING_SCALE_BB = 100.0
 SOLVER_BUDGET = PROFILES["pc"].solver_seconds  # for each heads-up river decision in a full review
 # The default reference opponent (DESIGN.md Section 6.2).
 REFERENCE = RangeBot("reference", PRESETS["balanced"])
@@ -70,6 +74,7 @@ class Situation:
     role: str  # preflop "aggressor" (made the last raise), "caller" of someone's raise, or "none"
     facing: float | None  # the street's last bet or raise as a share of the pot before it
     stack_bb: float  # effective stack at the start of the hand
+    owed_bb: float
 
 
 @dataclass(frozen=True)
@@ -102,6 +107,7 @@ class DecisionReview:
     situation: Situation
     ranges: dict[int, RangeView]  # by opponent seat
     equity: Equity
+    reference_equity: Equity
     percentile: float | None  # where the hand sits in the user's own range, 1 = strongest
     thresholds: Thresholds
     chosen: Action | None  # None for a coach hint, asked before acting
@@ -133,6 +139,32 @@ class DecisionReview:
             return "mistake"
         return "close" if loss > 1e-9 else "best"
 
+    def rating(self) -> float:
+        """The move from 0 to 1 (DESIGN.md Section 7.7): mostly the share of the pot being played
+        for that it gives up beyond the noise, then the big blinds given up on a log scale, held
+        inside its verdict's band so the number never contradicts the verdict."""
+        verdict = self.verdict()
+        if verdict == "best":
+            return 1.0
+        loss, stderr = self.loss(self.reference)
+        if self.tournament:  # prize-pool share back to big blinds at the user's stack
+            assert self.icm_threshold
+            loss, stderr = (
+                loss * MISTAKE_BB / self.icm_threshold,
+                stderr * MISTAKE_BB / self.icm_threshold,
+            )
+        given = max(0.0, loss - 2 * stderr)
+        # The pot being played for: less any bet faced, whose uncallable part goes back to the
+        # bettor.
+        spot = self.situation
+        played_for = spot.pot_bb - spot.owed_bb if spot.facing is not None else spot.pot_bb
+        correct = 1 - min(1.0, given / (RATING_POT_SHARE * max(played_for, MISTAKE_BB)))
+        size = 1 - min(1.0, math.log1p(given / MISTAKE_BB) / math.log1p(RATING_SCALE_BB / MISTAKE_BB))
+        raw = RATING_CORRECT_WEIGHT * correct + (1 - RATING_CORRECT_WEIGHT) * size
+        if verdict == "close":
+            return min(max(raw, RATING_CLOSE), 0.99)
+        return min(raw, RATING_CLOSE - 0.01)
+
     def exploit_spot(self) -> bool:
         """The actual bot is beaten by a different option than the reference, by a clear margin."""
         best_here = max(self.exploitative, key=_ev_of)
@@ -156,12 +188,60 @@ def best_option(options: list[OptionValue], tournament: bool) -> OptionValue:
     return max(options, key=_icm_of if tournament else _ev_of)
 
 
+def hand_rating(moves: Sequence[tuple[float, float]]) -> float | None:
+    """A hand's rating from its moves' (rating, chips at stake): the ratings weighted by the
+    stakes, so a big pot counts for more than a preflop fold."""
+    total = sum(stake for _, stake in moves)
+    return sum(rating * stake for rating, stake in moves) / total if total > 0 else None
+
+
+@dataclass(frozen=True)
+class MoveRating:
+    history_index: int  # the move's place in the hand's history
+    rating: float
+    stake: float  # big blinds at stake once called, less what the user cannot cover
+    hinted: bool  # made after a coach hint
+
+
+@dataclass(frozen=True)
+class HandRating:
+    """What a session keeps of a reviewed hand: the chance to win at the last move and each
+    move's rating."""
+
+    chance: float
+    moves: tuple[MoveRating, ...]
+
+    def rating(self) -> float | None:
+        return hand_rating([(m.rating, m.stake) for m in self.moves])
+
+
+def move_ratings(decisions: Sequence[DecisionReview], hinted: set[int]) -> tuple[MoveRating, ...]:
+    """The rating of each move made; a coach hint, asked before acting, has none."""
+    return tuple(
+        MoveRating(
+            d.index,
+            d.rating(),
+            d.situation.pot_bb + 2 * d.situation.to_call_bb - d.situation.owed_bb,
+            d.index in hinted,
+        )
+        for d in decisions
+        if d.chosen is not None
+    )
+
+
 @dataclass(frozen=True)
 class HandReview:
     hand: GameState
     decisions: list[DecisionReview]
     net_bb: float
     all_in_net_bb: float | None  # expected result at the moment all chips went in
+
+    def rating(self) -> float | None:
+        return hand_rating([(m.rating, m.stake) for m in move_ratings(self.decisions, set())])
+
+    def chance(self) -> float | None:
+        """The chance to win at the user's last decision, as a strong player reads the others."""
+        return self.decisions[-1].reference_equity.value if self.decisions else None
 
 
 @dataclass(frozen=True)
@@ -225,6 +305,7 @@ def situation(view: Observation) -> Situation:
         role,
         bet[1] / bet[0] if bet else None,
         effective_stack(view) / big_blind,
+        (view.current_bet - view.committed_this_street[view.seat]) / big_blind,
     )
 
 
@@ -401,6 +482,7 @@ def _review_decision(
     icm_threshold = None
     if payouts is not None:
         icm_threshold = icm_value_of(MISTAKE_BB * state.config.big_blind, state.starting_stacks, user, payouts)
+    read = [w for s, w in reference_snapshot.ranges.items() if s != user]
     return DecisionReview(
         index,
         hole,
@@ -408,6 +490,7 @@ def _review_decision(
         situation(view),
         {s: range_view(w, state.board) for s, w in opponents.items()},
         hand_equity(hole, state.board, list(opponents.values()), Rng(public_seed(view))),
+        hand_equity(hole, state.board, read, Rng(public_seed(view))),
         _percentile(view, snapshot.ranges[user], list(opponents.values())),
         thresholds(view),
         chosen,
@@ -492,13 +575,24 @@ def hint(
     user: int,
     bots: dict[int, Bot],
     reference: Bot,
-    payouts: Sequence[float] | None = None,
-    min_branch: float = TRIAGE_BRANCH,
+    payouts: Sequence[float] | None,
+    min_branch: float,
+    solver_seconds: float | None,
 ) -> DecisionReview:
     """The five steps for the decision `user` faces now in an unfinished `hand`, before it acts
-    (the coach hint of DESIGN.md Section 7.8), with the triage pass's coarser pruning and no
-    river solve, to answer quickly."""
-    return _review_at(hand, user, bots, reference, len(hand.history), payouts, min_branch, None)
+    (the coach hint of DESIGN.md Section 7.8)."""
+    return _review_at(hand, user, bots, reference, len(hand.history), payouts, min_branch, solver_seconds)
+
+
+def with_choice(review: DecisionReview, state: GameState, chosen: Action) -> DecisionReview | None:
+    """A review made before acting at `state`, completed with the action then taken, when that
+    action is one it priced (always so for fold, check, call and the abstract sizes): a review
+    made after acting would value the same options. None when the size needs pricing of its own."""
+    if chosen not in {o.action for o in review.exploitative}:
+        return None
+    assert state.to_act is not None
+    view = observation(state, state.to_act)
+    return replace(review, chosen=chosen, chosen_bet=_bet_share(chosen, view))
 
 
 def review_hand(

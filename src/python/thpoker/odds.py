@@ -241,6 +241,17 @@ def range_share(classes: Iterable[str]) -> float:
     return sum(len(COMBOS_OF_CLASS[c]) for c in classes) / len(COMBOS)
 
 
+@cache
+def _rank_by_class() -> dict[str, tuple[float, float]]:
+    return {name: (start, end) for name, start, end in _strength_order()}
+
+
+def hand_rank(hole: tuple[int, int]) -> tuple[float, float]:
+    """The shares of all deals stronger than `hole` and at least as strong, before the flop, in
+    the strength order `hand_range` uses: (0, 6/1326) for aces."""
+    return _rank_by_class()[PREFLOP_CLASSES[COMBO_CLASS[combo_index(*hole)]]]
+
+
 @dataclass(frozen=True)
 class Classes:
     """Class-level inputs: equity of row class against column class, card-disjoint combo pairs

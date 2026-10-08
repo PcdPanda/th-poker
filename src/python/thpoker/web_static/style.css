@@ -1029,3 +1029,78 @@ tr.moves td {
     grid-template-columns: 1fr;
   }
 }
+
+/* The hands tables: only the table scrolls sideways on a narrow screen, the hand number stays
+   in view, and a number filling in never shifts its row. */
+.table-scroll {
+  overflow-x: auto;
+  --sticky: var(--panel);
+}
+
+#session-hands .table-scroll,
+#sessions .table-scroll {
+  --sticky: var(--page);
+}
+
+.moves-box {
+  position: sticky;
+  left: 0.4rem;
+  max-width: calc(100vw - 4rem);
+}
+
+table.hands th:first-child,
+table.hands td:first-child:not([colspan]) {
+  position: sticky;
+  left: 0;
+  background: var(--sticky);
+}
+
+table.hands td.number {
+  white-space: nowrap;
+}
+
+table.hands td.strength {
+  min-width: 5.5rem;
+}
+
+table.hands td.chance {
+  min-width: 3.5rem;
+}
+
+table.hands td.rating {
+  min-width: 2.5rem;
+}
+
+.row-review {
+  margin-top: 0.4rem;
+}
+
+.hand-summary {
+  margin: 0.6rem 0;
+}
+
+.icon-button.waiting {
+  opacity: 0.5;
+}
+
+.session-tools {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+button.danger {
+  background: transparent;
+  color: var(--bad);
+  border-color: var(--bad);
+}
+
+@media (max-width: 720px) {
+  table.hands .wide-only {
+    display: none;
+  }
+
+  button.danger {
+    min-height: 44px;
+  }
+}

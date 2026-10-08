@@ -7,13 +7,20 @@ import pytest
 from   thpoker.analysis.review  import position_names
 from   thpoker.analysis.stats   import DecisionRecord, progress
 from   thpoker.charts           import seat_names
-from   thpoker.cli              import build_config, main, parse_args
+from   thpoker.cli              import REVIEWS, build_config, main, parse_args
 from   thpoker.game.cards       import parse_cards, preflop_class
 from   thpoker.game.engine      import new_hand, observation
 from   thpoker.game.session     import Mode, begin_hand, start_session
 from   thpoker.game.state       import AnteType, GameState
 from   thpoker.storage          import SessionLog
 from   thpoker.text             import pretty_cards
+
+
+@pytest.fixture(autouse=True)
+def reviews_finish():
+    """Each test's background reviews finish before the next test starts."""
+    yield
+    REVIEWS.submit(int).result()
 
 
 def answers(monkeypatch, actions=(), between=(), other="", special=None):
@@ -115,6 +122,14 @@ def test_a_logged_session_can_be_reviewed_after_a_hand_and_later(monkeypatch, ca
     played = capsys.readouterr().out
     assert "-- Decision 1" in played and " 5 Options" in played
     log = tmp_path / "session-8.jsonl"
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    user_hands = [
+        r["hand"]["hand_id"]
+        for r in records
+        if r["type"] == "hand" and any(e["seat"] == 0 for e in r["hand"]["history"])
+    ]
+    # Every hand the user played was rated before the game closed.
+    assert {r["hand_id"] for r in records if r["type"] == "rating"} == set(user_hands)
     decisions = str(tmp_path / "decisions.jsonl")
     assert main(["review", str(log), "--top", "3", "--decisions-log", decisions]) == 0
     summary = capsys.readouterr().out
@@ -129,10 +144,12 @@ def test_a_logged_session_can_be_reviewed_after_a_hand_and_later(monkeypatch, ca
     out = tmp_path / "hands.csv"
     assert main(["export", str(log), "--out", str(out), "--decisions-log", decisions]) == 0
     rows = list(csv.DictReader(out.open(encoding="utf-8")))
-    logged = [r["hand"]["hand_id"].removeprefix("hand-") for r in hands if r["type"] == "hand"]
+    logged = [r["hand"]["hand_id"].removeprefix("hand-") for r in records if r["type"] == "hand"]
     assert [row["hand"] for row in rows] == logged
     for row in rows:
         assert f"your cards {pretty_cards(parse_cards(row['cards']))}" in row["history"]
+    played = {h.removeprefix("hand-") for h in user_hands}
+    assert {row["hand"] for row in rows if row["rating"] and row["win_chance"]} == played
     reviewed = DecisionRecord.read(Path(decisions), "decision")
     assert sum(int(row["decisions"] or 0) for row in rows) == len(reviewed) > 0
 

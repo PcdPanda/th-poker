@@ -3,20 +3,23 @@ a hand or a session, and the rendering of reviews (the data comes from `analysis
 """
 
 from   collections              import defaultdict
-from   collections.abc          import Callable
+from   collections.abc          import Callable, Sequence
 import functools
 import math
 from   thpoker.analysis.ev      import OptionValue
-from   thpoker.analysis.review  import (DecisionReview, HandReview, RangeView,
+from   thpoker.analysis.review  import (DecisionReview, HandReview, MoveRating,
+                                        RATING_CLOSE, RangeView,
                                         SessionSummary, best_option,
                                         position_names)
 from   thpoker.analysis.training \
                                 import Calibration, RECENT
 from   thpoker.game.cards       import RANKS, cards_str
-from   thpoker.game.engine      import new_hand, observation, replay_states
+from   thpoker.game.engine      import (is_terminal, new_hand, observation,
+                                        replay_states)
 from   thpoker.game.evaluator   import describe, evaluate
 from   thpoker.game.state       import (Action, ActionType, AnteType, Event,
                                         GameState, Street)
+from   thpoker.odds             import hand_rank
 
 
 def format_chips(amount: float, scale: int) -> str:
@@ -218,6 +221,8 @@ def render_decision(
             )
         else:
             lines.append("   Best option.")
+        lines.append(f"   Rated {review.rating():.2f} of 1 (1 is the best option you had).")
+
     if review.exploit_spot():
         lines.append(
             "   Exploit spot: the best play against these bots differs from the play against a strong opponent."
@@ -413,7 +418,8 @@ def _icm_or_ev(option: OptionValue, tournament: bool) -> float:
 def decision_summary(review: DecisionReview, scale: int, big_blind: int) -> list[str]:
     """The two or three lines a newcomer reads under the headline."""
     error = "" if review.equity.exact else f" (± {_share(review.equity.stderr)})"
-    lines = [f"You win about {_share(review.equity.value)}{error} of the time against the hands they likely hold."]
+    lines = [] if review.chosen is None else [f"Rated {review.rating():.2f} of 1 (1 is the best option you had)."]
+    lines.append(f"You win about {_share(review.equity.value)}{error} of the time against the hands they likely hold.")
     required = review.thresholds.required_equity
     if required is not None:
         to_call = _chips(review.situation.to_call_bb, big_blind, scale)
@@ -516,6 +522,80 @@ def plain_decision_text(
             + (f" ({', '.join(marks)})" if marks else "")
         )
     return lines
+
+
+def percent_text(share: float) -> str:
+    """A whole percent, or one decimal where that would read as none or all."""
+    whole = round(100 * share)
+    return str(whole) if 0 < whole < 100 else f"{100 * share:.1f}"
+
+
+def strength_text(hole: tuple[int, int]) -> str:
+    """Where the hole cards rank among starting hands: "best 6%", or past the middle "worst 1%"
+    (the share as weak or weaker)."""
+    stronger, through = hand_rank(hole)
+    if through <= 0.5:
+        return f"best {percent_text(through)}%"
+    return f"worst {percent_text(1 - stronger)}%"
+
+
+def rated_moves_text(hand: GameState, user: int, moves: Sequence[MoveRating], scale: int) -> list[str]:
+    """The user's moves with their 0-1 ratings, under a header giving the scale in the coach's
+    words."""
+    states = replay_states(hand)
+    chips = functools.partial(format_chips, scale=scale)
+    close = f"{RATING_CLOSE:.2f}"
+    lines = [
+        f"Your moves, rated from 0 to 1: 1.00 is the best option you had, {close} to 0.99 is close "
+        f"to it, and below {close} is a costly mistake; the more of the pot a move gives up, the "
+        "lower it goes."
+    ]
+    for move in moves:
+        entry = hand.history[move.history_index]
+        words = _move_text(entry.action, user, states[move.history_index], "you", True, chips)
+        hinted = " (after a hint)" if move.hinted else ""
+        lines.append(f"  {_STREET_WORDS[entry.street]}: {words}, rated {move.rating:.2f}{hinted}")
+    return lines
+
+
+def rated_hand_text(
+    hand: GameState,
+    user: int,
+    moves: Sequence[MoveRating],
+    chance: float | None,
+    rating: float | None,
+    scale: int,
+) -> tuple[list[str], str]:
+    """The rated moves and the summary sentence, as the copy texts and the hands tables give
+    them. Without moves, the summary counts the user's moves in the hand."""
+    hole = hand.hole_cards[user]
+    assert hole is not None
+    lines = rated_moves_text(hand, user, moves, scale) if moves else []
+    made = len(moves) or sum(e.seat == user for e in hand.history)
+    return lines, hand_summary_text(hole, chance, rating, made, is_terminal(hand))
+
+
+def hand_summary_text(hole: tuple[int, int], chance: float | None, rating: float | None, moves: int, over: bool) -> str:
+    """The hand's three numbers in words: the starting hand's rank, the chance to win at the
+    last (or, mid-hand, latest) move, and the rating of `moves` rated moves."""
+    parts = [f"Your cards ({pretty_cards(hole)}) are in the {strength_text(hole)} of starting hands."]
+    if not moves:
+        if over:
+            parts.append("You made no decision this hand.")
+        return " ".join(parts)
+    if chance is not None:
+        parts.append(
+            f"At your {'last' if over else 'latest'} move your chance to win at showdown was about "
+            f"{percent_text(chance)}%, reading the others' hands from their play the way a strong "
+            "player would."
+        )
+    if rating is not None:
+        span = "this hand" if over else "so far"
+        if moves == 1:
+            parts.append(f"Your move {span} rates {rating:.2f}.")
+        else:
+            parts.append(f"Your moves {span} rate {rating:.2f} overall, with moves in bigger pots counting for more.")
+    return " ".join(parts)
 
 
 def hand_result_text(net_bb: float, all_in_net_bb: float | None, scale: int, big_blind: int) -> str:

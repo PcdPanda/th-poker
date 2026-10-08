@@ -16,14 +16,16 @@ them would mislead.
 
 from   bisect                   import bisect_left, bisect_right
 from   collections              import defaultdict
+from   collections.abc          import Mapping
 import csv
 from   dataclasses              import dataclass
 import math
-from   thpoker.analysis.review  import (DecisionReview, hand_group,
+from   thpoker.analysis.review  import (DecisionReview, HandRating, hand_group,
                                         position_names)
 from   thpoker.game.cards       import cards_str
 from   thpoker.game.engine      import observation
 from   thpoker.game.state       import GameState, Street
+from   thpoker.odds             import hand_rank
 from   thpoker.storage          import Record
 from   typing                   import Any, TextIO
 
@@ -286,6 +288,9 @@ HAND_COLUMNS = (
     "result",
     "result_bb",
     "showdown",
+    "hand_rank",
+    "win_chance",
+    "rating",
     "decisions",
     "mistakes",
     "loss_bb",
@@ -307,11 +312,14 @@ def hand_rows(
     mode: str,
     decisions: list[DecisionRecord],
     histories: dict[str, str],
+    ratings: Mapping[str, HandRating],
 ) -> list[dict[str, Any]]:
     """One row per hand the user was dealt into, in chips as shown on the table, for a
-    spreadsheet. Only the user's own cards appear. The review columns come from `decisions`
-    (records written by `thpoker review`) and stay blank for hands never reviewed; `histories`
-    holds each hand's moves as the user saw them, by hand id."""
+    spreadsheet. Only the user's own cards appear. `hand_rank` is the share of starting hands
+    at least as strong; the chance to win at the last move and the hand's rating come from
+    `ratings`, by hand id, and stay blank for hands never rated. The review columns come from
+    `decisions` (records written by `thpoker review`) and stay blank for hands never reviewed;
+    `histories` holds each hand's moves as the user saw them, by hand id."""
     reviewed: dict[str, list[DecisionRecord]] = defaultdict(list)
     for decision in decisions:
         if decision.session == session:
@@ -325,6 +333,10 @@ def hand_rows(
         records = reviewed.get(hand.hand_id)
         loss = sum(r.loss for r in records) if records else None
         tournament = mode == "tournament"
+        hole = hand.hole_cards[user]
+        assert hole is not None
+        rated = ratings.get(hand.hand_id)
+        rating = rated.rating() if rated is not None else None
         rows.append(
             {
                 "session": session,
@@ -333,12 +345,15 @@ def hand_rows(
                 "players": sum(hand.dealt_in),
                 "hand": int(hand.hand_id.rpartition("-")[2]),
                 "position": position_names(observation(hand, user))[user],
-                "cards": cards_str(hand.hole_cards[user] or ()),
+                "cards": cards_str(hole),
                 "board": cards_str(hand.board),
                 "put_in": _number((won - result) / scale),
                 "result": _number(result / scale),
                 "result_bb": round(result / hand.config.big_blind, 2),
                 "showdown": "yes" if user in hand.shown else "no",
+                "hand_rank": round(hand_rank(hole)[1], 4),
+                "win_chance": round(rated.chance, 3) if rated is not None else "",
+                "rating": round(rating, 2) if rating is not None else "",
                 "decisions": len(records) if records else "",
                 "mistakes": sum(r.verdict == "mistake" for r in records) if records else "",
                 "loss_bb": round(loss, 2) if loss is not None and not tournament else "",
@@ -350,6 +365,6 @@ def hand_rows(
 
 
 def write_hands_csv(rows: list[dict[str, Any]], stream: TextIO):
-    writer = csv.DictWriter(stream, fieldnames=HAND_COLUMNS, lineterminator="\n")
+    writer = csv.DictWriter(stream, fieldnames=HAND_COLUMNS, lineterminator="\n", extrasaction="ignore")
     writer.writeheader()
     writer.writerows(rows)

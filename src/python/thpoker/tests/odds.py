@@ -1,8 +1,6 @@
 from   itertools                import combinations
-from   statistics               import fmean, stdev
-
 import pytest
-
+from   statistics               import fmean, stdev
 from   thpoker.game.cards       import (COMBOS, COMBOS_OF_CLASS,
                                         PREFLOP_CLASSES, combo_index,
                                         parse_cards)
@@ -11,10 +9,10 @@ from   thpoker.game.rng         import Rng
 import thpoker.odds
 from   thpoker.odds             import (Classes, FULL_RANGE, Range, chen_score,
                                         equity_to_reach_top, equity_vs_random,
-                                        hand_equity, hand_range, hand_window,
-                                        range_equities, range_share,
-                                        ranked_range, representative_equities,
-                                        texture)
+                                        hand_equity, hand_range, hand_rank,
+                                        hand_window, range_equities,
+                                        range_share, ranked_range,
+                                        representative_equities, texture)
 
 
 @pytest.mark.parametrize(
@@ -55,6 +53,12 @@ def test_training_hands_come_from_a_strength_window_or_a_named_set():
     for bad in ("top", "5-", "-5", "5-150", "AKs"):
         with pytest.raises(ValueError):
             hand_range(bad)
+
+
+def test_a_starting_hand_ranks_in_the_order_training_deals_from():
+    aces, three_two = parse_cards("AsAh"), parse_cards("3c2d")
+    assert hand_rank((aces[0], aces[1])) == (0.0, 6 / 1326)
+    assert hand_rank((three_two[0], three_two[1])) == (pytest.approx(1 - 12 / 1326), 1.0)
 
 
 def only(*hands: str) -> Range:

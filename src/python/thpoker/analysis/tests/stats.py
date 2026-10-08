@@ -1,7 +1,7 @@
 from   dataclasses              import replace
 import io
 import pytest
-from   thpoker.analysis.review  import review_hand
+from   thpoker.analysis.review  import HandRating, MoveRating, review_hand
 import thpoker.analysis.stats
 from   thpoker.analysis.stats   import (DecisionRecord, HAND_COLUMNS,
                                         MIN_HANDS, compare, facing_bucket,
@@ -19,6 +19,7 @@ from   thpoker.game.state       import (Action, ActionType, GameConfig,
                                         Observation, Street)
 from   thpoker.game.tests.decks import (CALL, CHECK, FOLD, heads_up, play,
                                         stacked_deck)
+from   thpoker.odds             import hand_rank
 from   typing                   import Any
 
 
@@ -200,14 +201,33 @@ def test_hand_rows_count_the_chips_put_in_and_join_the_review():
         "cash",
         [reviewed, other_session],
         {"hand-7": "You raise to 300."},
+        # The raise was worth 1.5 big blinds at stake and rated 0.6; the call 6 and rated 1.
+        {"hand-7": HandRating(0.4321, (MoveRating(0, 0.6, 1.5, False), MoveRating(2, 1.0, 6.0, True)))},
     )
-    picked = [{k: row[k] for k in ("position", "put_in", "result", "showdown", "mistakes", "loss_bb")} for row in rows]
+    picked = [
+        {
+            k: row[k]
+            for k in (
+                "position",
+                "put_in",
+                "result",
+                "showdown",
+                "win_chance",
+                "rating",
+                "mistakes",
+                "loss_bb",
+            )
+        }
+        for row in rows
+    ]
     assert picked == [
         {
             "position": "BTN",
             "put_in": 300,
             "result": -300,
             "showdown": "yes",
+            "win_chance": 0.432,
+            "rating": round((0.6 * 1.5 + 6.0) / 7.5, 2),
             "mistakes": 1,
             "loss_bb": 1.5,
         },
@@ -216,13 +236,17 @@ def test_hand_rows_count_the_chips_put_in_and_join_the_review():
             "put_in": 100,
             "result": 100,
             "showdown": "no",
+            "win_chance": "",
+            "rating": "",
             "mistakes": "",
             "loss_bb": "",
         },
     ]
+    hole = shown_down.hole_cards[0]
+    assert hole is not None and rows[0]["hand_rank"] == round(hand_rank(hole)[1], 4)
     stream = io.StringIO()
-    write_hands_csv(rows[:1], stream)
+    write_hands_csv([{**rows[0], "page_only": "not written"}], stream)
     assert stream.getvalue().splitlines() == [
         ",".join(HAND_COLUMNS),
-        "s,2026-01-02,cash,2,7,BTN,As Kd,2c 3d 7h 8s 9c,300,-300,-3.0,yes,1,1,1.5,,You raise to 300.",
+        f"s,2026-01-02,cash,2,7,BTN,As Kd,2c 3d 7h 8s 9c,300,-300,-3.0,yes,{rows[0]['hand_rank']},0.432,0.92,1,1,1.5,,You raise to 300.",
     ]

@@ -1,15 +1,14 @@
 from   dataclasses              import replace
-from   typing                   import Any
-
 import numpy as np
 import pytest
-
-from   thpoker.analysis.ev      import PROFILES
-from   thpoker.analysis.review  import (TRIAGE_BRANCH, all_in_net, hint,
-                                        needs_full_review, position_names,
-                                        range_view, review_decision,
-                                        review_hand, situation, summarize,
-                                        thresholds)
+from   thpoker.analysis.ev      import OptionValue, PROFILES
+from   thpoker.analysis.review  import (DecisionReview, TRIAGE_BRANCH,
+                                        all_in_net, hand_rating, hint,
+                                        move_ratings, needs_full_review,
+                                        position_names, range_view,
+                                        review_decision, review_hand,
+                                        situation, summarize, thresholds,
+                                        with_choice)
 from   thpoker.analysis.tests.tracking \
                                 import Calls, REFERENCE
 from   thpoker.bots.abstraction import AbstractAction, legal_abstract_actions
@@ -24,6 +23,7 @@ from   thpoker.game.state       import (Action, ActionType, GameConfig,
 from   thpoker.game.tests.decks import (CALL, CHECK, FOLD, heads_up, play,
                                         stacked_deck)
 from   thpoker.text             import render_decision
+from   typing                   import Any
 
 
 class BetsTheRiver(Bot):
@@ -314,8 +314,107 @@ def test_board_made_hands_count_only_when_the_hole_cards_beat_them(hand, board, 
 def test_a_hint_shows_the_decision_ahead_without_judging_it():
     state = heads_up("8c8d", "JhTh", "AhKhQh2c3d")
     facing_bet = play(state, CALL, CHECK, *[CHECK] * 4, CHECK, Action(ActionType.BET, 200))
-    decision = hint(facing_bet, 1, {0: BetsTheRiver()}, REFERENCE)
+    decision = hint(facing_bet, 1, {0: BetsTheRiver()}, REFERENCE, None, TRIAGE_BRANCH, None)
     assert decision.chosen is None and decision.index == len(facing_bet.history)
     assert {o.action for o in decision.reference} >= {FOLD, CALL}
     lines = render_decision(decision, {0: "Alex"}, 1)
     assert lines[0].endswith("your move") and not any("Mistake" in line or "Best option" in line for line in lines)
+
+
+def judged(
+    base: DecisionReview,
+    played_for: float,
+    values: dict[Action, float],
+    chosen: Action,
+    stderr: float = 0.0,
+) -> tuple[str, float]:
+    """`base` judged with hand-set options; valued against a strong player, in a pot of
+    `played_for` big blinds with nothing to call: its verdict and rating."""
+    spot = replace(base.situation, pot_bb=played_for, to_call_bb=0.0, owed_bb=0.0, facing=None)
+    options = [OptionValue(None, a, ev, stderr, stderr == 0, None, None) for a, ev in values.items()]
+    decision = replace(base, situation=spot, reference=options, exploitative=options, chosen=chosen)
+    return decision.verdict(), decision.rating()
+
+
+def test_a_move_is_rated_by_the_share_of_the_pot_it_gives_up_within_its_verdict():
+    state = heads_up("8c8d", "JhTh", "AhKhQh2c3d")
+    folded = play(state, CALL, CHECK, *[CHECK] * 4, CHECK, Action(ActionType.BET, 200), FOLD)
+    base = review_hand(folded, 1, {0: BetsTheRiver()}, REFERENCE, None, TRIAGE_BRANCH, None).decisions[-1]
+    bet, shove = Action(ActionType.BET, 300), Action(ActionType.BET, 9_000)
+    # Folding away 1 big blind of a 6 big blind pot rates the same whether or not a costly
+    # all-in was on the menu: 0.7 * (1 - 1 / 2.4) + 0.3 * (1 - ln(3) / ln(201))
+    expected = 0.7 * (1 - 1 / 2.4) + 0.3 * (1 - np.log(3) / np.log(201))
+    for values in ({FOLD: 0.0, CALL: 1.0, bet: -2.0, shove: -25.0}, {FOLD: 0.0, CALL: 1.0}):
+        assert judged(base, 6.0, values, FOLD) == ("mistake", pytest.approx(expected))
+    # A narrow loss: 0.1 of a 4 big blind pot.
+    assert judged(base, 4.0, {FOLD: 0.0, CALL: 0.10, bet: 0.12}, FOLD) == (
+        "close",
+        pytest.approx(0.7 * (1 - 0.12 / 1.6) + 0.3 * (1 - np.log(1.24) / np.log(201))),
+    )
+    # A loss within the noise counts for nothing, and "close" stays below a best move's 1.
+    assert judged(base, 10.0, {FOLD: 0.0, CALL: 17.9}, FOLD, stderr=11.6 / 2**0.5) == (
+        "close",
+        0.99,
+    )
+    assert judged(base, 10.0, {FOLD: 0.0, CALL: 1.0}, CALL) == ("best", 1.0)
+    # Held inside the verdict's band: a close loss of 0.4 in the blinds pot computes 0.50 and
+    # shows 0.75, a mistake of 1.1 in a 100 big blind pot computes 0.81 and shows 0.74.
+    assert judged(base, 1.5, {FOLD: 0.0, CALL: 0.4}, FOLD) == ("close", 0.75)
+    assert judged(base, 100.0, {FOLD: 0.0, CALL: 1.1}, FOLD) == ("mistake", 0.74)
+    # In a tournament the prize-pool share is turned back into big blinds at the user's stack.
+    options = [
+        OptionValue(None, FOLD, 0.0, 0.0, True, 0.30, 0.0),
+        OptionValue(None, CALL, 0.0, 0.0, True, 0.32, 0.0),
+    ]
+    spot = replace(base.situation, pot_bb=6.0, to_call_bb=0.0, owed_bb=0.0, facing=None)
+    tournament = replace(
+        base,
+        situation=spot,
+        reference=options,
+        exploitative=options,
+        chosen=FOLD,
+        tournament=True,
+        icm_threshold=0.01,
+    )
+    assert tournament.rating() == pytest.approx(expected)
+
+
+def test_a_short_stack_facing_a_shove_plays_for_what_it_can_cover():
+    deck = stacked_deck(0, 2, {0: "QsJs", 1: "8s8d"}, "KhQc2s9h")
+    state, _ = new_hand(GameConfig(2), 1, 0, (6_000, 1_500), deck=deck)
+    # The button shoves 60 big blinds into the big blind's 1.5; the pot already matched is 3 big
+    # blinds, and calling plays the 15 against the 15 that can be covered.
+    spot = situation(observation(play(state, Action(ActionType.RAISE, 6_000)), 1))
+    assert (spot.pot_bb, spot.to_call_bb, spot.owed_bb) == (61.0, 14.0, 59.0)
+    river = heads_up("8c8d", "JhTh", "AhKhQh2c3d")
+    folded = play(river, CALL, CHECK, *[CHECK] * 4, CHECK, Action(ActionType.BET, 200), FOLD)
+    bots: dict[int, Bot] = {0: BetsTheRiver()}
+    base = review_hand(folded, 1, bots, REFERENCE, None, TRIAGE_BRANCH, None).decisions[-1]
+    options = [
+        OptionValue(None, FOLD, 0.0, 0.0, True, None, None),
+        OptionValue(None, CALL, 3.0, 0.0, True, None, None),
+    ]
+    decision = replace(base, situation=spot, reference=options, exploitative=options, chosen=FOLD)
+    # Folding away 3 big blinds in a 30 big blind pot: 0.7 * (1 - 3 / 4.8) + 0.3 * (1 - ln(7) / ln(201)).
+    assert decision.rating() == pytest.approx(0.3 * (1 - np.log(7) / np.log(201)))
+    assert move_ratings([decision], set())[0].stake == 30.0
+
+
+def test_a_hand_rating_weights_each_move_by_the_chips_at_stake():
+    # An open worth 2.5 big blinds at stake, then a river facing an 88 big blind shove (133):
+    assert hand_rating([(1.0, 2.5), (0.07, 133.0)]) == pytest.approx((2.5 + 0.07 * 133) / 135.5)
+    assert hand_rating([]) is None
+
+
+def test_a_review_made_before_acting_completes_with_the_action_taken():
+    state = heads_up("8c8d", "JhTh", "AhKhQh2c3d")
+    before = play(state, CALL, CHECK)  # the big blind first to act on the flop, no river solve
+    bots: dict[int, Bot] = {0: BetsTheRiver()}
+    ahead = hint(before, 1, bots, REFERENCE, None, TRIAGE_BRANCH, None)
+    hand = play(before, CHECK, CHECK)
+    after = review_decision(hand, 1, bots, REFERENCE, 2, None, TRIAGE_BRANCH, None)
+    assert with_choice(ahead, before, CHECK) == after
+    bet = next(o.action for o in ahead.exploitative if o.action.type == ActionType.BET)
+    betting = review_decision(play(before, bet), 1, bots, REFERENCE, 2, None, TRIAGE_BRANCH, None)
+    assert with_choice(ahead, before, bet) == betting
+    assert with_choice(ahead, before, Action(ActionType.BET, 123)) is None
