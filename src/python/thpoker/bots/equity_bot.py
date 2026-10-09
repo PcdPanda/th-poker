@@ -62,11 +62,12 @@ def _open_width(view: Observation, opener: int) -> float:
     return min(0.5, position_width(0.2, behind))
 
 
-def preflop_range(view: Observation, seat: int) -> Range:
-    """A seat's range from its preflop actions: percentile bands by its strongest action. A
-    raise bigger than usual from a deep stack reads as a stronger range, in proportion to its
-    size (a 100bb open-shove is not a 2.5bb open), phased in between 25bb and 50bb deep since
-    short stacks shove as a matter of course; it never reads looser than the usual band."""
+def preflop_range(view: Observation, seat: int, limp: Range = _LIMP_RANGE) -> Range:
+    """A seat's range from its preflop actions: percentile bands by its strongest action, with
+    `limp` for a limp. A raise bigger than usual from a deep stack reads as a stronger range, in
+    proportion to its size (a 100bb open-shove is not a 2.5bb open), phased in between 25bb and
+    50bb deep since short stacks shove as a matter of course; it never reads looser than the
+    usual band."""
     big_blind = view.config.big_blind
     sizes = iter(usual_raises(view))
     raises = 0
@@ -90,17 +91,17 @@ def preflop_range(view: Observation, seat: int) -> Range:
                 strongest = ranked_range(0.0, top)
             raises += 1
         elif entry.seat == seat and kind == ActionType.CALL and strongest is None:
-            strongest = _CALL_RANGE if raises else _LIMP_RANGE
+            strongest = _CALL_RANGE if raises else limp
         elif entry.seat == seat and kind == ActionType.CHECK and strongest is None:
             strongest = _CHECKED_OPTION_RANGE
     return strongest if strongest is not None else FULL_RANGE
 
 
 @lru_cache(maxsize=128)
-def strength_weighted(weights: Range, board: tuple[int, ...]) -> Range:
-    """Shift a range toward hands that are strong on `board`: weight times 0.25 + 0.75 * rank,
-    where rank is the hand's made-hand percentile (0 weakest, 1 strongest) within the range.
-    Cached: every bot decision on a street rebuils the same seat ranges."""
+def strength_weighted(weights: Range, board: tuple[int, ...], floor: float = 0.25) -> Range:
+    """Shift a range toward hands that are strong on `board`: weight times floor + (1 - floor) *
+    rank, where rank is the hand's made-hand percentile (0 weakest, 1 strongest) within the
+    range. Cached: every bot decision on a street rebuilds the same seat ranges."""
     live = [i for i, (a, b) in enumerate(COMBOS) if weights[i] and a not in board and b not in board]
     if len(live) < 2:
         return weights
@@ -115,21 +116,23 @@ def strength_weighted(weights: Range, board: tuple[int, ...]) -> Range:
         # Equal hands share their group's midpoint rank, so suits do not tilt the weights.
         rank = (start + end) / 2 / (len(live) - 1)
         for position in order[start : end + 1]:
-            shifted[live[position]] *= 0.25 + 0.75 * rank
+            shifted[live[position]] *= floor + (1 - floor) * rank
         start = end + 1
     return tuple(shifted)
 
 
-def bet_shifted(view: Observation, seat: int, weights: Range) -> Range:
+def bet_shifted(view: Observation, seat: int, weights: Range, floors: tuple[float, float] = (0.25, 0.25)) -> Range:
     """`weights` shifted toward strong hands by each of the seat's bets and raises after the
-    flop. Only public cards count: the range must not depend on whose hand is being scored."""
+    flop, with `strength_weighted`'s floor for flop bets and for later ones. Only public cards
+    count: the range must not depend on whose hand is being scored."""
     for entry in view.history:
         if (
             entry.seat == seat
             and entry.street != Street.PREFLOP
             and entry.action.type in (ActionType.BET, ActionType.RAISE)
         ):
-            weights = strength_weighted(weights, view.board[: _STREET_CARDS[entry.street]])
+            floor = floors[entry.street != Street.FLOP]
+            weights = strength_weighted(weights, view.board[: _STREET_CARDS[entry.street]], floor)
     return weights
 
 

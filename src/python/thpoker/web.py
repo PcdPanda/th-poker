@@ -27,7 +27,7 @@ from   thpoker.analysis.ev      import (OptionValue, PROFILES, Profile,
 from   thpoker.analysis.review  import (DecisionReview, HandRating, HandReview,
                                         REFERENCE, best_option, hand_rating,
                                         move_ratings, position_names,
-                                        range_view, thresholds)
+                                        range_view, rating_band, thresholds)
 from   thpoker.analysis.stats   import (DecisionRecord, hand_rows,
                                         write_hands_csv)
 from   thpoker.analysis.tracking \
@@ -49,8 +49,8 @@ from   thpoker.game.rng         import Rng
 from   thpoker.game.rules       import IllegalActionError
 from   thpoker.game.session     import Mode
 from   thpoker.game.state       import Action, ActionType, Event, GameState
-from   thpoker.odds             import (hand_equity, hand_range, hand_window,
-                                        range_share)
+from   thpoker.odds             import (hand_equity, hand_range, hand_rank,
+                                        hand_window, range_share)
 from   thpoker.storage          import (SessionLog, default_decisions_log,
                                         default_log_dir, read_records)
 from   thpoker.table            import (EXPLOITS, MIN_HANDS, STYLE_WORDS,
@@ -59,8 +59,7 @@ from   thpoker.text             import (chips_shown, decision_details,
                                         decision_headline, decision_summary,
                                         describe_action, hand_history_text,
                                         hand_result_text, percent_text,
-                                        plain_decision_text, rated_hand_text,
-                                        strength_text)
+                                        plain_decision_text, rated_hand_text)
 import threading
 from   typing                   import Any, NamedTuple
 
@@ -184,14 +183,15 @@ def _page_rows(
         hole = hand.hole_cards[user]
         assert hole is not None
         page = {
-            "strength": strength_text(hole),
+            "strength": percent_text(hand_rank(hole)[1]) + "%",
             "acted": any(e.seat == user for e in hand.history),
             "pending": hand.hand_id in pending,
             "review": None,
         }
         rated = ratings.get(hand.hand_id)
         if rated is not None and hand.hand_id not in settled:
-            lines, summary = rated_hand_text(hand, user, rated.moves, rated.chance, rated.rating(), scale)
+            rating = rated.rating()
+            lines, summary = rated_hand_text(hand, user, rated.moves, rated.chance, rating, scale)
             each = [
                 f"{hand.history[m.history_index].street.title()} {m.rating:.2f}"
                 + (" (after a hint)" if m.hinted else "")
@@ -199,6 +199,7 @@ def _page_rows(
             ]
             settled[hand.hand_id] = {
                 "review": lines + [summary],
+                "band": None if rating is None else rating_band(rating),
                 "chance": percent_text(rated.chance) + "%",
                 "moves": " · ".join(each),
             }
@@ -325,13 +326,15 @@ def _coach_json(
     plain, styled = seat_labels(runner, False), seat_labels(runner, True)
     big_blind = hand.config.big_blind
     moves = move_ratings(reviews, hinted or set())
+    chance: float | None
+    rating: float | None
     if kept is not None:
-        rated, summary = rated_hand_text(hand, user, kept.moves, kept.chance, kept.rating(), scale)
+        moves, chance, rating = kept.moves, kept.chance, kept.rating()
     elif review is not None:
-        rated, summary = rated_hand_text(hand, user, moves, review.chance(), review.rating(), scale)
+        chance, rating = review.chance(), review.rating()
     else:  # a move checked has its chance but no rating of moves not shown; a hint has neither
-        chance = reviews[-1].reference_equity.value if moves else None
-        rated, summary = rated_hand_text(hand, user, moves, chance, None, scale)
+        chance, rating = (reviews[-1].reference_equity.value if moves else None), None
+    rated, summary = rated_hand_text(hand, user, moves, chance, rating, scale)
     copy = hand_history_text(hand, user, styled, scale, game_name(runner), shows) + [""]
     decisions = []
     for number, decision in enumerate(reviews, 1):
@@ -345,6 +348,8 @@ def _coach_json(
         "decisions": decisions,
         "result": result,
         "summary": summary if review is not None else None,
+        "rating": rating,
+        "band": None if rating is None else rating_band(rating),
         "copy_text": "\n".join(copy).strip() + "\n",
         "hand_text": _player_view(history, rated, summary, _result(hand, user, scale, None)),
     }
@@ -768,6 +773,8 @@ class _Saved:
                     raise ValueError("bot-only sessions have no decisions to review")
                 self.runner = TableRunner(self.config)
             hands = [GameState.from_dict(r["hand"]) for r in records if r["type"] == "hand"]
+            assert self.runner is not None
+            self.runner.replay(records)
         except (KeyError, TypeError) as error:
             raise ValueError(f"damaged log: {error!r}") from error
         shows, ratings = logged_shows(records), logged_ratings(records)

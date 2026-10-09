@@ -527,16 +527,7 @@ def plain_decision_text(
 def percent_text(share: float) -> str:
     """A whole percent, or one decimal where that would read as none or all."""
     whole = round(100 * share)
-    return str(whole) if 0 < whole < 100 else f"{100 * share:.1f}"
-
-
-def strength_text(hole: tuple[int, int]) -> str:
-    """Where the hole cards rank among starting hands: "best 6%", or past the middle "worst 1%"
-    (the share as weak or weaker)."""
-    stronger, through = hand_rank(hole)
-    if through <= 0.5:
-        return f"best {percent_text(through)}%"
-    return f"worst {percent_text(1 - stronger)}%"
+    return str(whole) if 0 < whole < 100 or share in (0, 1) else f"{100 * share:.1f}"
 
 
 def rated_moves_text(hand: GameState, user: int, moves: Sequence[MoveRating], scale: int) -> list[str]:
@@ -578,7 +569,9 @@ def rated_hand_text(
 def hand_summary_text(hole: tuple[int, int], chance: float | None, rating: float | None, moves: int, over: bool) -> str:
     """The hand's three numbers in words: the starting hand's rank, the chance to win at the
     last (or, mid-hand, latest) move, and the rating of `moves` rated moves."""
-    parts = [f"Your cards ({pretty_cards(hole)}) are in the {strength_text(hole)} of starting hands."]
+    stronger, through = hand_rank(hole)
+    rank = f"best {percent_text(through)}%" if through <= 0.5 else f"worst {percent_text(1 - stronger)}%"
+    parts = [f"Your cards ({pretty_cards(hole)}) are in the {rank} of starting hands."]
     if not moves:
         if over:
             parts.append("You made no decision this hand.")

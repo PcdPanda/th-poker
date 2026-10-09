@@ -195,6 +195,13 @@ def hand_rating(moves: Sequence[tuple[float, float]]) -> float | None:
     return sum(rating * stake for rating, stake in moves) / total if total > 0 else None
 
 
+def rating_band(rating: float) -> str:
+    """The verdict whose band holds `rating` as shown, to two decimals: "best", "close" or
+    "mistake"."""
+    shown = round(rating, 2)
+    return "best" if shown >= 1 else "close" if shown >= RATING_CLOSE else "mistake"
+
+
 @dataclass(frozen=True)
 class MoveRating:
     history_index: int  # the move's place in the hand's history

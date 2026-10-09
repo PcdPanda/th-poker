@@ -164,6 +164,11 @@ label.choice small {
   color: var(--muted);
 }
 
+#tier-hint {
+  display: block;
+  min-height: 4.2em;  /* three lines on a phone, so the form doesn't move with the choice */
+}
+
 details.more>summary {
   cursor: pointer;
   color: var(--muted);
@@ -1060,7 +1065,15 @@ table.hands td.number {
 }
 
 table.hands td.strength {
-  min-width: 5.5rem;
+  min-width: 3.5rem;
+}
+
+table.hands th button.sort {
+  background: none;
+  color: inherit;
+  padding: 0;
+  margin: 0;
+  text-align: left;
 }
 
 table.hands td.chance {
@@ -1077,6 +1090,26 @@ table.hands td.rating {
 
 .hand-summary {
   margin: 0.6rem 0;
+}
+
+.rating-badge {
+  display: inline-block;
+  font-size: 1.05rem;
+  font-weight: 700;
+  padding: 0.1rem 0.7rem;
+  margin-bottom: 0.3rem;
+  border: 2px solid var(--muted);
+  border-radius: 999px;
+}
+
+.rating-badge.best {
+  color: var(--good);
+  border-color: var(--good);
+}
+
+.rating-badge.mistake {
+  color: var(--bad);
+  border-color: var(--bad);
 }
 
 .icon-button.waiting {

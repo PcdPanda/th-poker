@@ -6,7 +6,9 @@ import pytest
 from   thpoker.analysis.ev      import PROFILES
 import thpoker.analysis.review
 from   thpoker.bots.equity_bot  import public_seed
-from   thpoker.cli              import REVIEWS, build_config, parse_args
+from   thpoker.bots.range_bot   import NEUTRAL
+from   thpoker.cli              import (REVIEWS, build_config, load_session,
+                                        parse_args)
 from   thpoker.game.cards       import card_str, parse_cards
 from   thpoker.game.engine      import observation
 from   thpoker.game.rng         import Rng
@@ -467,6 +469,10 @@ def test_past_sessions_read_back_the_same_hands_as_the_live_table(tmp_path):
     rows = call(app, "GET", ["history", saved["name"]], {})["rows"]
     assert [{k: v for k, v in row.items() if k != "date"} for row in rows] == undated
     review = call(app, "POST", ["history", saved["name"], "review"], {"hand": row["hand"]})
+    # The review highlights the hand's rating as its row gives it, in the band of its verdicts.
+    shown = round(weighted, 2)
+    band = "best" if shown == 1 else "close" if shown >= 0.75 else "mistake"
+    assert (round(review["rating"], 2), review["band"], row["band"]) == (row["rating"], band, band)
     assert review["copy_text"].startswith("No-limit Texas Hold'em cash game")
     assert review["copy_text"].count(review["result"]) == 1 and review["result"] not in review["history"]
     everything = app.handle("GET", ["history.csv"], {})
@@ -481,26 +487,55 @@ def test_past_sessions_read_back_the_same_hands_as_the_live_table(tmp_path):
             app.handle("GET", ["history", name], {})
 
 
-def test_saved_sessions_can_be_deleted_together_and_nothing_brings_them_back(tmp_path):
+def test_an_expert_session_comes_back_with_the_reads_it_was_played_with(tmp_path):
+    # Heads-up against Expert, folding the first move of every third hand: a fold on the button
+    # ends a hand before any bot acts, and its read must come back all the same.
     app = App(tmp_path)
-    keys = [call(app, "POST", ["sessions"], {**SETUP, "seed": seed})["id"] for seed in (8, 9)]
+    key = call(app, "POST", ["sessions"], {**SETUP, "seats": 2, "tier": 4})["id"]
+    for number in range(12):
+        state = call(app, "GET", ["sessions", your_turn(app, key)], {})
+        if number % 3 == 2 and state["legal"]["call"] is not None:
+            call(app, "POST", ["sessions", key, "action"], {"kind": "fold"})
+        state = play_out(app, key)
+    live = app.tables[key].runner.reads
+    (log,) = tmp_path.glob("session-*.jsonl")
+    records = read_session_log(log)
+    acted = {
+        r["event"]["data"]["hand_id"] for r in records if r["type"] == "event" and r["event"]["kind"] == "BotDecision"
+    }
+    assert set(live) - acted and len(live) == 12 and list(live.values())[-1] != NEUTRAL
+    assert load_session(log)[2].reads == live
+    (saved,) = call(app, "GET", ["history"], {})["sessions"]
+    rows = call(app, "GET", ["history", saved["name"]], {})["rows"]
+    assert app.saved[log].runner is not None and app.saved[log].runner.reads == live
+    # The last hand was folded at once: its review values the other options by how the bots
+    # answer, with the hand's read, live and saved alike.
+    reviewed = call(app, "POST", ["sessions", key, "review"], {})
+    again = call(app, "POST", ["history", saved["name"], "review"], {"hand": state["hand_number"]})
+    assert reviewed["decisions"] == again["decisions"] and rows[-1]["hand"] == state["hand_number"]
+
+
+def test_ticked_sessions_are_deleted_together_and_nothing_brings_them_back(tmp_path):
+    app = App(tmp_path)
+    keys = {seed: call(app, "POST", ["sessions"], {**SETUP, "seed": seed})["id"] for seed in (7, 8, 9)}
     hold = threading.Event()
     REVIEWS.submit(hold.wait)  # the hands' ratings have not run when the sessions are deleted
     try:
-        for key in keys:
+        for key in keys.values():
             play_out(app, key)
-        names = [saved["name"] for saved in call(app, "GET", ["history"], {})["sessions"]]
-        with pytest.raises(KeyError):  # only listed logs can be deleted, and then none is
-            app.handle("POST", ["history", "delete"], {"names": [names[0], "session-1"]})
-        assert len(call(app, "GET", ["history"], {})["sessions"]) == 2
-        listed = call(app, "POST", ["history", "delete"], {"names": names})
+        with pytest.raises(KeyError):  # an unknown name deletes none of them
+            app.handle("POST", ["history", "delete"], {"names": ["session-7", "session-1"]})
+        assert len(call(app, "GET", ["history"], {})["sessions"]) == 3
+        listed = call(app, "POST", ["history", "delete"], {"names": ["session-7", "session-9"]})
     finally:
         hold.set()
     REVIEWS.submit(int).result()
-    assert listed["sessions"] == [] and not list(tmp_path.glob("session-*.jsonl"))
-    for key in keys:
+    assert [s["name"] for s in listed["sessions"]] == ["session-8"]
+    assert [p.stem for p in tmp_path.glob("session-*.jsonl")] == ["session-8"]
+    call(app, "GET", ["sessions", keys[8]], {})  # the table writing the kept one plays on
+    for seed in (7, 9):
         with pytest.raises(KeyError):  # the tables writing them went with them
-            call(app, "GET", ["sessions", key], {})
+            call(app, "GET", ["sessions", keys[seed]], {})
 
 
 def test_the_state_counts_the_chips_in_the_pot_the_pot_odds_and_the_hand_result():

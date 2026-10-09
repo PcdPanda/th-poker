@@ -16,7 +16,13 @@ const SEAT_WORDS = {
   UTG: "First to act", "UTG+1": "Second to act", "UTG+2": "Third to act", HJ: "Hijack",
   CO: "Cutoff", BTN: "Dealer", SB: "Small blind", BB: "Big blind",
 };
-const DIFFICULTY = { 1: "Easy", 2: "Medium", 3: "Hard" };
+const DIFFICULTY = { 1: "Easy", 2: "Medium", 3: "Hard", 4: "Expert" };
+const DIFFICULTY_WORDS = {
+  1: "Plays by simple rules about its own cards. Easy to read and easy to beat.",
+  2: "Weighs its chance to win against the cost of calling, and guesses your cards from how you bet.",
+  3: "Plays like a strong player: standard charts before the flop, and a hard-to-read mix of bets and bluffs after it.",
+  4: "Plays like Hard at first, then adjusts to your habits the longer you play. Only this session counts.",
+};
 const STREETS = { preflop: "Before the flop", flop: "Flop", turn: "Turn", river: "River" };
 const PRESETS = [["⅓ pot", 1 / 3], ["½ pot", 1 / 2], ["⅔ pot", 2 / 3], ["Pot", 1]];
 const CARD = /^[2-9TJQKA][cdhs]$/;
@@ -40,16 +46,24 @@ const openMoves = new Set(); // "session/hand" of the rows showing their moves, 
 const latestRows = new Map();  // each shown hand's row as last read, by "session/hand"
 let refreshTimer = null;
 let refreshes = 0;  // counts what the hands tables show, so a re-read for an older view is dropped
+let handsOrder = null;  // the hands tables' sort as { column, up }, or null for the newest hand first
+const SEAT_ORDER = Object.keys(SEAT_WORDS);
+const RATING_TIP = "Your moves this hand, rated 0 to 1, with moves in bigger pots counting for more: 1 means you picked the best option every time";
 const COPY_TIP = "Copy the hand as you saw it, with your moves rated 0 to 1, for an AI chat";
 const ANALYSIS_TIP = "Copy the hand with the coach's full analysis and ratings, for an AI chat";
+// Title, tip, class, and the value a click on the title sorts by.
 const COLUMNS = [
-  ["Hand"], ["Seat"], ["Your cards"],
-  ["Strength", "How your two starting cards rank among all starting hands: best 6% means only 6% are as strong or stronger"],
+  ["Hand", null, null, (row) => row.hand],
+  ["Seat", null, null, (row) => SEAT_ORDER.indexOf(row.position)],
+  ["Your cards"],
+  ["Top %", "Your two starting cards are in this top share of all starting hands: lower is stronger, and aces are the top 0.5%", null, (row) => row.hand_rank],
   ["Board", null, "wide-only"],
-  ["Chance to win", "Your chance to win at showdown at your last move, reading the others' hands from their play the way a strong player would, so it can differ from the chance shown during play"],
-  ["Put in", null, "wide-only"], ["Result"],
-  ["Rating", "Your moves this hand, rated 0 to 1, with moves in bigger pots counting for more: 1 means you picked the best option every time"],
+  ["Chance to win", "Your chance to win at showdown at your last move, reading the others' hands from their play the way a strong player would, so it can differ from the chance shown during play", null, (row) => row.win_chance],
+  ["Put in", null, "wide-only", (row) => row.put_in],
+  ["Result", null, null, (row) => row.result],
+  ["Rating", RATING_TIP, null, (row) => row.rating],
   [""],
+
 ];
 
 async function api(path, body) {
@@ -620,15 +634,34 @@ function renderLog() {
 
 function handsTable(rows, reviewer) {
   if (!rows.length) return element("p", "", "No finished hands yet.");
+  const scroll = element("div", "table-scroll");
   const table = element("table", "hands");
   const head = element("tr");
-  for (const [title, tip, className] of COLUMNS) {
-    const th = element("th", className, title);
+  for (const [index, [title, tip, className, value]] of COLUMNS.entries()) {
+    const th = element("th", className);
     if (tip) th.title = tip;
     head.append(th);
+    if (!value) {
+      th.textContent = title;
+      continue;
+    }
+    // Each click on a title goes up, down, then back to the newest hand first.
+    const order = handsOrder && handsOrder.column === index ? handsOrder : null;
+    th.setAttribute("aria-sort", order ? (order.up ? "ascending" : "descending") : "none");
+    th.append(button(title + (order ? (order.up ? " ▲" : " ▼") : ""), () => {
+      handsOrder = !order ? { column: index, up: true } : order.up ? { column: index, up: false } : null;
+      scroll.replaceWith(handsTable(rows.map((row) => latestRows.get(row.session + "/" + row.hand)), reviewer));
+    }, "sort"));
   }
   table.append(head);
-  for (const row of rows.slice().reverse()) {
+  const shown = rows.slice().reverse();
+  if (handsOrder) {
+    const value = COLUMNS[handsOrder.column][3];
+    const sign = handsOrder.up ? 1 : -1;
+    // Blanks (a rating still coming, or none) stay last either way.
+    shown.sort((a, b) => (value(a) === "") - (value(b) === "") || sign * (value(a) - value(b)));
+  }
+  for (const row of shown) {
     const tr = element("tr");
     const key = row.session + "/" + row.hand;
     tr.dataset.key = key;
@@ -662,7 +695,6 @@ function handsTable(rows, reviewer) {
     table.append(tr);
     if (openMoves.has(key)) table.append(movesRow(row));
   }
-  const scroll = element("div", "table-scroll");
   scroll.append(table);
   return scroll;
 }
@@ -705,9 +737,21 @@ function rowReview(row) {
   const box = element("div", "row-review");
   if (row.review === null) {
     box.append(element("p", "waiting", "Loading…"));
-  } else {
-    for (const line of row.review) box.append(prettyLine(line.trim(), line.startsWith(" ") ? "story-line" : "story-head"));
+    return box;
   }
+  for (const line of row.review.slice(0, -1)) box.append(prettyLine(line.trim(), line.startsWith(" ") ? "story-line" : "story-head"));
+  box.append(handSummary(row.review.at(-1), row.rating === "" ? null : row.rating, row.band));
+  return box;
+}
+
+function handSummary(text, rating, band) {
+  const box = element("div", "hand-summary");
+  if (rating !== null) {
+    const badge = element("span", "rating-badge " + band, "Hand rating " + rating.toFixed(2));
+    badge.title = RATING_TIP;
+    box.append(badge);
+  }
+  box.append(prettyLine(text));
   return box;
 }
 
@@ -925,7 +969,7 @@ function coachView(answer, full) {
   view.append(story);
   if (!answer.decisions.length) view.append(element("p", "", "You made no decision in that hand."));
   for (const decision of answer.decisions) view.append(decisionView(decision, false));
-  if (answer.summary) view.append(prettyLine(answer.summary, "hand-summary"));
+  if (answer.summary) view.append(handSummary(answer.summary, answer.rating, answer.band));
   if (answer.result) view.append(element("p", "result", answer.result));
   return view;
 }
@@ -1131,6 +1175,13 @@ function rangeTyped() {
   showHands();
 }
 
+function tierHint() {
+  // With picked training cards the server keeps Expert's read of you neutral.
+  const tier = setupForm.elements.tier.value;
+  const picked = tier === "4" && selectedMode() === "training" && handsSpec() !== "";
+  document.getElementById("tier-hint").textContent = DIFFICULTY_WORDS[tier] + (picked ? " In training with picked cards it plays like Hard." : "");
+}
+
 function modeChanged() {
   const mode = selectedMode();
   document.getElementById("blinds-field").hidden = mode === "tournament";
@@ -1143,7 +1194,11 @@ for (const radio of document.querySelectorAll("input[name=mode]")) radio.addEven
 setupForm.elements.seats.addEventListener("input", fillSeats);
 document.getElementById("hands-preset").addEventListener("change", presetChanged);
 for (const id of ["hands-low", "hands-high"]) document.getElementById(id).addEventListener("input", rangeTyped);
+for (const id of ["hands-preset", "hands-low", "hands-high"]) document.getElementById(id).addEventListener("input", tierHint);
+for (const radio of document.querySelectorAll("input[name=mode]")) radio.addEventListener("change", tierHint);
+setupForm.elements.tier.addEventListener("change", tierHint);
 fillSeats();
+tierHint();
 
 setupForm.addEventListener("submit", (event) => {
   event.preventDefault();

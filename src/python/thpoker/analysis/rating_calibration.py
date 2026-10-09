@@ -18,6 +18,7 @@ from   thpoker.table            import BOT_TIERS, TableConfig, TableRunner
 
 SEATS = 6
 HANDS_PER_TABLE = 25
+TIERS = (1, 2, 3)  # Expert plays like Hard without a user to read
 
 
 def _table(task: tuple[int, int]) -> tuple[int, list[float]]:
@@ -46,8 +47,8 @@ def _table(task: tuple[int, int]) -> tuple[int, list[float]]:
 def calibrate(hands: int, workers: int) -> dict[int, tuple[float, float, int]]:
     """(reference loss per 100 hands, its standard error, hands counted) for each tier."""
     tables = max(1, hands // HANDS_PER_TABLE)
-    tasks = [(tier, 1000 * tier + table) for tier in BOT_TIERS for table in range(tables)]
-    losses: dict[int, list[float]] = {tier: [] for tier in BOT_TIERS}
+    tasks = [(tier, 1000 * tier + table) for tier in TIERS for table in range(tables)]
+    losses: dict[int, list[float]] = {tier: [] for tier in TIERS}
     with ProcessPoolExecutor(workers) as pool:
         for tier, table_losses in pool.map(_table, tasks):
             losses[tier].extend(table_losses)

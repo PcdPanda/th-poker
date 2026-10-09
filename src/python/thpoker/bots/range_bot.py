@@ -11,29 +11,38 @@ clearly priced in; when checked to it bets its value hands plus a balanced share
 """
 
 from   bisect                   import bisect_left, bisect_right
-from   dataclasses              import dataclass
+from   collections.abc          import Callable, Sequence
+from   dataclasses              import dataclass, field
+from   functools                import cache
 import math
-from   typing                   import Any
-
 from   thpoker.bots.abstraction import (AbstractAction, NEVER_FOLD_EQUITY,
                                         POT_FRACTIONS, PUSH_FOLD_BIG_BLINDS,
                                         call_price, defense_share,
                                         effective_stack, finish, last_bet,
                                         legal_abstract_actions, sigmoid,
                                         usual_raises)
-from   thpoker.bots.bot         import Policy, Style, TierBot
+from   thpoker.bots.bot         import PRESETS, Policy, Style, TierBot
 from   thpoker.bots.equity_bot  import (EquityBot, bet_shifted, preflop_range,
                                         public_seed)
 from   thpoker.charts           import call_chart, push_chart, strategy
-from   thpoker.game.cards       import COMBO_CLASS
+from   thpoker.game.cards       import (COMBOS, COMBOS_OF_CLASS, COMBO_CLASS,
+                                        PREFLOP_CLASSES)
+from   thpoker.game.engine      import observation, replay_states
 from   thpoker.game.rng         import Rng
 from   thpoker.game.rules       import legal_actions
-from   thpoker.game.state       import ActionType, Observation, Street
-from   thpoker.odds             import Range, range_equities, texture
+from   thpoker.game.state       import (ActionType, GameState, Observation,
+                                        Street)
+from   thpoker.odds             import (Range, hand_range, range_equities,
+                                        ranked_range, texture)
+from   typing                   import Any
 
 _BLUFF_STREET_FACTOR = {Street.FLOP: 1.5, Street.TURN: 1.2, Street.RIVER: 1.0}
 # Chart thresholds sit on a half-big-blind grid; mix across about that width.
 _CHART_SOFTNESS_BB = 0.3
+# How much wider (above 1) or narrower a seat's continuing and re-raising chart rows are, from
+# the view, the seats in preflop order, the raisers and the actor (as places in that order),
+# and the chart node.
+Factors = Callable[[Observation, tuple[int, ...], list[int], int, str], tuple[float, float]]
 
 
 @dataclass(frozen=True)
@@ -91,10 +100,58 @@ def _oversized(view: Observation) -> bool:
     )
 
 
-def chart_range(view: Observation, seat: int) -> Range | None:
-    """The range the charts give `seat` for its preflop actions so far, or None when its line
-    leaves the charted spots (limps, multiway pots, cold 4-bets, short-stack raises that are
-    not all-in, raises of an unusual size)."""
+@cache
+def _strongest_first() -> tuple[int, ...]:
+    return tuple(PREFLOP_CLASSES.index(name) for name in hand_range("0-100"))
+
+
+_CLASS_COMBOS = tuple(len(COMBOS_OF_CLASS[name]) for name in PREFLOP_CLASSES)
+
+
+def _combos(weights: Sequence[float]) -> float:
+    """How many of the 1326 deals class weights hold."""
+    return sum(w * n for w, n in zip(weights, _CLASS_COMBOS))
+
+
+def stretched(weights: Sequence[float], factor: float) -> list[float]:
+    """Class weights at `factor` times their share of deals (at most all of them): a wider
+    range fills the strongest classes first, a narrower one empties the weakest first."""
+    result = list(weights)
+    if factor == 1:
+        return result
+    share = _combos(weights)
+    left = min(len(COMBOS), factor * share) - share
+    order = _strongest_first() if left > 0 else reversed(_strongest_first())
+    for klass in order:
+        if abs(left) < 1e-9:
+            break
+        room = 1 - result[klass] if left > 0 else -result[klass]
+        change = min(room, left / _CLASS_COMBOS[klass], key=abs)
+        result[klass] += change
+        left -= change * _CLASS_COMBOS[klass]
+    return result
+
+
+def _stretched_rows(
+    node: str, rows: tuple[tuple[float, ...], ...], factors: tuple[float, float]
+) -> tuple[tuple[float, ...], ...]:
+    """Open rows (fold, open) with the opens at `factors[0]` times their share; respond rows
+    (fold, call, re-raise) with the continuing hands at `factors[0]` and the re-raises at
+    `factors[1]` times theirs, a re-raise never above the class's continuing weight."""
+    keep, again = factors
+    if (keep, again) == (1.0, 1.0):
+        return rows
+    if node == "open":
+        return tuple((1 - w, w) for w in stretched([row[1] for row in rows], keep))
+    going = stretched([row[1] + row[2] for row in rows], keep)
+    raising = [min(r, g) for r, g in zip(stretched([row[2] for row in rows], again), going)]
+    return tuple((1 - g, g - r, r) for g, r in zip(going, raising))
+
+
+def chart_range(view: Observation, seat: int, factors: Factors | None = None) -> Range | None:
+    """The range the charts, stretched by `factors`, give `seat` for its preflop actions so far,
+    or None when its line leaves the charted spots (limps, multiway pots, cold 4-bets,
+    short-stack raises that are not all-in, raises of an unusual size)."""
     if _oversized(view):
         return None
     order = preflop_spot(view, seat).order
@@ -110,7 +167,16 @@ def chart_range(view: Observation, seat: int) -> Range | None:
         if actor == index:
             # An open follows the chart for the depth when it was made, before any short 3-bet.
             spot = preflop_spot(view, seat, position)
-            node = _chart_node(spot, raisers, callers, index, aggressive, action.type == ActionType.CALL, view)
+            node = _chart_node(
+                spot,
+                raisers,
+                callers,
+                index,
+                aggressive,
+                action.type == ActionType.CALL,
+                view,
+                factors,
+            )
             if node is None:
                 return None
             weights = node if weights is None else [w * p for w, p in zip(weights, node)]
@@ -129,6 +195,7 @@ def _chart_node(
     aggressive: bool,
     called: bool,
     view: Observation,
+    factors: Factors | None,
 ) -> list[float] | None:
     """Per-class probability that a player at `index` took this action, or None if off-chart."""
     if callers:
@@ -144,9 +211,13 @@ def _chart_node(
             ]
         return None
     if not raisers and aggressive:
-        return [row[1] for row in strategy("open", spot.num_players, str(index), spot.stack, spot.bb_ante)]
+        rows = strategy("open", spot.num_players, str(index), spot.stack, spot.bb_ante)
+        stretch = factors(view, spot.order, raisers, index, "open") if factors else (1.0, 1.0)
+        return [row[1] for row in _stretched_rows("open", rows, stretch)]
     if len(raisers) == 1 and raisers[0] != index:
         rows = strategy("respond", spot.num_players, f"{raisers[0]}-{index}", spot.stack, spot.bb_ante)
+        stretch = factors(view, spot.order, raisers, index, "respond") if factors else (1.0, 1.0)
+        rows = _stretched_rows("respond", rows, stretch)
         return [row[2] if aggressive else row[1] for row in rows] if (aggressive or called) else None
     if len(raisers) == 2 and raisers[0] == index:
         rows = strategy("versus_3bet", spot.num_players, f"{index}-{raisers[1]}", spot.stack, spot.bb_ante)
@@ -157,13 +228,23 @@ def _chart_node(
     return None
 
 
-def seat_range(view: Observation, seat: int) -> Range:
-    """A seat's range from its public actions: charts (or the Tier 2 bands off-chart) preflop,
-    then shifted toward strong hands by each of its postflop bets and raises."""
-    charted = chart_range(view, seat)
+def seat_range(
+    view: Observation,
+    seat: int,
+    factors: Factors | None = None,
+    limp: Range | None = None,
+    floors: tuple[float, float] = (0.25, 0.25),
+) -> Range:
+    """A seat's range from its public actions: charts stretched by `factors` (or the Tier 2
+    bands off-chart, with `limp` for a limp) preflop, then shifted toward strong hands by each
+    of its postflop bets and raises, with `strength_weighted`'s `floors` on the flop and later."""
+    charted = chart_range(view, seat, factors)
     # A line the charts give no weight to any hand leaves nothing to score against.
-    weights = charted if charted is not None and sum(charted) > 1.0 else preflop_range(view, seat)
-    return bet_shifted(view, seat, weights)
+    if charted is not None and sum(charted) > 1.0:
+        weights = charted
+    else:
+        weights = preflop_range(view, seat) if limp is None else preflop_range(view, seat, limp)
+    return bet_shifted(view, seat, weights, floors)
 
 
 class RangeBot(TierBot):
@@ -171,6 +252,20 @@ class RangeBot(TierBot):
         self.name = name
         self.style = style
         self._fallback = EquityBot(name, style)
+
+    def chart_factors(
+        self, view: Observation, order: tuple[int, ...], raisers: list[int], index: int, node: str
+    ) -> tuple[float, float]:
+        """See `Factors`: Hard plays and reads the charts as they are."""
+        return 1.0, 1.0
+
+    def seat_range(self, view: Observation, seat: int) -> Range:
+        return seat_range(view, seat)
+
+    def exploits(self, view: Observation, opponents: list[int]) -> tuple[float, float, float]:
+        """After the flop, what to add to the share of its range it continues with facing a
+        bet, what to add to its value bar, and what to multiply its bluffs by."""
+        return 0.0, 0.0, 1.0
 
     def decisions(self, view: Observation, holes: list[int]) -> dict[int, Policy]:
         """One chart lookup preflop or one equity pass postflop serves every hand. Off the
@@ -260,6 +355,11 @@ class RangeBot(TierBot):
         else:
             return None
         rows = strategy(node, spot.num_players, seats, spot.stack, spot.bb_ante)
+        if node in ("open", "respond"):
+            stretch = self.chart_factors(view, spot.order, raisers, index, node)
+            rows = _stretched_rows(node, rows, stretch)
+            if stretch != (1.0, 1.0):
+                rationale["chart_stretch"] = stretch
         table = [dict(zip(actions, row)) for row in rows]
         return table, {**rationale, "rule_triggered": f"preflop table: {rule}"}, None
 
@@ -272,8 +372,9 @@ class RangeBot(TierBot):
         opponents = [
             s for s in range(view.config.num_seats) if s != view.seat and view.dealt_in[s] and not view.folded[s]
         ]
-        opponent_ranges = [seat_range(view, s) for s in opponents]
-        own = seat_range(view, view.seat)
+        opponent_ranges = [self.seat_range(view, s) for s in opponents]
+        own = self.seat_range(view, view.seat)
+        call_shift, value_shift, bluff_factor = self.exploits(view, opponents)
         combos = sorted({i for i, w in enumerate(own) if w > 0} | set(holes))
         equities = range_equities(view.board, combos, opponent_ranges, Rng(public_seed(view)))
         ranked = sorted((e, own[i]) for i, e in equities.items() if own[i] > 0)
@@ -289,6 +390,8 @@ class RangeBot(TierBot):
             "opponents": len(opponents),
             "board": f"{tags.high}, {tags.pairing}, {tags.suits}, {tags.connectivity}",
         }
+        if (call_shift, value_shift, bluff_factor) != (0.0, 0.0, 1.0):
+            common["exploits"] = [call_shift, value_shift, bluff_factor]
         if legal.can_check:
             size = 0.75 if tags.wet or view.street == Street.RIVER else 0.33
             size = min(1.0, max(0.33, size + 0.3 * (style.sizing_preference - 0.5)))
@@ -304,8 +407,16 @@ class RangeBot(TierBot):
                 / (1 + size)
                 * _BLUFF_STREET_FACTOR[view.street]
                 * style.bluff_multiplier
+                * bluff_factor
                 / len(opponents),
             )
+            if value_shift:  # bluffs stay balanced against the value share before the shift
+                value_share = min(
+                    1.0,
+                    style.aggression
+                    * (weight_total - running[bisect_left(values, value_bar + value_shift)])
+                    / weight_total,
+                )
             action = _size_action(size)
             common.update(
                 {
@@ -317,19 +428,15 @@ class RangeBot(TierBot):
             )
         else:
             price = call_price(view)
-            faced = last_bet(view)
-            assert faced is not None  # after the flop, a seat that cannot check faces a bet
-            bet_fraction = faced[1] / faced[0]
-            defense = defense_share(view)
-            if defense is None:
-                defense = 1 - (bet_fraction / (1 + bet_fraction)) ** (1 / len(opponents))
+            defense, bet_fraction = _defense(view, len(opponents))
             continue_share = min(
                 1.0,
                 max(
                     0.05,
                     defense
                     + 0.15 * (style.call_down_tendency - 0.5)
-                    - 0.1 * style.fold_to_pressure * max(0.0, bet_fraction - 0.75),
+                    - 0.1 * style.fold_to_pressure * max(0.0, bet_fraction - 0.75)
+                    + call_shift,
                 ),
             )
             raise_share = continue_share * 0.2 * style.aggression
@@ -376,6 +483,200 @@ class RangeBot(TierBot):
         return decided
 
 
+def _defense(view: Observation, opponents: int) -> tuple[float, float]:
+    """The share of its range a seat keeps facing this street's last bet by the minimum defense
+    frequency (in its multiway form where `defense_share` has none), and the bet's size as a
+    share of the pot before it."""
+    faced = last_bet(view)
+    assert faced is not None  # after the flop, a seat that cannot check faces a bet
+    bet_fraction = faced[1] / faced[0]
+    defense = defense_share(view)
+    if defense is None:
+        defense = 1 - (bet_fraction / (1 + bet_fraction)) ** (1 / opponents)
+    return defense, bet_fraction
+
+
 def _size_action(pot_fraction: float) -> AbstractAction:
     """The abstract bet closest to a pot fraction."""
     return min(POT_FRACTIONS, key=lambda a: abs(POT_FRACTIONS[a] - pot_fraction))
+
+
+# Behind every factor of the read, this many events of solid play (DESIGN.md Section 5.3), so a
+# short session reads like a solid player; factors stay within the clamp.
+READ_PRIOR = 4.0
+READ_CLAMP = (0.4, 2.5)
+_AGGRESSIVE = (ActionType.BET, ActionType.RAISE)
+
+
+@dataclass(frozen=True)
+class UserRead:
+    """How often the user has done each thing this session against what Hard expects of a
+    solid player in the same spots (1 is as expected), and how wide its limping hands are."""
+
+    opens: float = 1.0
+    defends: float = 1.0  # calls or re-raises facing one open
+    three_bets: float = 1.0
+    bets_flop: float = 1.0  # bets when checked to
+    bets_late: float = 1.0  # the same on the turn and river
+    folds_flop: float = 1.0  # folds facing a bet
+    folds_late: float = 1.0
+    limp_width: float = 0.5
+
+
+NEUTRAL = UserRead()
+
+
+def _floor(bets: float) -> float:
+    """`strength_weighted`'s floor for the bets of a user who bets `bets` times as often as
+    expected: the more often, the less a bet says."""
+    return min(0.7, max(0.1, 1 - 0.75 / bets))
+
+
+class ExpertBot(RangeBot):
+    """Hard, adjusted to the user's play this session: `reads` holds the read each hand was
+    dealt with, by hand id, so a policy stays a pure function of its hand."""
+
+    def __init__(
+        self,
+        name: str,
+        style: Style,
+        reads: dict[str, UserRead] | None = None,
+        user: int | None = None,
+    ):
+        super().__init__(name, style)
+        self.reads = {} if reads is None else reads
+        self.user = user
+
+    def chart_factors(
+        self, view: Observation, order: tuple[int, ...], raisers: list[int], index: int, node: str
+    ) -> tuple[float, float]:
+        """The user's rows by its read; its own rows wider against a user in the blinds who
+        defends too little, or facing an open from a user who opens too much."""
+        if self.user not in order:
+            return 1.0, 1.0
+        read = self.reads.get(view.hand_id, NEUTRAL)
+        user = order.index(self.user)
+        if node == "open":
+            if index == user:
+                return read.opens, 1.0
+            if user == len(order) - 1:
+                return read.defends**-0.5, 1.0
+            # In the small blind, the big blind behind it still defends.
+            if user == len(order) - 2 and index < user:
+                return read.defends**-0.25, 1.0
+            return 1.0, 1.0
+        if index == user:
+            return read.defends, read.three_bets
+        if raisers[0] == user:
+            return read.opens**0.5, read.opens**0.5
+        return 1.0, 1.0
+
+    def seat_range(self, view: Observation, seat: int) -> Range:
+        if seat != self.user:
+            return seat_range(view, seat, self.chart_factors)
+        read = self.reads.get(view.hand_id, NEUTRAL)
+        limp = ranked_range(0.1, min(1.0, 0.1 + read.limp_width))
+        floors = (_floor(read.bets_flop), _floor(read.bets_late))
+        return seat_range(view, seat, self.chart_factors, limp, floors)
+
+    def exploits(self, view: Observation, opponents: list[int]) -> tuple[float, float, float]:
+        """Against a user who bets more than expected it calls down more; heads-up against one
+        who folds less, it bluffs less and value bets thinner (and the other way round)."""
+        if self.user not in opponents:
+            return 0.0, 0.0, 1.0
+        read = self.reads.get(view.hand_id, NEUTRAL)
+        flop = view.street == Street.FLOP
+        bets, folds = (read.bets_flop, read.folds_flop) if flop else (read.bets_late, read.folds_late)
+        street = [e for e in view.history if e.street == view.street]
+        bettor = next((e.seat for e in reversed(street) if e.action.type in _AGGRESSIVE), None)
+        call_shift = 0.15 * min(1.0, max(-1.0, math.log2(bets))) if bettor == self.user else 0.0
+        if opponents != [self.user]:
+            return call_shift, 0.0, 1.0
+        return call_shift, min(0.03, max(-0.03, 0.03 * (folds - 1))), folds
+
+
+@dataclass
+class UserTally:
+    """What the user did this session and what a solid player would have done in the same
+    spots, by factor of the read, and its first-in spots and limps."""
+
+    observed: dict[str, float] = field(default_factory=dict)
+    expected: dict[str, float] = field(default_factory=dict)
+    spots: int = 0
+    limps: int = 0
+
+    def read(self) -> UserRead:
+        low, high = READ_CLAMP
+        factors = {
+            name: min(
+                high,
+                max(low, (self.observed[name] + READ_PRIOR) / (self.expected[name] + READ_PRIOR)),
+            )
+            for name in self.expected
+        }
+        return UserRead(**factors, limp_width=max(0.1, (self.limps + 5) / (self.spots + 10)))
+
+    def count(self, hand: GameState, user: int, read: UserRead):
+        """Add the user's decisions in a finished hand, judged with the read it was dealt with."""
+        states = replay_states(hand)
+        for index, entry in enumerate(hand.history):
+            if entry.seat != user:
+                continue
+            view = observation(states[index], user)
+            kind = entry.action.type
+            if view.street == Street.PREFLOP:
+                self._preflop(view, kind)
+                continue
+            street = "flop" if view.street == Street.FLOP else "late"
+            if legal_actions(view).can_check:
+                self._add(f"bets_{street}", kind in _AGGRESSIVE, _bet_rate(view, read))
+            else:
+                opponents = sum(
+                    view.dealt_in[s] and not view.folded[s] for s in range(view.config.num_seats) if s != user
+                )
+                self._add(f"folds_{street}", kind == ActionType.FOLD, 1 - _defense(view, opponents)[0])
+
+    def _preflop(self, view: Observation, kind: ActionType):
+        """The user's first decision before the flop, when it is first in or facing one open
+        with no callers, deeper than the push/fold charts."""
+        spot = preflop_spot(view)
+        entries = [e for e in view.history if e.street == Street.PREFLOP]
+        if (
+            spot.stack <= PUSH_FOLD_BIG_BLINDS
+            or _oversized(view)
+            or any(e.seat == view.seat or e.action.type == ActionType.CALL for e in entries)
+        ):
+            return
+        raisers = [spot.order.index(e.seat) for e in entries if e.action.type in _AGGRESSIVE]
+        index = spot.order.index(view.seat)
+        if not raisers:
+            self.spots += 1
+            if kind == ActionType.CALL:
+                self.limps += 1
+                return
+            rows = strategy("open", spot.num_players, str(index), spot.stack, spot.bb_ante)
+            self._add("opens", kind in _AGGRESSIVE, _combos([row[1] for row in rows]) / len(COMBOS))
+        elif len(raisers) == 1:
+            rows = strategy("respond", spot.num_players, f"{raisers[0]}-{index}", spot.stack, spot.bb_ante)
+            self._add(
+                "defends",
+                kind in (ActionType.CALL, *_AGGRESSIVE),
+                _combos([row[1] + row[2] for row in rows]) / len(COMBOS),
+            )
+            self._add("three_bets", kind in _AGGRESSIVE, _combos([row[2] for row in rows]) / len(COMBOS))
+
+    def _add(self, name: str, happened: bool, expected: float):
+        self.observed[name] = self.observed.get(name, 0.0) + happened
+        self.expected[name] = self.expected.get(name, 0.0) + expected
+
+
+def _bet_rate(view: Observation, read: UserRead) -> float:
+    """How often a solid player would bet here, checked to, holding the user's range as Expert
+    reads it: Hard's balanced play over that range, from the user's seat."""
+    solid = ExpertBot("solid", PRESETS["balanced"], {view.hand_id: read}, view.seat)
+    own = solid.seat_range(view, view.seat)
+    board = set(view.board)
+    holes = [i for i, w in enumerate(own) if w > 0 and not board.intersection(COMBOS[i])]
+    policies = solid.policies(view, holes)
+    total = sum(own[h] for h in policies)
+    return sum(own[h] * (1 - p.get(AbstractAction.CHECK, 0.0)) for h, p in policies.items()) / total

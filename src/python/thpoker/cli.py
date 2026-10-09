@@ -316,7 +316,9 @@ class PlaySession:
             return
         self.finished = hand
         if self.log is not None:
-            self.log.append("hand", {"hand": hand.to_dict()})
+            read = self.runner.reads.get(hand.hand_id)
+            logged = {"hand": hand.to_dict()} | ({} if read is None else {"read": asdict(read)})
+            self.log.append("hand", logged)
         jobs, user = self.jobs.get(hand.hand_id), self.runner.user_seat
         if jobs is not None and jobs.moves and jobs.rating is None:
             assert user is not None
@@ -807,7 +809,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--minutes-per-level", type=float, help="tournament level length in minutes")
     parser.add_argument("--style", help="give every bot this style instead of drawing from the panel")
     parser.add_argument("--panel", default="online_micro", help="population panel for bot styles")
-    parser.add_argument("--tier", type=int, choices=(1, 2, 3), default=2, help="bot difficulty (default 2)")
+    parser.add_argument(
+        "--tier",
+        type=int,
+        choices=(1, 2, 3, 4),
+        default=2,
+        help="bot difficulty: 1 easy, 2 medium, 3 hard, 4 expert (adjusts to you during the session); default 2",
+    )
     parser.add_argument(
         "--hud",
         action=argparse.BooleanOptionalAction,
@@ -849,11 +857,13 @@ def load_session(
         config = TableConfig.from_dict(logged["config"])
         hands = [GameState.from_dict(r["hand"]) for r in records if r["type"] == "hand"]
         scale = logged["scale"]
+        runner = TableRunner(config)
+        runner.replay(records)
     except (KeyError, TypeError) as error:
         raise ValueError(f"damaged log: {error!r}") from error
     if config.session.user_seat is None:
         raise ValueError("bot-only sessions have no decisions to review")
-    return config, scale, TableRunner(config), hands, records
+    return config, scale, runner, hands, records
 
 
 def seat_labels(runner: TableRunner, styled: bool) -> dict[int, str]:

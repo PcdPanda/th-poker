@@ -6,9 +6,9 @@ from   thpoker.analysis.review  import (DecisionReview, TRIAGE_BRANCH,
                                         all_in_net, hand_rating, hint,
                                         move_ratings, needs_full_review,
                                         position_names, range_view,
-                                        review_decision, review_hand,
-                                        situation, summarize, thresholds,
-                                        with_choice)
+                                        rating_band, review_decision,
+                                        review_hand, situation, summarize,
+                                        thresholds, with_choice)
 from   thpoker.analysis.tests.tracking \
                                 import Calls, REFERENCE
 from   thpoker.bots.abstraction import AbstractAction, legal_abstract_actions
@@ -333,6 +333,7 @@ def judged(
     spot = replace(base.situation, pot_bb=played_for, to_call_bb=0.0, owed_bb=0.0, facing=None)
     options = [OptionValue(None, a, ev, stderr, stderr == 0, None, None) for a, ev in values.items()]
     decision = replace(base, situation=spot, reference=options, exploitative=options, chosen=chosen)
+    assert rating_band(decision.rating()) == decision.verdict()
     return decision.verdict(), decision.rating()
 
 
@@ -404,6 +405,9 @@ def test_a_hand_rating_weights_each_move_by_the_chips_at_stake():
     # An open worth 2.5 big blinds at stake, then a river facing an 88 big blind shove (133):
     assert hand_rating([(1.0, 2.5), (0.07, 133.0)]) == pytest.approx((2.5 + 0.07 * 133) / 135.5)
     assert hand_rating([]) is None
+    # A hand's band is the one of its rating as shown: a 1.00 is best, a 0.75 close.
+    bands = [rating_band(r) for r in (0.998, 0.99, 0.747, 0.744)]
+    assert bands == ["best", "close", "close", "mistake"]
 
 
 def test_a_review_made_before_acting_completes_with_the_action_taken():

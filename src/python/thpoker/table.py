@@ -14,7 +14,7 @@ from   typing                   import Any
 
 from   thpoker.bots.bot         import Bot, PANELS, PRESETS, Style, draw_style
 from   thpoker.bots.equity_bot  import EquityBot
-from   thpoker.bots.range_bot   import RangeBot
+from   thpoker.bots.range_bot   import ExpertBot, RangeBot, UserRead, UserTally
 from   thpoker.bots.rule_bot    import RuleBot
 from   thpoker.game.engine      import (apply_action, is_terminal, new_hand,
                                         observation)
@@ -145,29 +145,36 @@ BOT_TIERS: dict[int, type[RuleBot] | type[EquityBot] | type[RangeBot]] = {
     1: RuleBot,
     2: EquityBot,
     3: RangeBot,
+    4: ExpertBot,
 }
 # One name per seat, unrelated to style, so hidden styles stay hidden and no two bots match.
 _BOT_NAMES = ("Alex", "Blake", "Casey", "Devon", "Emery", "Finley", "Harper", "Jordan")
 # The chance, by tier, that a bot winning without a shodown shows its cards: easier bots show
 # more, which gives a newcomer more hands to learn from.
-SHOW_CHANCE = {1: 0.5, 2: 0.25, 3: 0.1}
+SHOW_CHANCE = {1: 0.5, 2: 0.25, 3: 0.1, 4: 0.1}
 
 
-def _seat_bots(config: TableConfig) -> dict[int, Bot]:
+def _seat_bots(config: TableConfig, reads: dict[str, UserRead]) -> dict[int, Bot]:
     rng = Rng(config.session.seed).derive("seats")
     bots: dict[int, Bot] = {}
     for seat, style_name in enumerate(config.bot_styles):
         if seat == config.session.user_seat:
             continue
         style: Style = PRESETS[style_name] if style_name else draw_style(config.population_panel, rng)
-        bots[seat] = BOT_TIERS[config.tier](_BOT_NAMES[seat], style)
+        make, name = BOT_TIERS[config.tier], _BOT_NAMES[seat]
+        user = config.session.user_seat
+        bots[seat] = ExpertBot(name, style, reads, user) if make is ExpertBot else make(name, style)
     return bots
 
 
 class TableRunner:
     def __init__(self, config: TableConfig):
         self.config = config
-        self.bots = _seat_bots(config)
+        # The read of the user each hand was dealt with, by hand id; non in tradingf with picked
+        # cards, whose deals would mislead it
+        self.reads: dict[str, UserRead] = {}
+        self.tally = UserTally()
+        self.bots = _seat_bots(config, self.reads)
         self.session, self.opening_events = start_session(config.session)
         self.hand: GameState | None = None
         self.hud = Hud(config.session.num_seats)
@@ -184,6 +191,14 @@ class TableRunner:
         self.session, setup, events = begin_hand(self.session, elapsed_minutes)
         self.hand, dealt = new_hand(setup.config, setup.seed, setup.button, setup.stacks, setup.dealt_in, setup.hand_id)
         events.extend(dealt)
+        user = self.user_seat
+        if (
+            BOT_TIERS[self.config.tier] is ExpertBot
+            and user is not None
+            and self.hand.dealt_in[user]
+            and not self.config.session.user_hands
+        ):
+            self.reads[self.hand.hand_id] = self.tally.read()
         events.extend(self._run_bots())
         return events
 
@@ -229,6 +244,10 @@ class TableRunner:
         if is_terminal(self.hand):
             events.extend(self._show_uncontested())
             self.hud.record(self.hand)
+            read = self.reads.get(self.hand.hand_id)
+            if read is not None:
+                assert self.user_seat is not None
+                self.tally.count(self.hand, self.user_seat, read)
             self.session, ended = end_hand(self.session, self.hand)
             events.extend(ended)
         return events
@@ -249,6 +268,13 @@ class TableRunner:
         if Rng(hand.seed).derive("show", seat).random() >= SHOW_CHANCE[self.config.tier]:
             return []
         return [Event("CardsShown", {"hand_id": hand.hand_id, "seat": seat, "cards": list(cards)})]
+
+    def replay(self, records: list[dict[str, Any]]):
+        """Take back the reads logged with a saved session's hands. Raises `KeyError` or
+        `TypeError` on a damaged record."""
+        for record in records:
+            if record["type"] == "hand" and "read" in record:
+                self.reads[record["hand"]["hand_id"]] = UserRead(**record["read"])
 
     def user_rebuy(self) -> list[Event]:
         if self.user_seat is None:

@@ -11,7 +11,8 @@ from   thpoker.odds             import Equity
 from   thpoker.text             import (decision_headline, decision_summary,
                                         format_chips, hand_history_text,
                                         hand_summary_text, narrate,
-                                        plain_decision_text, rated_moves_text)
+                                        percent_text, plain_decision_text,
+                                        rated_moves_text)
 
 LABELS = {0: "You", 1: "Blake"}
 RAISE_300 = Action(ActionType.RAISE, 300)
@@ -193,3 +194,5 @@ def test_the_rated_moves_and_the_summary_read_like_the_hand():
     assert hand_summary_text(worst, None, None, 2, True) == (
         "Your cards (3♣ 2♦) are in the worst 1% of starting hands."
     )
+    # A share shows a decimal only where a whole percent would read as none or all.
+    assert [percent_text(s) for s in (0, 0.004, 0.06, 0.996, 1)] == ["0", "0.4", "6", "99.6", "100"]

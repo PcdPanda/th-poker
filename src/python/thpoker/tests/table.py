@@ -1,4 +1,4 @@
-from   dataclasses              import asdict
+from   dataclasses              import asdict, replace
 import hashlib
 import json
 import os
@@ -8,6 +8,7 @@ import subprocess
 import sys
 from   thpoker.bots.bot         import PRESETS
 from   thpoker.bots.equity_bot  import EquityBot
+from   thpoker.bots.range_bot   import NEUTRAL, UserTally
 from   thpoker.cli              import build_config, parse_args
 from   thpoker.game.engine      import apply_action, new_hand
 from   thpoker.game.session     import (Mode, SessionConfig, SessionError,
@@ -135,6 +136,27 @@ def test_user_acts_only_on_their_turn_and_bots_play_around_them():
     assert sum(runner.session.stacks) == sum(runner.session.buy_ins)
 
 
+def test_expert_reads_the_user_from_earlier_hands_only_and_never_from_picked_cards():
+    session = SessionConfig(Mode.CASH, 5, 3, 10_000, cash_blinds=GameConfig(3), reset_stacks_each_hand=True)
+    trainings = replace(session, mode=Mode.TRAINING, user_hands=("AA", "KK"))
+    runners = [TableRunner(TableConfig(s, (None,) * 3, tier=4)) for s in (session, trainings)]
+    hands = []
+    for runner in runners:
+        for _ in range(8):
+            runner.start_hand()
+            while runner.user_to_act():
+                legal = runner.user_legal_actions()
+                runner.act(Action(ActionType.CHECK if legal.can_check else ActionType.CALL))
+            hands.append(runner.hand)
+    tally = UserTally()
+    for hand in hands[:8]:
+        read = runners[0].reads[hand.hand_id]
+        assert read == tally.read()
+        tally.count(hand, 0, read)
+    assert read != NEUTRAL
+    assert runners[1].reads == {}
+
+
 def test_fast_forward_refuses_while_the_user_is_still_playing():
     session = SessionConfig(Mode.TOURNAMENT, 5, 3, 5_000, tournament=TournamentConfig(preset_schedule(100)))
     runner = TableRunner(TableConfig(session, (None,) * 3))
@@ -164,7 +186,7 @@ def test_tier_two_bots_finish_a_tournament_and_unknown_tiers_are_rejected():
     assert runner.session.finished and sum(runner.session.stacks) == 6_000
     assert all(isinstance(bot, EquityBot) for bot in runner.bots.values())
     with pytest.raises(ConfigError, match="tier"):
-        TableConfig(session, (None,) * 3, tier=4)
+        TableConfig(session, (None,) * 3, tier=5)
 
 
 @pytest.mark.parametrize(

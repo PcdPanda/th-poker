@@ -41,10 +41,10 @@
               <option value="">Any hand</option>
               <option value="0-5">Best 5%</option>
               <option value="0-25">Best 25%</option>
-              <option value="25-50">Middle 25–50%</option>
+              <option value="25-50">Middle 25-50%</option>
               <option value="50-100">Bottom half</option>
               <option value="pairs">Pairs</option>
-              <option value="small-aces">Small aces (A2–A9)</option>
+              <option value="small-aces">Small aces (A2-A9)</option>
               <option value="suited-connectors">Suited connectors (like 8♥7♥)</option>
               <option value="custom">Custom</option>
             </select>
@@ -57,11 +57,14 @@
         </fieldset>
         <label>Players at the table <input name="seats" type="number" min="2" max="8" value="6"></label>
         <label>Opponents
-          <select name="tier">
+          <select name="tier" aria-describedby="tier-hint">
             <option value="1">Easy</option>
             <option value="2" selected>Medium</option>
             <option value="3">Hard</option>
+            <option value="4">Expert</option>
           </select>
+          <small id="tier-hint" class="hint-line">Weighs its chance to win against the cost of calling, and
+            guesses your cards from how you bet.</small>
         </label>
         <label class="inline" title="Hints and checks of your moves while you play"><input name="coach" type="checkbox"
             checked> Coach</label>
@@ -186,9 +189,9 @@
           Also called equity. On each player you'll also see your chance against that player alone. In Your
           hands it is your chance at your last move, reading the others' hands from their play the way a strong
           player would, so it can differ from the chance shown during play.</dd>
-        <dt>Strength</dt>
-        <dd>How your two starting cards rank among all starting hands: best 6% means only 6% are as strong or
-          stronger.</dd>
+        <dt>Top %</dt>
+        <dd>Your two starting cards are in this top share of all starting hands: lower is stronger, and aces
+          are the top 0.5%.</dd>
         <dt>Rating</dt>
         <dd>Your moves this hand, rated 0 to 1, with moves in bigger pots counting for more: 1 means you picked
           the best option every time. For each move, 1.00 is the best option you had, 0.75 to 0.99 is close to
