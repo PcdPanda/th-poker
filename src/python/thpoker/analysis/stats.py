@@ -280,6 +280,9 @@ HAND_COLUMNS = (
     "date",
     "mode",
     "players",
+    "big_blind",
+    "ante",
+    "ante_type",
     "hand",
     "position",
     "cards",
@@ -315,7 +318,8 @@ def hand_rows(
     ratings: Mapping[str, HandRating],
 ) -> list[dict[str, Any]]:
     """One row per hand the user was dealt into, in chips as shown on the table, for a
-    spreadsheet. Only the user's own cards appear. `hand_rank` is the share of starting hands
+    spreadsheet; the big blind and ante are the hand's own, as they rise in a tournament. 
+    Only the user's own cards appear. `hand_rank` is the share of starting hands
     at least as strong; the chance to win at the last move and the hand's rating come from
     `ratings`, by hand id, and stay blank for hands never rated. The review columns come from
     `decisions` (records written by `thpoker review`) and stay blank for hands never reviewed;
@@ -343,6 +347,9 @@ def hand_rows(
                 "date": date,
                 "mode": mode,
                 "players": sum(hand.dealt_in),
+                "big_blind": _number(hand.config.big_blind / scale),
+                "ante": _number(hand.config.ante / scale),
+                "ante_type": hand.config.ante_type.lower(),
                 "hand": int(hand.hand_id.rpartition("-")[2]),
                 "position": position_names(observation(hand, user))[user],
                 "cards": cards_str(hole),
