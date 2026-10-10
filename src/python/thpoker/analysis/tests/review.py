@@ -328,12 +328,21 @@ def judged(
     values: dict[Action, float],
     chosen: Action,
     stderr: float = 0.0,
+    mix: dict[Action, float] | None = None,
 ) -> tuple[str, float]:
-    """`base` judged with hand-set options; valued against a strong player, in a pot of
-    `played_for` big blinds with nothing to call: its verdict and rating."""
+    """`base` judged with hand-set options, valued against a strong player, in a pot of
+    `played_for` big blinds with nothing to call, and how often a strong player makes each move
+    (`mix`, none by default): its verdict and rating."""
     spot = replace(base.situation, pot_bb=played_for, to_call_bb=0.0, owed_bb=0.0, facing=None)
     options = [OptionValue(None, a, ev, stderr, stderr == 0, None, None) for a, ev in values.items()]
-    decision = replace(base, situation=spot, reference=options, exploitative=options, chosen=chosen)
+    decision = replace(
+        base,
+        situation=spot,
+        reference=options,
+        exploitative=options,
+        chosen=chosen,
+        reference_mix={} if mix is None else mix,
+    )
     assert rating_band(decision.rating()) == decision.verdict()
     return decision.verdict(), decision.rating()
 
@@ -379,6 +388,15 @@ def test_a_move_is_rated_by_the_share_of_the_pot_it_gives_up_within_its_verdict(
         icm_threshold=0.01,
     )
     assert tournament.rating() == pytest.approx(expected)
+
+
+def test_a_move_a_strong_player_makes_often_is_close_however_much_it_gives_up():
+    state = heads_up("8c8d", "JhTh", "AhKhQh2c3d")
+    folded = play(state, CALL, CHECK, *[CHECK] * 4, CHECK, Action(ActionType.BET, 200), FOLD)
+    base = review_hand(folded, 1, {0: BetsTheRiver()}, REFERENCE, None, TRIAGE_BRANCH, None).decisions[-1]
+    values = {FOLD: 0.0, CALL: 8.0}
+    assert judged(base, 14.0, values, FOLD, mix={FOLD: 0.1}) == ("close", 0.75)
+    assert judged(base, 14.0, values, FOLD, mix={FOLD: 0.05})[0] == "mistake"
 
 
 def test_a_short_stack_facing_a_shove_plays_for_what_it_can_cover():

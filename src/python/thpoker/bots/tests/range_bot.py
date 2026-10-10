@@ -120,6 +120,39 @@ def test_a_hand_without_an_equity_falls_back_the_same_way_when_played_and_tracke
     assert TAG.policies(view, [hero])[hero] == tier_2
 
 
+def test_facing_a_4_bet_off_the_charts_it_keeps_half_its_range_strongest_first():
+    # The limp takes the hand off the charts: the button raises over it, the big blind 3-bets,
+    # and the button 4-bets to 30 big blinds.
+    deck = stacked_deck(3, 6, SIX_SEATS, "")
+    state, _ = new_hand(GameConfig(6), 1, 3, (10_000,) * 6, deck=deck)
+    raises = (Action(ActionType.RAISE, a) for a in (250, 1_000, 3_000))
+    state = play(state, FOLD, FOLD, CALL, next(raises), FOLD, next(raises), FOLD, next(raises))
+    view = observation(state, 5)
+    own = seat_range(view, 5)
+    holes = [i for i, w in enumerate(own) if w > 0]
+    bot = RangeBot("probe", BALANCED)
+    decisions = bot.policies(view, holes)
+    folds = {h: decisions[h].get(AbstractAction.FOLD, 0.0) for h in holes}
+    kept = sum(own[h] * (1 - folds[h]) for h in holes) / sum(own[h] for h in holes)
+    assert kept == pytest.approx(0.5)
+    strong, weak = ("AA", "KK", "QQ", "JJ", "AKs", "AKo"), ("JTs", "QJs")
+    fold_of = {name: folds[COMBOS_OF_CLASS[name][0]] for name in strong + weak}
+    assert all(fold_of[name] == 0 for name in strong)
+    assert all(fold_of[name] > 0.5 for name in weak)
+    # Played or tracked, a hand gets the same policy, the class the floor moves partly included.
+    assert all(bot.policies(view, [h])[h] == decisions[h] for h in holes)
+
+
+def test_a_that_has_not_raised_keeps_the_tier_2_policy_facing_a_re_raise():
+    # The big blind faces a limp, a raise and a 3-bet with no range of its own to defend.
+    deck = stacked_deck(3, 6, SIX_SEATS, "")
+    state, _ = new_hand(GameConfig(6), 1, 3, (10_000,) * 6, deck=deck)
+    raise_to = (Action(ActionType.RAISE, a) for a in (250, 1_000))
+    view = observation(play(state, FOLD, FOLD, CALL, next(raise_to), next(raise_to)), 5)
+    tier_2 = EquityBot("probe", BALANCED, range_bot._RERAISE_TOPS)
+    assert RangeBot("probe", BALANCED).policies(view, ONE_PER_CLASS) == tier_2.policies(view, ONE_PER_CLASS)
+
+
 def test_an_oversized_deep_open_leaves_the_charts():
     # The charts were solved for a 2.5bb open; a 100bb open-shove goes to the size-aware Tier 2.
     state, _ = new_hand(GameConfig(2), 1, 0, (10_000, 10_000))

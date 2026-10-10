@@ -3,7 +3,7 @@ a hand (situation, ranges, equity, thresholds, options), all-in adjusted results
 summary of the largest mistakes.
 
 A decision counts as a mistake only when its EV loss is above the threshold and above twice its
-standard error; otherwise it is "close". Mistakes are ranked by the loss against the reference
+standard error, and the strong player rarely makes it; otherwise it is "close". Mistakes are ranked by the loss against the reference
 opponent (a balanced Tier 3 bot reading the same actions), so the lesson carries over to other
 opponents; the loss against the actual bot is shown next to it, and a large gap between the two
 marks an exploit spot. Tournament decisions are ranked by ICM loss instead of chips.
@@ -42,6 +42,7 @@ from   thpoker.odds             import (Equity, Texture, hand_equity,
                                         settled_equity, texture)
 
 MISTAKE_BB = 0.5
+USUAL_SHARE = 0.1
 RATING_POT_SHARE = 0.4
 RATING_CLOSE = 0.75
 RATING_CORRECT_WEIGHT = 0.7
@@ -117,6 +118,7 @@ class DecisionReview:
     reference: list[OptionValue]
     tournament: bool
     icm_threshold: float | None  # ICM value of MISTAKE_BB at the user's stack
+    reference_mix: dict[Action, float]
     reference_note: str | None = None  # set when the reference is not the Tier 3 bot
 
     def loss(self, options: list[OptionValue]) -> tuple[float, float]:
@@ -135,9 +137,9 @@ class DecisionReview:
         """ "mistake", "close" (a loss within noise or under the threshold), or "best"."""
         loss, stderr = self.loss(self.reference)
         threshold = self.icm_threshold if self.tournament else MISTAKE_BB
-        assert threshold is not None
+        assert threshold is not None and self.chosen is not None
         if loss > threshold and loss > 2 * stderr:
-            return "mistake"
+            return "close" if self.reference_mix.get(self.chosen, 0.0) >= USUAL_SHARE else "mistake"
         return "close" if loss > 1e-9 else "best"
 
     def rating(self) -> float:
@@ -493,6 +495,10 @@ def _review_decision(
     if payouts is not None:
         icm_threshold = icm_value_of(MISTAKE_BB * state.config.big_blind, state.starting_stacks, user, payouts)
     read = [w for s, w in reference_snapshot.ranges.items() if s != user]
+    mix: dict[Action, float] = {}
+    for abstract, share in reference.action_probabilities(view).items():
+        action = to_action(abstract, view)
+        mix[action] = mix.get(action, 0.0) + share
     return DecisionReview(
         index,
         hole,
@@ -510,6 +516,7 @@ def _review_decision(
         reference_values,
         payouts is not None,
         icm_threshold,
+        mix,
         note,
     )
 

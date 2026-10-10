@@ -9,8 +9,9 @@ import math
 from   thpoker.analysis.ev      import OptionValue
 from   thpoker.analysis.review  import (DecisionReview, GodView, HandReview,
                                         MoveRating, RATING_CLOSE, RangeView,
-                                        SessionSummary, best_option,
-                                        hindsight_best, position_names)
+                                        SessionSummary, USUAL_SHARE,
+                                        best_option, hindsight_best,
+                                        position_names)
 from   thpoker.analysis.training \
                                 import Calibration, RECENT
 from   thpoker.game.cards       import RANKS, cards_str
@@ -89,7 +90,7 @@ def narrate(
     if event.kind == "TournamentFinished":
         order = sorted(range(len(data["places"])), key=data["places"].__getitem__)
         return ["*** Tournament over"] + [
-            f"    {data['places'][seat]}. {label(seat)}  prize {data['prizes'][seat]:.0%}" for seat in order
+            f"    {data['places'][seat]}. {label(seat)}  prize {data['prizes'][seat]:.1%}" for seat in order
         ]
     return []
 
@@ -109,7 +110,7 @@ def describe_action(action: Action, scale: int) -> str:
 
 
 def _share(value: float) -> str:
-    return f"{100 * value:.0f}%"
+    return f"{100 * value:.1f}%"
 
 
 def range_grid(view: RangeView) -> list[str]:
@@ -149,7 +150,7 @@ def _option_rows(review: DecisionReview, scale: int, bot_label: str) -> list[str
 
 def _value(option: OptionValue, tournament: bool) -> str:
     if tournament and option.icm is not None:
-        return f"{100 * option.icm:.2f} ± {100 * (option.icm_stderr or 0):.2f}"
+        return f"{100 * option.icm:.1f} ± {100 * (option.icm_stderr or 0):.1f}"
     if option.exact:
         return f"{option.ev:+.2f}"
     return f"{option.ev:+.2f} ± {option.stderr:.2f}"
@@ -210,14 +211,20 @@ def render_decision(
         bot_loss, _ = review.loss(review.exploitative)
         verdict = review.verdict()
         unit = "% of the prize pool" if review.tournament else "bb"
-        factor = 100 if review.tournament else 1
+        factor, places = (100, 1) if review.tournament else (1, 2)
         if verdict == "mistake":
             lines.append(
-                f"   Mistake: {factor * loss:.2f}{unit} ± {factor * stderr:.2f} against the reference ({factor * bot_loss:.2f} against the bots)"
+                f"   Mistake: {factor * loss:.{places}f}{unit} ± {factor * stderr:.{places}f} against the reference ({factor * bot_loss:.{places}f} against the bots)"
             )
         elif verdict == "close":
+            usual = review.reference_mix.get(review.chosen, 0.0)
+            why = (
+                f"but a strong player makes this move {_share(usual)} of the time"
+                if usual >= USUAL_SHARE
+                else "within the threshold or the noise"
+            )
             lines.append(
-                f"   Close: {factor * loss:.2f}{unit} ± {factor * stderr:.2f} behind the best option, within the threshold or the noise"
+                f" Close: {factor * loss:.{places}f}{unit} ± {factor * stderr:.{places}f} behind the best option, {why}"
             )
         else:
             lines.append("   Best option.")
@@ -367,17 +374,18 @@ def _chips(bb: float, big_blind: int, scale: int, signed: bool = False) -> str:
 def _worth(option: OptionValue, review: DecisionReview, big_blind: int, scale: int) -> str:
     if review.tournament:
         assert option.icm is not None
-        noise = f" ± {100 * option.icm_stderr:.2f}" if option.icm_stderr else ""
-        return f"{100 * option.icm:.2f}%{noise}"
+        noise = f" ± {100 * option.icm_stderr:.1f}" if option.icm_stderr else ""
+        return f"{100 * option.icm:.1f}%{noise}"
     noise = "" if option.exact else f" ± {_chips(option.stderr, big_blind, scale)}"
     return _chips(option.ev, big_blind, scale, signed=True) + noise
 
 
-def decision_headline(review: DecisionReview, scale: int, big_blind: int, mix: dict[Action, float]) -> str:
+def decision_headline(review: DecisionReview, scale: int, big_blind: int) -> str:
     """One line: the verdict on a chosen move, or the suggestion for a coach hint. The best move
     is the best against a strong player, the standard the verdict uses. When a hint's averages
     are within their noise of each other, it names what a strong player does (`mix`) instead."""
     tournament = review.tournament
+    mix = review.reference_mix
     best = best_option(review.reference, tournament)
     best_text = describe_action(best.action, scale)
     if review.chosen is None:
@@ -402,9 +410,12 @@ def decision_headline(review: DecisionReview, scale: int, big_blind: int, mix: d
     if verdict == "best":
         return f"Good move. Best option: {chosen}."
     if verdict == "close":
+        share = mix.get(review.chosen, 0.0)
+        if share >= USUAL_SHARE:
+            return f"Close. A strong player would {chosen} here {_share(share)} of the time."
         return f"Close. Best option: {best_text}; your {chosen} was nearly as good."
     loss, _ = review.loss(review.reference)
-    cost = f"{100 * loss:.2f}% of the prize pool" if tournament else f"{_chips(loss, big_blind, scale)} chips"
+    cost = f"{100 * loss:.1f}% of the prize pool" if tournament else f"{_chips(loss, big_blind, scale)} chips"
     return f"Costly. Best option: {best_text}; your {chosen} gave up about {cost} on average."
 
 
@@ -419,7 +430,7 @@ def decision_summary(review: DecisionReview, scale: int, big_blind: int) -> list
     """The two or three lines a newcomer reads under the headline, from what the user could know:
     the others' hands as a strong player reads them, not the bots' styles."""
     equity = review.reference_equity
-    error = "" if equity.exact else f" (± {_share(equity.stderr)})"
+    error = "" if equity.exact else f" (±{_share(equity.stderr)})"
     lines = [] if review.chosen is None else [f"Rated {review.rating():.2f} of 1 (1 is the best option you had)."]
     lines.append(
         "Your chance at showdown against the hands a strong player would put them on: about "
@@ -436,7 +447,7 @@ def god_summary(review: DecisionReview, god: GodView | None, scale: int) -> list
     """God's view lines under the summary: the chance against the hands the bots' styles would
     hold, the better play against these bots, and with their cards known (`god`), the chance
     against those cards and the move that would have won more in hindsight."""
-    error = "" if review.equity.exact else f" (± {_share(review.equity.stderr)})"
+    error = "" if review.equity.exact else f" (±{_share(review.equity.stderr)})"
     lines = [f"Against the hands these players' styles would hold here: about {_share(review.equity.value)}{error}."]
     if review.exploit_spot():
         best_bot = best_option(review.exploitative, review.tournament)
@@ -524,7 +535,6 @@ def solver_decision_text(
     labels: dict[int, str],
     scale: int,
     big_blind: int,
-    mix: dict[Action, float],
     styled: dict[int, str] | None,
     god: GodView | None,
 ) -> list[str]:
@@ -534,7 +544,7 @@ def solver_decision_text(
     chose = "" if review.chosen is None else f"; you chose {describe_action(review.chosen, scale)}"
     lines = [
         f"Decision {number} ({_STREET_WORDS[review.situation.street].lower()}): your cards {pretty_cards(review.hole)}, board {board}{chose}.",
-        decision_headline(review, scale, big_blind, mix),
+        decision_headline(review, scale, big_blind),
     ]
     lines += decision_summary(review, scale, big_blind)
     if styled is not None:
@@ -565,7 +575,7 @@ def solver_decision_text(
             held = cards.get(option.action)
             values.append("-" if held is None else _worth(held, review, big_blind, scale))
         lines.append(
-            f"  {describe_action(option.action, scale)}: {' | '.join(values)} | {_share(mix.get(option.action, 0.0))}"
+            f"  {describe_action(option.action, scale)}: {' | '.join(values)} | {_share(review.reference_mix.get(option.action, 0.0))}"
             + (f" ({', '.join(marks)})" if marks else "")
         )
     return lines
@@ -592,8 +602,7 @@ def held_text(hand: GameState, user: int, labels: dict[int, str], shown: dict[in
 
 def percent_text(share: float) -> str:
     """A whole percent, or one decimal where that would read as none or all."""
-    whole = round(100 * share)
-    return str(whole) if 0 < whole < 100 or share in (0, 1) else f"{100 * share:.1f}"
+    return f"{100 * share:.1f}"
 
 
 def rated_moves_text(hand: GameState, user: int, moves: Sequence[MoveRating], scale: int) -> list[str]:
@@ -664,8 +673,7 @@ def hand_result_text(net_bb: float, all_in_net_bb: float | None, scale: int, big
     else:
         verb = "won" if net_bb > 0 else "lost"
         blinds = f"{abs(net_bb):.1f}".removesuffix(".0")
-        unit = "big blind" if blinds == "1" else "big blinds"
-        text = f"You {verb} {_chips(abs(net_bb), big_blind, scale)} chips ({blinds} {unit}) this hand."
+        text = f"You {verb} {_chips(abs(net_bb), big_blind, scale)} chips ({blinds} BB) this hand."
     if all_in_net_bb is not None:
         text += f" With the cards as they were when the chips went in, you would average {_chips(all_in_net_bb, big_blind, scale, signed=True)}."
     return text

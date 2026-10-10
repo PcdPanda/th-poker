@@ -28,6 +28,7 @@ from   thpoker.odds             import (FULL_RANGE, Range, equity_to_reach_top,
                                         equity_vs_random, range_equities,
                                         ranked_range, representative_equities)
 
+RERAISE_TOPS = (0.06, 0.025)
 # Assumed preflop ranges of a typical opponent, as preflop percentile bands.
 _THREE_BET_TOP = 0.06
 _FOUR_BET_TOP = 0.025
@@ -62,7 +63,9 @@ def _open_width(view: Observation, opener: int) -> float:
     return min(0.5, position_width(0.2, behind))
 
 
-def preflop_range(view: Observation, seat: int, limp: Range = _LIMP_RANGE) -> Range:
+def preflop_range(
+    view: Observation, seat: int, limp: Range = _LIMP_RANGE, reraise_tops: tuple[float, float] = RERAISE_TOPS
+) -> Range:
     """A seat's range from its preflop actions: percentile bands by its strongest action, with
     `limp` for a limp. A raise bigger than usual from a deep stack reads as a stronger range, in
     proportion to its size (a 100bb open-shove is not a 2.5bb open), phased in between 25bb and
@@ -79,7 +82,7 @@ def preflop_range(view: Observation, seat: int, limp: Range = _LIMP_RANGE) -> Ra
         if kind in (ActionType.BET, ActionType.RAISE):
             _, amount, usual = next(sizes)
             if entry.seat == seat:
-                top = _open_width(view, seat) if raises == 0 else _THREE_BET_TOP if raises == 1 else _FOUR_BET_TOP
+                top = _open_width(view, seat) if raises == 0 else reraise_tops[min(raises, 2) - 1]
                 depth = effective_stack(view, seat) / big_blind
                 if amount > usual and depth > _DEEP_BIG_BLINDS:
                     ramp = min(
@@ -183,9 +186,10 @@ class _Context:
 
 
 class EquityBot(TierBot):
-    def __init__(self, name: str, style: Style):
+    def __init__(self, name: str, style: Style, reraise_tops: tuple[float, float] = RERAISE_TOPS):
         self.name = name
         self.style = style
+        self.reraise_tops = reraise_tops
 
     def _context(self, view: Observation) -> _Context:
         ranges = assumed_ranges(view)
@@ -212,7 +216,7 @@ class EquityBot(TierBot):
             # range only, with a penalty for each other player still in.
             kind = "preflop"
             if view.last_aggressor is not None:
-                strongest = preflop_range(view, view.last_aggressor)
+                strongest = preflop_range(view, view.last_aggressor, reraise_tops=self.reraise_tops)
             else:
                 strongest = _LIMP_RANGE
         return _Context(

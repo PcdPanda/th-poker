@@ -104,9 +104,9 @@ def test_a_hand_over_before_any_action_still_shows_its_board():
     assert "The rest of the board, with no more betting: 2♣ 3♦ 7♥ 8♠ 9♣." in text
 
 
-def fold_to_a_bet(tournament: bool) -> DecisionReview:
+def fold_to_a_bet(tournament: bool, mix: dict[Action, float] | None = None) -> DecisionReview:
     """The user folded to a 2 big blind bet when calling was worth 1.5 big blinds (or 3% more of
-    the prize pool): a mistake of 1.5 big blinds."""
+    the prize pool): a mistake of 1.5 big blinds, unless the strong player folds often (`mix`)."""
     options = [
         OptionValue(None, Action(ActionType.FOLD), 0.0, 0.0, True, 0.30, 0.0),
         OptionValue(None, Action(ActionType.CALL), 1.5, 0.1, False, 0.33, 0.002),
@@ -146,28 +146,32 @@ def fold_to_a_bet(tournament: bool) -> DecisionReview:
         options,
         tournament,
         0.01 if tournament else None,
+        {} if mix is None else mix,
     )
 
 
 def test_coach_amounts_are_chips_on_the_table_or_shares_of_the_prize_pool():
     cash, tournament = fold_to_a_bet(False), fold_to_a_bet(True)
-    # Blinds 50/100 shown as they are (scale 1); blinds 0.5/1 are kept as 50/100 internally (scale 100)
-    assert decision_headline(cash, 1, 100, {}) == (
+    # Blinds 50/100 shown as they are (scale 1); blinds 0.5/1 are kept as 50/100 internally (scale 100).
+    assert decision_headline(cash, 1, 100) == (
         "Costly. Best option: call; your fold gave up about 150 chips on average."
     )
-    assert decision_headline(cash, 100, 100, {}).endswith("about 1.50 chips on average.")
-    assert decision_headline(tournament, 1, 100, {}).endswith("about 3.00% of the prize pool on average.")
+    assert decision_headline(cash, 100, 100).endswith("about 1.50 chips on average.")
+    assert decision_headline(tournament, 1, 100).endswith("about 3.0% of the prize pool on average.")
     # Folding gave up 1.5 big blinds (1.3 beyond the noise) of the 4 being played for.
     assert decision_summary(cash, 1, 100)[0] == "Rated 0.36 of 1 (1 is the best option you had)."
     assert decision_summary(tournament, 1, 100)[0] == decision_summary(cash, 1, 100)[0]
-    assert decision_summary(cash, 1, 100)[2] == "Calling costs 200: it pays if you win at least 25% of the time."
-    mix = {Action(ActionType.CALL): 0.75}
-    options = solver_decision_text(1, cash, {}, 1, 100, mix, None, None)[-3:]
+    assert decision_summary(cash, 1, 100)[2] == "Calling costs 200: it pays if you win at least 25.0% of the time."
+    mixed = fold_to_a_bet(False, {Action(ActionType.CALL): 0.75})
+    options = solver_decision_text(1, mixed, {}, 1, 100, None, None)[-3:]
     assert options == [
-        "  fold: 0 | 0% (your choice)",
-        "  call: +150 ± 10 | 75% (best against a strong player)",
-        "  raise to 900: +25 ± 10 | 0%",
+        "  fold: 0 | 0.0% (your choice)",
+        "  call: +150 ± 10 | 75.0% (best against a strong player)",
+        "  raise to 900: +25 ± 10 | 0.0%",
     ]
+    # A move a strong player makes often is close, however far another option averages ahead.
+    usual = fold_to_a_bet(False, {Action(ActionType.FOLD): 0.25})
+    assert decision_headline(usual, 1, 100) == "Close. A strong player would fold here 25.0% of the time."
 
 
 def test_the_rated_moves_and_the_summary_read_like_the_hand():
@@ -182,23 +186,23 @@ def test_the_rated_moves_and_the_summary_read_like_the_hand():
     aces, three_two = parse_cards("AsAh"), parse_cards("3c2d")
     assert hand_summary_text((aces[0], aces[1]), 0.8512, 0.94, 2, True) == (
         "Your cards (A♠ A♥) are in the best 0.5% of starting hands. At your last move your chance "
-        "to win at showdown was about 85%, reading the others' hands from their play the way a "
+        "to win at showdown was about 85.1%, reading the others' hands from their play the way a "
         "strong player would. Your moves this hand rate 0.94 overall, with moves in bigger pots "
         "counting for more."
     )
     worst = (three_two[0], three_two[1])
     assert hand_summary_text(worst, None, None, 0, True) == (
-        "Your cards (3♣ 2♦) are in the worst 1% of starting hands. You made no decision this hand."
+        "Your cards (3♣ 2♦) are in the worst 0.9% of starting hands. You made no decision this hand."
     )
     assert hand_summary_text(worst, 0.2, 0.5, 1, False).endswith(
-        "At your latest move your chance to win at showdown was about 20%, reading the others' "
+        "At your latest move your chance to win at showdown was about 20.0%, reading the others' "
         "hands from their play the way a strong player would. Your move so far rates 0.50."
     )
     assert hand_summary_text(worst, None, None, 2, True) == (
-        "Your cards (3♣ 2♦) are in the worst 1% of starting hands."
+        "Your cards (3♣ 2♦) are in the worst 0.9% of starting hands."
     )
     # A share shows a decimal only where a whole percent would read as none or all.
-    assert [percent_text(s) for s in (0, 0.004, 0.06, 0.996, 1)] == ["0", "0.4", "6", "99.6", "100"]
+    assert [percent_text(s) for s in (0, 0.004, 0.06, 0.996, 1)] == ["0.0", "0.4", "6.0", "99.6", "100.0"]
 
 
 @pytest.mark.parametrize("tournament", [False, True])
@@ -214,7 +218,7 @@ def test_the_hindsight_line_needs_a_gap_beyond_the_noise_and_the_mistake_thresho
         god = GodView([fold, call], Equity(0.6, 0.0, True))
         lines = god_summary(review, god, 1)
         assert (line in lines) == shown
-        assert lines[-2 if shown else -1] == "Against the cards they really held: 60%."
+        assert lines[-2 if shown else -1] == "Against the cards they really held: 60.0%."
     # A gap inside twice the noise is not shown either.
     noisy = OptionValue(None, Action(ActionType.CALL), 0.6, 0.4, False, 0.32, 0.02)
     assert line not in god_summary(review, GodView([fold, noisy], Equity(0.6, 0.0, True)), 1)

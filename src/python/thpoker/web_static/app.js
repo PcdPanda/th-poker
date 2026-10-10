@@ -27,6 +27,7 @@ const STREETS = { preflop: "Before the flop", flop: "Flop", turn: "Turn", river:
 const PRESETS = [["⅓ pot", 1 / 3], ["½ pot", 1 / 2], ["⅔ pot", 2 / 3], ["Pot", 1]];
 const CARD = /^[2-9TJQKA][cdhs]$/;
 const HELPERS_KEY = "thpoker.hideHelpers";
+const HELPERS_TIP = "Hide pot odds, hand names, chips-in-the-pot totals and player stats, as at a real table";
 const CHANCE_KEY = "thpoker.showChance";
 const SVG = "http://www.w3.org/2000/svg";
 const ICONS = {
@@ -49,27 +50,29 @@ let refreshes = 0;  // counts what the hands tables show, so a re-read for an ol
 let handsOrder = null;  // the hands tables' sort as { column, up }, or null for the newest hand first
 const SEAT_ORDER = Object.keys(SEAT_WORDS);
 const RATING_TIP = "Your moves this hand, rated 0 to 1, with moves in bigger pots counting for more: 1 means you picked the best option every time";
+const SOLVER_TIP = "Show the coach's numbers for every decision, in hand reviews and copies";
 const GOD_TIP = "Also show the bots' styles and cards, and the numbers knowing them (finished hands)";
+const HIDDEN_TIP = ". This shows the hidden styles.";
 // What hand reviews and copies show, for the whole page: off at every visit, and never stored.
 const switches = { solver: false, god: false };
 let coachShown = null;  // the coach panel's answer and whether it reviews a whole hand
-let historyShown = null;  // the Past sessions review panel's answer
+const reviews = new Map();  // each opened hand row's full review by "session/hand"
+const loading = new Set();  // the rows whose review is on its way
+let inBB = false;  // the hands tables' Put in and Result in big blinds rather than chips
 let clock = null;  // the move timer of this turn: { turn, deadline, warned, fired }, or null
 let clockPaused = null;  // when a coach request began: waiting on it isn't the player's time
 let timeoutNote = "";  // what the timer did, shown with the status until the next move
-// Title, tip, class, and the value a click on the title sorts by.
+// Title, tip, class, and the value a click on the title sorts by, and whether it is an amount.
 const COLUMNS = [
   ["Hand", null, null, (row) => row.hand],
   ["Seat", null, null, (row) => SEAT_ORDER.indexOf(row.position)],
-  ["Your cards"],
-  ["Top %", "Your two starting cards are in this top share of all starting hands: lower is stronger, and aces are the top 0.5%", null, (row) => row.hand_rank],
+  ["Cards"],
+  ["Top %", "Your two starting cards are in this top share of all starting hands: lower is stronger, and aces are the top 0.5%", "number", (row) => row.hand_rank],
   ["Board", null, "wide-only"],
-  ["Chance to win", "Your chance to win at showdown at your last move, reading the others' hands from their play the way a strong player would, so it can differ from the chance shown during play", null, (row) => row.win_chance],
-  ["Put in", null, "wide-only", (row) => row.put_in],
-  ["Result", null, null, (row) => row.result],
-  ["Rating", RATING_TIP, null, (row) => row.rating],
-  [""],
-
+  ["Chance", "Your chance to win at showdown at your last move, reading the others' hands from their play the way a strong player would, so it can differ from the chance shown during play", "number", (row) => row.win_chance],
+  ["Put in", null, "wide-only number", (row) => amount(row.put_in, row)],
+  ["Result", null, "number", (row) => amount(row.result, row)],
+  ["Rating", RATING_TIP, "number", (row) => row.rating],
 ];
 
 async function api(path, body) {
@@ -123,10 +126,10 @@ function copyIcon(name, tip, text) {
   node.setAttribute("aria-label", tip);
   node.append(icon(name));
   node.addEventListener("click", async () => {
-    if (node.classList.contains("waiting")) return;
-    const panel = node.closest(".panel, .copy-host");
+    if (node.classList.contains("busy")) return;
+    const panel = node.closest(".copy-host");
     const pending = Promise.resolve(typeof text === "function" ? text() : text);
-    node.classList.add("waiting");
+    node.classList.add("busy");
     try {
       try {
         // Started in the click itself, so a browser that ties copying to the click (Safari)
@@ -150,18 +153,10 @@ function copyIcon(name, tip, text) {
       panel.append(fallback);
       if (box.value) box.select();
     } finally {
-      node.classList.remove("waiting");
+      node.classList.remove("busy");
     }
   });
   return node;
-}
-
-function tools(id) {
-  // A copy icon's place, emptied along with any copy box it left behind.
-  const target = document.getElementById(id);
-  target.closest(".panel, .copy-host").querySelector(".copy-fallback")?.remove();
-  target.replaceChildren();
-  return target;
 }
 
 function copyMode() {
@@ -174,16 +169,47 @@ function copyTip(hand) {
   return "Copy hand " + hand + " for an AI chat (solver " + on(switches.solver) + ", God's view " + on(switches.god) + ")";
 }
 
+function makeSwitch(name, text, tip, checked, changed) {
+  const label = element("label", "switch");
+  label.title = tip;
+  const input = element("input");
+  input.type = "checkbox";
+  input.name = name;
+  input.setAttribute("role", "switch");
+  input.checked = checked;
+  if (changed) input.addEventListener("change", () => changed(input));
+  label.append(text, input);
+  return label;
+}
+
+function reviewSwitches() {
+  // The Solver and God's view switches, which hold for the whole page and stay in view while
+  // scrolling, and room for a copy icon.
+  const group = element("div", "review-switches");
+  group.setAttribute("role", "group");
+  group.setAttribute("aria-label", "Reviews and copies");
+  group.append(
+    element("span", "", "Reviews and copies:"),
+    makeSwitch("solver", "Solver", SOLVER_TIP, switches.solver, switchChanged),
+    makeSwitch("god", "God's view", GOD_TIP, switches.god, switchChanged),
+    element("span", "tools"),
+  );
+  return group;
+}
+
 function renderSwitches() {
   // The table's copy icon copies the hand shown, as the switches set it.
-  const target = tools("copy-tools");
+  const host = document.querySelector("#table .copy-host");
+  host.querySelector(".copy-fallback")?.remove();
+  const target = host.querySelector(".tools");
+  target.replaceChildren();
   if (state.hand_number) {
     const path = "sessions/" + session + "/hands/" + state.hand_number + "/copy/";
     target.append(copyIcon("copy", copyTip(state.hand_number), () => api(path + copyMode()).then((answer) => answer.text)));
   }
   document.getElementById("god-later").hidden = !(switches.god && state.hand_number && !state.hand_over);
   const hidden = state.seats.some((seat) => !seat.is_user && !seat.style);
-  for (const label of document.querySelectorAll("#table .god-switch")) label.title = GOD_TIP + (hidden ? ". This shows the hidden styles." : "");
+  host.querySelector("input[name=god]").parentElement.title = GOD_TIP + (hidden ? HIDDEN_TIP : "");
 }
 
 function renderHistoryCopy() {
@@ -234,6 +260,12 @@ function prettyLine(line, className) {
   return node;
 }
 
+function storyLine(line) {
+  // Indented lines are the moves of the step above them; a line ending in ":" starts a step.
+  const text = line.trim();
+  return prettyLine(text, line.startsWith(" ") ? "story-line" : text.endsWith(":") ? "story-head step" : "story-head");
+}
+
 function button(label, handler, className, key) {
   const node = element("button", className || "", label);
   node.type = "button";
@@ -254,7 +286,7 @@ function signed(value) {
 }
 
 function percent(share) {
-  return Math.round(100 * share) + "%";
+  return (100 * share).toFixed(1) + "%";
 }
 
 function showError(id, error) {
@@ -441,10 +473,7 @@ function renderStatus() {
     odds.title = "Pot odds: call " + chips(state.legal.call) + " into a pot of " + chips(state.pot)
       + ", so calling pays if you win more than " + percent(state.call_needs) + " of the time.";
   }
-  const pill = document.getElementById("training-pill");
-  pill.hidden = !state.training;
-  if (state.training) pill.textContent = trainingText(state.training, state.seats.length);
-  document.getElementById("chance-mode").hidden = !state.training;
+  if (state.training) document.getElementById("training-pill").textContent = trainingText(state.training, state.seats.length);
 }
 
 function chanceMode() {
@@ -482,8 +511,8 @@ function drawChance() {
   if (mode === "guess" && !revealed) {
     const guesses = element("div", "guesses");
     for (let tenth = 1; tenth <= 9; tenth++) {
-      const chip = button(tenth * 10 + "%", () => reveal(tenth / 10), "chip", String(tenth));
-      chip.title = "Guess " + tenth * 10 + "% -- key: " + tenth;
+      const chip = button(percent(tenth / 10), () => reveal(tenth / 10), "chip", String(tenth));
+      chip.title = "About " + percent(tenth / 10) + " · Key: " + tenth;
       guesses.append(chip);
     }
     const skip = button("Show", () => reveal(null), "chip quiet", "s");
@@ -507,7 +536,7 @@ function drawChance() {
   line.textContent = "Chance to win " + percent(chance.chance) + " against " + against;
   if (guess !== null) line.textContent += " -- you guessed " + percent(guess) + " (" + guessWords(guess, chance.chance) + ")";
   if (chance.opponents.some((opponent) => !opponent.acted)) {
-    more.append(element("p", "still", "Players still to act count as holding any two cards; most of them will fold."));
+    more.append(element("p", "hint-line", "Players still to act count as holding any hand; most of them will fold."));
   }
   chance.opponents.forEach((opponent, index) => seatChance(opponent, names[index]));
 }
@@ -622,7 +651,7 @@ function renderActions() {
     if (state.coach) actions.append(button("Ask the coach", hint, "secondary", "h"));
     renderSizing(legal.raise, raiseButton);
   } else {
-    clock = nulkl;
+    clock = null;
     renderSizing(null, null);
   }
   const check = state.coach && state.acted ? button("Check my last move", analyze, "secondary") : null;
@@ -708,8 +737,32 @@ function renderLog() {
   log.scrollTop = log.scrollHeight;
 }
 
-function handsTable(rows, reviewer) {
+function rowKey(row) {
+  return row.session + "/" + row.hand;
+}
+
+function amount(value, row) {
+  // A row's chips, or the same in that hand's big blinds (tournament blinds grow).
+  return inBB ? value / row.big_blind : value;
+}
+
+function handsTable(rows, csv) {
   if (!rows.length) return element("p", "", "No finished hands yet.");
+  const box = element("div", "hands-box");
+  const redraw = (focus) => {
+    const fresh = handsTable(rows.map((row) => latestRows.get(rowKey(row))), csv);
+    box.replaceWith(fresh);
+    fresh.querySelector(focus).focus();
+  };
+  const unit = makeSwitch("unit", "Big blinds", "Show Put in and Result in big blinds rather than chips", inBB, (input) => {
+    inBB = input.checked;
+    redraw("input[name=unit]");
+  });
+  const link = element("a", "download", "CSV");
+  link.href = csv;
+  link.title = "Download this session's hands as a CSV file";
+  const tools = element("div", "table-tools");
+  tools.append(unit, link);
   const scroll = element("div", "table-scroll");
   const table = element("table", "hands");
   const head = element("tr");
@@ -726,7 +779,7 @@ function handsTable(rows, reviewer) {
     th.setAttribute("aria-sort", order ? (order.up ? "ascending" : "descending") : "none");
     th.append(button(title + (order ? (order.up ? " ▲" : " ▼") : ""), () => {
       handsOrder = !order ? { column: index, up: true } : order.up ? { column: index, up: false } : null;
-      scroll.replaceWith(handsTable(rows.map((row) => latestRows.get(row.session + "/" + row.hand)), reviewer));
+      redraw("th:nth-child(" + (index + 1) + ") button");
     }, "sort"));
   }
   table.append(head);
@@ -738,11 +791,10 @@ function handsTable(rows, reviewer) {
     shown.sort((a, b) => (value(a) === "") - (value(b) === "") || sign * (value(a) - value(b)));
   }
   for (const row of shown) {
-    const tr = element("tr");
-    const key = row.session + "/" + row.hand;
-    tr.dataset.key = key;
+    const key = rowKey(row);
+    const tr = element("tr", "hand-row");
+    tr.dataset.hand = key;
     latestRows.set(key, row);
-    const number = element("td");
     const toggle = button(String(row.hand), () => {
       if (openMoves.delete(key)) {
         tr.nextElementSibling.remove();
@@ -752,10 +804,13 @@ function handsTable(rows, reviewer) {
       }
       toggle.setAttribute("aria-expanded", String(openMoves.has(key)));
     }, "moves-toggle");
-    toggle.title = "Show or hide the moves";
+    toggle.title = "Show or hide the moves and the review";
     toggle.setAttribute("aria-expanded", String(openMoves.has(key)));
+    tr.addEventListener("click", (event) => {
+      if (!event.target.closest("button")) toggle.click();
+    });
+    const number = element("td");
     number.append(toggle);
-    tr.append(number, element("td", "", POSITIONS[row.position] || "early"));
     const cards = element("td");
     for (const text of row.cards.split(" ").filter(Boolean)) cards.append(card(text, true));
     const board = element("td", "wide-only");
@@ -763,16 +818,15 @@ function handsTable(rows, reviewer) {
     const chance = element("td", "number chance");
     const rating = element("td", "number rating");
     fillRated(chance, rating, row);
-    tr.append(cards, element("td", "number strength", row.strength), board, chance, element("td", "wide-only", chips(row.put_in)));
-    tr.append(element("td", row.result > 0 ? "up" : row.result < 0 ? "down" : "", signed(row.result)), rating);
-    const action = element("td");
-    if (reviewer) action.append(button("Review", () => reviewer(row.hand), "small"));
-    tr.append(action);
+    const result = element("td", "number" + (row.result > 0 ? " up" : row.result < 0 ? " down" : ""), signed(amount(row.result, row)));
+    tr.append(number, element("td", "", POSITIONS[row.position] || "early"), cards, element("td", "number strength", row.strength), board);
+    tr.append(chance, element("td", "wide-only number", chips(amount(row.put_in, row))), result, rating);
     table.append(tr);
     if (openMoves.has(key)) table.append(movesRow(row));
   }
   scroll.append(table);
-  return scroll;
+  box.append(tools, scroll);
+  return box;
 }
 
 function fillRated(chance, rating, row) {
@@ -797,30 +851,58 @@ function fillRated(chance, rating, row) {
 }
 
 function movesRow(row) {
-  // The moves stay in view when a narrow screen scrolls the table sideways.
+  // A loaded review moves into the redrawn table as it is, keeping its opened details.
+  const key = rowKey(row);
+  const kept = reviews.has(key) && document.querySelector(`.row-review[data-hand="${CSS.escape(key)}"]`);
   const tr = element("tr", "moves");
   const cell = element("td");
   cell.colSpan = COLUMNS.length;
-  const box = element("div", "moves-box");
-  for (const line of row.history.split("\n")) box.append(prettyLine(line, line.startsWith(" ") ? "story-line" : "story-head"));
-  box.append(rowReview(row));
-  cell.append(box);
+  cell.append(kept || rowReview(row));
   tr.append(cell);
   return tr;
 }
 
-function rowReview(row) {
-  const box = element("div", "row-review");
-  if (row.review === null) {
-    box.append(element("p", "waiting", "Loading…"));
+function rowReview(row, failed = false) {
+  // The hand's full review once it is rated, its moves and "Loading…" until then. A hand whose
+  // review couldn't be fetched (an unsaved session) shows its moves and rated summary instead.
+  const key = rowKey(row);
+  const box = element("div", "row-review copy-host");
+  box.dataset.hand = key;
+  const answer = reviews.get(key);
+  if (answer) {
+    const tools = element("div", "review-tools");
+    tools.append(copyIcon("copy", copyTip(row.hand), () => answer.texts[copyMode()]));
+    box.append(tools, coachView(answer, true));
     return box;
   }
-  for (const line of row.review.slice(0, -1)) box.append(prettyLine(line.trim(), line.startsWith(" ") ? "story-line" : "story-head"));
-  box.append(handSummary(row.review.at(-1), row.rating === "" ? null : row.rating, row.band));
+  if (failed && row.review !== null) {
+    box.append(handSummary(row.review.at(-1), row.rating === "" ? null : row.rating, row.band));
+  }
+  for (const line of row.history.split("\n")) box.append(storyLine(line));
+  if (failed && row.review !== null) {
+    for (const line of row.review.slice(0, -1)) box.append(storyLine(line));
+    return box;
+  }
+  box.append(element("p", "waiting", "Loading…"));
+  if (!row.pending) loadReview(row);
   return box;
 }
 
-function handSummary(text, rating, band) {
+async function loadReview(row) {
+  const key = rowKey(row);
+  if (reviews.has(key) || loading.has(key)) return;
+  loading.add(key);
+  let failed = false;
+  try {
+    reviews.set(key, await api("history/" + encodeURIComponent(row.session) + "/review", { hand: row.hand }));
+  } catch (error) {
+    failed = true;  // not kept, so the next open tries again
+  }
+  loading.delete(key);
+  document.querySelector(`.row-review[data-hand="${CSS.escape(key)}"]`)?.replaceWith(rowReview(latestRows.get(key), failed));
+}
+
+function handSummary(text, rating, band, result) {
   const box = element("div", "hand-summary");
   if (rating !== null) {
     const badge = element("span", "rating-badge " + band, "Hand rating " + rating.toFixed(2));
@@ -828,6 +910,7 @@ function handSummary(text, rating, band) {
     box.append(badge);
   }
   box.append(prettyLine(text));
+  if (result) box.append(element("p", "result", result));
   return box;
 }
 
@@ -845,15 +928,15 @@ function refreshRows(path, container, pending) {
       return;
     }
     if (asked !== refreshes) return;
-    // Only the rated cells and the opened rows change, so nothing else moves.
+    // Only the rated cells and the opened rows still loading change, so nothing else moves.
     for (const row of answer.hands || answer.rows) {
-      const key = row.session + "/" + row.hand;
+      const key = rowKey(row);
       latestRows.set(key, row);
-      const tr = container.querySelector(`tr[data-key="${CSS.escape(key)}"]`);
+      const tr = container.querySelector(`tr[data-hand="${CSS.escape(key)}"]`);
       if (!tr) continue;
       fillRated(tr.querySelector("td.chance"), tr.querySelector("td.rating"), row);
       const opened = tr.nextElementSibling;
-      if (opened && opened.classList.contains("moves")) opened.querySelector(".row-review").replaceWith(rowReview(row));
+      if (opened && opened.classList.contains("moves") && !reviews.has(key)) opened.querySelector(".row-review").replaceWith(rowReview(row));
     }
     refreshRows(path, container, answer.pending);
   }, 1000);
@@ -861,8 +944,7 @@ function refreshRows(path, container, pending) {
 
 function renderHands() {
   document.getElementById("net").textContent = state.session_net ? "· " + signed(state.session_net) : "";
-  document.getElementById("hands-table").replaceChildren(handsTable(state.hands, null));
-  document.getElementById("csv").href = "/api/sessions/" + session + "/hands.csv";
+  document.getElementById("hands-table").replaceChildren(handsTable(state.hands, "/api/sessions/" + session + "/hands.csv"));
   refreshRows("sessions/" + session, document.getElementById("hands-table"), state.pending);
 }
 
@@ -882,36 +964,32 @@ function clearCoach() {
   document.getElementById("coach-panel").hidden = true;
 }
 
-async function act(action) {
+async function play(command, body, fresh = true) {
+  // A move, and the table it leads to; `fresh` clears the coach and the timer's note.
   await run("table-error", async (current) => {
-    const answer = await api("sessions/" + session + "/action", action);
+    const answer = await api("sessions/" + session + "/" + command, body);
     if (!current()) return;
     state = answer;
-    timeoutNote = "";
-    clearCoach();
+    if (fresh) {
+      timeoutNote = "";
+      clearCoach();
+    }
     render();
   });
 }
 
-async function next() {
-  await run("table-error", async (current) => {
-    const answer = await api("sessions/" + session + "/next", {});
-    if (!current()) return;
-    state = answer;
-    timeoutNote = "";
-    clearCoach();
-    render();
-  });
+function act(action) {
+  return play("action", action);
 }
 
-async function rebuy() {
-  await run("table-error", async (current) => {
-    const answer = await api("sessions/" + session + "/rebuy", {});
-    if (!current()) return;
-    state = answer;
-    render();
-  });
+function next() {
+  return play("next", {});
 }
+
+function rebuy() {
+  return play("rebuy", {}, false);
+}
+
 
 function newGame() {
   if (!window.confirm("Leave this game and start a new one?")) return;
@@ -964,38 +1042,39 @@ function review() {
 
 // The coach's answers
 
+
 function optionsTable(decision, god) {
   // What each option averages: against a strong player, and with God's view against these
   // players' styles and, in hindsight, against the cards they held.
   const table = element("table", "options");
   const head = element("tr");
-  const unit = decision.unit === "chips" ? "" : " (" + decision.unit + ")";
   const titles = [
     ["Option", ""],
     ["Strong player", "How often a strong player makes this move here"],
-    ["vs a strong player" + unit, "Average result against a strong player"],
+    ["Vs strong", "Average result against a strong player"],
   ];
   if (god) {
     titles.push(
-      ["vs their styles" + unit, "Average result against the hands these players' styles would hold, played their way"],
-      ["vs their cards" + unit, "In hindsight: the average result if you could see their cards, an estimate before the river"],
+      ["Vs styles", "Average result against the hands these players' styles would hold, played their way"],
+      ["Vs cards", "In hindsight: the average result if you could see their cards, an estimate before the river"],
     );
   }
-  for (const [title, tip] of titles) {
-    const cell = element("th", "", title);
+  for (const [index, [title, tip]] of titles.entries()) {
+    const cell = element("th", index > 1 ? "number" : "", title);
     if (tip) cell.title = tip;
     head.append(cell);
   }
   table.append(head);
   const value = (worth, noise) => {
-    if (worth === null) return element("td", "muted", "–");
-    const cell = element("td", "", decision.unit === "chips" ? signed(worth) : worth.toFixed(2) + "%");
+    if (worth === null) return element("td", "number muted", "–");
+    const cell = element("td", "number", decision.unit === "chips" ? signed(worth) : worth.toFixed(1) + "%");
     if (noise) cell.title = "± " + chips(noise) + ": an estimate from sampling";
     return cell;
   };
   for (const option of decision.options) {
     const tr = element("tr", option.best ? "best" : "");
-    const name = element("td", "", option.action);
+    const name = element("td");
+    name.append(element("span", "action", option.action));
     if (option.chosen) name.append(element("span", "mark", "your move"));
     if (option.best) {
       const mark = element("span", "mark best", "best");
@@ -1003,9 +1082,11 @@ function optionsTable(decision, god) {
       name.append(mark);
     }
     const share = element("td", "share");
+    const track = element("span", "track");
     const bar = element("span", "bar");
     bar.style.width = Math.round(100 * option.strong_share) + "%";
-    share.append(bar, element("span", "", percent(option.strong_share)));
+    track.append(bar);
+    share.append(track, element("span", "", percent(option.strong_share)));
     tr.append(name, share, value(option.vs_strong, option.vs_strong_noise));
     if (god) tr.append(value(option.vs_bots, option.vs_bots_noise), value(option.vs_cards, option.vs_cards_noise));
     table.append(tr);
@@ -1025,7 +1106,7 @@ function rangeGrid(classes, label) {
       const b = RANKS[Math.max(row, column)];
       const name = row === column ? a + b : a + b + (row < column ? "s" : "o");
       const weight = classes[row * 13 + column];
-      const cell = element("span", "cell", name);
+      const cell = element("span", weight > 0.55 ? "cell strong" : "cell", name);
       cell.style.setProperty("--w", String(weight));
       cell.title = name + ": " + percent(weight);
       grid.append(cell);
@@ -1045,8 +1126,15 @@ function decisionView(decision, open, god) {
   }
   if (decision.chosen) title.append(element("span", "chose", "you chose " + decision.chosen));
   box.append(title, element("p", "headline", decision.headline));
-  for (const line of decision.summary.concat(god ? decision.god_summary : [])) box.append(element("p", "summary", line));
-  box.append(optionsTable(decision, god));
+  const facts = decision.summary.slice();
+  if (decision.chosen) box.append(element("p", "note", facts.shift()));
+  box.append(element("p", "", facts.join(" ")));
+  if (god && decision.god_summary.length) {
+    const hindsight = element("div", "hindsight");
+    hindsight.append(element("p", "hindsight-title", "God's view"), element("p", "", decision.god_summary.join(" ")));
+    box.append(hindsight);
+  }
+  box.append(element("p", "note", "Results in " + decision.unit), optionsTable(decision, god));
   const details = element("details");
   details.open = open;
   details.append(element("summary", "", "Show details"));
@@ -1056,46 +1144,42 @@ function decisionView(decision, open, god) {
   for (const range of god ? decision.god_ranges : decision.ranges) {
     if (range.width >= 0.6) continue;  // nearly every hand: the grid would be solid colour
     const label = range.name + " likely holds about " + percent(range.width) + " of hands";
-    details.append(element("p", "grid-title", range.name + "'s likely hands (brighter means more likely):"), rangeGrid(range.classes, label));
+    details.append(element("p", "hint-line", range.name + "'s likely hands (brighter means more likely):"), rangeGrid(range.classes, label));
   }
   box.append(details);
   return box;
 }
 
 function coachView(answer, full) {
-  // A hand review follows the switches; a hint or a move check always shows the coach's
-  // numbers from what the player could know.
+  // A hand review follows the switches, its rating first; a hint or a move check always shows
+  // the coach's numbers from what the player could know.
   const solver = !full || switches.solver;
   const god = full && switches.god && answer.finished;
   const view = element("div", "coach-view");
+  if (answer.summary) view.append(handSummary(answer.summary, answer.rating, answer.band, answer.result));
   const story = element("details", "story");
   story.open = full;
   story.append(element("summary", "", full ? "The hand" : "The hand so far"));
-  for (const line of god ? answer.god_history : answer.history) story.append(prettyLine(line, line.startsWith(" ") ? "story-line" : "story-head"));
+  for (const line of god ? answer.god_history : answer.history) story.append(storyLine(line));
   view.append(story);
   if (solver) {
     if (!answer.decisions.length) view.append(element("p", "", "You made no decision in that hand."));
     for (const decision of answer.decisions) view.append(decisionView(decision, false, god));
   } else {
-    for (const line of answer.rated) view.append(element("p", line.startsWith(" ") ? "rated-move" : "summary", line.trim()));
+    for (const line of answer.rated) view.append(element("p", line.startsWith(" ") ? "rated-move" : "", line.trim()));
   }
-  if (answer.summary) view.append(handSummary(answer.summary, answer.rating, answer.band));
-  if (answer.result) view.append(element("p", "result", answer.result));
+  if (answer.result && !answer.summary) view.append(element("p", "result", answer.result));
   return view;
 }
 
 function switchChanged(input) {
-  // One state for the page: every copy of the switch follows, and what it shows is redrawn.
+  // One state for the page: every copy of the switch follows, and each review shown is redrawn.
   switches[input.name] = input.checked;
   for (const other of document.querySelectorAll(".review-switches input[name=" + input.name + "]")) other.checked = input.checked;
   if (session && state) renderSwitches();
   if (coachShown && coachShown.full) document.getElementById("coach").replaceChildren(coachView(coachShown.answer, true));
-  if (historyShown) {
-    document.getElementById("history-coach").replaceChildren(coachView(historyShown.answer, true));
-    renderHistoryCopy();
-  }
+  for (const box of document.querySelectorAll(".row-review")) box.replaceWith(rowReview(latestRows.get(box.dataset.hand)));
 }
-
 
 // Past sessions
 
@@ -1106,9 +1190,7 @@ function gameName(saved) {
 
 async function openHistory() {
   show("history");
-  document.getElementById("session-hands").replaceChildren();
-  document.getElementById("history-coach-panel").hidden = true;
-  historyShown = null;
+  closeSession();
   await run("history-error", async () => listSessions(await api("history")));
 }
 
@@ -1141,12 +1223,19 @@ function listSessions(answer) {
   const table = element("table", "hands");
   const head = element("tr");
   const dateHead = element("th");
-  dateHead.append(all, " Date");
+  const allLabel = element("label", "inline");
+  allLabel.append(all, "Date");
+  dateHead.append(allLabel);
   head.append(dateHead);
-  for (const title of ["Game", "Players", "Opponents", "Hands", "Result", ""]) head.append(element("th", "", title));
+  for (const [title, className] of [["Game"], ["Players", "wide-only"], ["Opponents", "wide-only"], ["Hands", "number"], ["Result", "number"], ["", "wide-only"]]) head.append(element("th", className, title));
   table.append(head);
   for (const saved of answer.sessions) {
-    const tr = element("tr");
+    const tr = element("tr", "session-row");
+    tr.dataset.name = saved.name;
+    tr.title = "Show or hide this session's hands"
+    tr.addEventListener("click", (event) => {
+      if (!event.target.closest("button, label")) openSession(saved);
+    });
     const pick = element("input");
     pick.type = "checkbox";
     pick.value = saved.name;
@@ -1155,16 +1244,20 @@ function listSessions(answer) {
     picks.push(pick);
     const date = element("td");
     const label = element("label", "inline");
-    label.append(pick, saved.date);
+    // "Oct 9", with the year only when it isn't this year; the full date shows on hover.
+    const day = new Date(saved.date + "T00:00");
+    const year = day.getFullYear() === new Date().getFullYear() ? undefined : "numeric";
+    label.append(pick, day.toLocaleDateString("en-US", { month: "short", day: "numeric", year }));
+    label.title = saved.date;
     date.append(label);
     tr.append(date, element("td", "", gameName(saved)));
-    tr.append(element("td", "", saved.players), element("td", "", DIFFICULTY[saved.difficulty]), element("td", "", saved.hands));
+    tr.append(element("td", "wide-only", saved.players), element("td", "wide-only", DIFFICULTY[saved.difficulty]), element("td", "number", saved.hands));
     const training = saved.mode === "training";
-    const result = element("td", training ? "muted" : saved.net > 0 ? "up" : saved.net < 0 ? "down" : "", signed(saved.net));
+    const result = element("td", "number" + (training ? " muted" : saved.net > 0 ? " up" : saved.net < 0 ? " down" : ""), signed(saved.net));
     if (training) result.title = "Training: not counted in your results";
     tr.append(result);
-    const open = element("td");
-    open.append(button("Open", () => openSession(saved), "small"));
+    const open = element("td", "wide-only");
+    open.append(button("Open", () => openSession(saved), "small session-toggle"));
     tr.append(open);
     table.append(tr);
   }
@@ -1173,23 +1266,43 @@ function listSessions(answer) {
   const scroll = element("div", "table-scroll");
   scroll.append(table);
   target.replaceChildren(actions, scroll);
+  markSession();
+}
+
+function markSession() {
+  // The open session's row reads Close, the others Open.
+  const open = document.getElementById("session-hands").dataset.name;
+  for (const tr of document.querySelectorAll("#sessions tr.session-row")) {
+    const toggle = tr.querySelector(".session-toggle");
+    toggle.textContent = tr.dataset.name === open ? "Close" : "Open";
+    toggle.setAttribute("aria-expanded", String(tr.dataset.name === open));
+  }
+}
+
+function closeSession() {
+  const target = document.getElementById("session-hands");
+  target.replaceChildren();
+  delete target.dataset.name;
+  refreshRows("", target, false);
+  markSession();
 }
 
 async function openSession(saved) {
-  const name = saved.name;
-  const label = gameName(saved) + " on " + saved.date;
+  // Opening the open session again closes it.
+  const target = document.getElementById("session-hands");
+  if (target.dataset.name === saved.name) {
+    closeSession();
+    return;
+  }
+  const name = encodeURIComponent(saved.name);
   await run("history-error", async () => {
-    const answer = await api("history/" + encodeURIComponent(name));
-    const target = document.getElementById("session-hands");
-    target.dataset.name = name;
-    const link = element("a", "download", "CSV");
-    link.href = "/api/history/" + encodeURIComponent(name) + "/hands.csv";
-    link.title = "Download this session as a CSV file";
-    link.prepend(icon("download"));
-    const actions = element("p", "session-tools");
-    actions.append(link);
-    target.replaceChildren(element("h2", "", "Hands: " + label), actions, handsTable(answer.rows, (hand) => reviewSaved(name, hand)));
-    refreshRows("history/" + encodeURIComponent(name), target, answer.pending);
+    const answer = await api("history/" + name);
+
+    target.dataset.name = saved.name;
+    const title = element("h2", "", "Hands: " + gameName(saved) + " on " + saved.date);
+    target.replaceChildren(title, reviewSwitches(), handsTable(answer.rows, "/api/history/" + name + "/hands.csv"));
+    refreshRows("history/" + name, target, answer.pending);
+    markSession();
   });
 }
 
@@ -1197,42 +1310,16 @@ async function deleteSessions(names) {
   await run("history-error", async () => {
     const answer = await api("history/delete", { names });
     for (const key of [...openMoves]) if (names.some((name) => key.startsWith(name + "/"))) openMoves.delete(key);
-    const hands = document.getElementById("session-hands");
-    if (names.includes(hands.dataset.name)) {
-      show("history");
-      hands.replaceChildren();
-      document.getElementById("history-coach-panel").hidden = true;
-      historyShown = null;
-    }
+    for (const key of [...reviews.keys()]) if (names.some((name) => key.startsWith(name + "/"))) reviews.delete(key);
+    if (names.includes(document.getElementById("session-hands").dataset.name)) closeSession();
     listSessions(answer);
-  });
-}
-
-async function reviewSaved(name, hand) {
-  await run("history-error", async () => {
-    const panel = document.getElementById("history-coach-panel");
-    const target = document.getElementById("history-coach");
-    panel.hidden = false;
-    historyShown = null;
-    renderHistoryCopy();
-    target.replaceChildren(element("p", "waiting", "Reviewing hand " + hand + "..."));
-    try {
-      const answer = await api("history/" + encodeURIComponent(name) + "/review", { hand });
-      historyShown = { answer, hand };
-      target.replaceChildren(coachView(answer, true));
-      renderHistoryCopy();
-      panel.scrollIntoView({ behavior: "smooth" });
-    } catch (error) {
-      target.replaceChildren();
-      panel.hidden = true;
-      throw error;
-    }
   });
 }
 
 // Setup and page-wide controls
 
 const setupForm = document.getElementById("setup-form");
+setupForm.querySelector("details.more").before(makeSwitch("coach", "Coach", "Hints and checks of your moves while you play", true, null));
 let preview = 0;
 
 function selectedMode() {
@@ -1359,15 +1446,16 @@ document.getElementById("new-game").addEventListener("click", newGame);
 document.getElementById("open-history").addEventListener("click", openHistory);
 document.getElementById("history-back").addEventListener("click", () => show("setup"));
 document.getElementById("words-link").addEventListener("click", () => { document.getElementById("glossary").open = true; });
-for (const link of document.querySelectorAll("a.download")) link.prepend(icon("download"));
 
-const hideHelpers = document.getElementById("hide-helpers");
-hideHelpers.checked = window.localStorage.getItem(HELPERS_KEY) === "1";
-document.body.classList.toggle("no-helpers", hideHelpers.checked);
-hideHelpers.addEventListener("change", () => {
-  window.localStorage.setItem(HELPERS_KEY, hideHelpers.checked ? "1" : "0");
-  document.body.classList.toggle("no-helpers", hideHelpers.checked);
+const helpersHidden = window.localStorage.getItem(HELPERS_KEY) === "1";
+document.body.classList.toggle("no-helpers", helpersHidden);
+const helpers = makeSwitch("hide-helpers", "Hide helpers", HELPERS_TIP, helpersHidden, (input) => {
+  window.localStorage.setItem(HELPERS_KEY, input.checked ? "1" : "0");
+  document.body.classList.toggle("no-helpers", input.checked);
 });
+helpers.id = "helpers-toggle";
+helpers.hidden = true;
+document.getElementById("words-link").before(helpers);
 
 const chanceSaved = window.localStorage.getItem(CHANCE_KEY);
 for (const radio of document.querySelectorAll("input[name=chance]")) {
@@ -1381,7 +1469,7 @@ for (const radio of document.querySelectorAll("input[name=chance]")) {
   });
 }
 
-for (const input of document.querySelectorAll(".review-switches input")) input.addEventListener("change", () => switchChanged(input));
+document.querySelector("#table .copy-host").prepend(reviewSwitches());
 setInterval(tickClock, 250);
 
 const rangeDialog = document.getElementById("range-dialog");

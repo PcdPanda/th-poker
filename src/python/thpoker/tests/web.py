@@ -621,33 +621,18 @@ def test_a_bot_that_shows_has_its_cards_on_its_seat(monkeypatch):
 
 
 def test_the_decision_json_counts_chips_on_the_table_or_shares_of_the_prize_pool():
-    mix = {Action(ActionType.CALL): 0.75}
-    cash = _decision_json(fold_to_a_bet(False), {}, 1, 100, mix)["options"]
-    assert [(o["vs_bots"], o["vs_bots_noise"], o["strong_share"]) for o in cash] == [
-        (0, 0, 0),
-        (150, 10, 0.75),
-        (25, 10, 0),
-    ]
-    small = _decision_json(fold_to_a_bet(False), {}, 100, 100, mix)["options"]  # blinds 0.5/1
-    assert [o["vs_strong"] for o in small] == [0, 1.5, 0.25]
-    tournament = _decision_json(fold_to_a_bet(True), {}, 1, 100, mix)
-    assert tournament["unit"] == "% of the prize pool"
-    assert [o["vs_bots"] for o in tournament["options"]] == [30, 33, 31]
-
-
-def test_the_decision_json_counts_chips_on_the_table_or_shares_of_the_prize_pool():
-    mix = {Action(ActionType.CALL): 0.75}
-    cash = _decision_json(fold_to_a_bet(False), {}, {}, 1, 100, mix, None, True)["options"]
+    mixed = fold_to_a_bet(False, {Action(ActionType.CALL): 0.75})
+    cash = _decision_json(mixed, {}, {}, 1, 100, None, True)["options"]
     assert [(o["vs_bots"], o["vs_bots_noise"], o["strong_share"], o["vs_cards"]) for o in cash] == [
         (0, 0, 0, None),
         (150, 10, 0.75, None),
         (25, 10, 0, None),
     ]
-    small = _decision_json(fold_to_a_bet(False), {}, {}, 100, 100, mix, None, True)["options"]
+    small = _decision_json(fold_to_a_bet(False), {}, {}, 100, 100, None, True)["options"]
     assert [o["vs_strong"] for o in small] == [0, 1.5, 0.25]  # blinds 0.5/1
-    unfinished = _decision_json(fold_to_a_bet(False), {}, {}, 1, 100, mix, None, False)
+    unfinished = _decision_json(fold_to_a_bet(False), {}, {}, 1, 100, None, False)
     assert [o["vs_bots"] for o in unfinished["options"]] == [None] * 3
-    tournament = _decision_json(fold_to_a_bet(True), {}, {}, 1, 100, mix, None, True)
+    tournament = _decision_json(fold_to_a_bet(True), {}, {}, 1, 100, None, True)
     assert tournament["unit"] == "% of the prize pool"
     assert [o["vs_bots"] for o in tournament["options"]] == [30, 33, 31]
 

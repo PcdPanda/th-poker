@@ -33,7 +33,6 @@ from   thpoker.analysis.stats   import (DecisionRecord, hand_rows,
                                         write_hands_csv)
 from   thpoker.analysis.tracking \
                                 import track
-from   thpoker.bots.abstraction import to_action
 from   thpoker.bots.bot         import Bot
 from   thpoker.bots.equity_bot  import public_seed
 from   thpoker.charts           import seats_from_button
@@ -45,7 +44,7 @@ from   thpoker.cli              import (PlaySession, Task, add_device_argument,
                                         plain_history, result_or, seat_labels,
                                         session_histories)
 from   thpoker.game.cards       import PREFLOP_CLASSES, card_str
-from   thpoker.game.engine      import is_terminal, observation, replay_states
+from   thpoker.game.engine      import is_terminal, observation
 from   thpoker.game.evaluator   import describe, evaluate
 from   thpoker.game.rng         import Rng
 from   thpoker.game.rules       import IllegalActionError
@@ -127,10 +126,16 @@ def _hands_label(classes: tuple[str, ...]) -> str:
         return f"{len(classes)} hand types"
     low, high = window
     if low == 0:
-        return "any hand" if high == 1 else f"best {percent_text(high)}%"
+        return "any hand" if high == 1 else f"best {_typed_percent(high)}%"
     if high == 1:
-        return f"worst {percent_text(1 - low)}%"
-    return f"top {percent_text(low)}-{percent_text(high)}%"
+        return f"worst {_typed_percent(1 - low)}%"
+    return f"top {_typed_percent(low)}-{_typed_percent(high)}%"
+
+
+def _typed_percent(share: float) -> str:
+    """A share of deals as the user typed it: a class run only comes close to the percent asked
+    for, so whole percents, with one decimal under 1%."""
+    return f"{100 * share:.0f}" if share >= 0.01 else f"{100 * share:.1f}"
 
 
 def _training(config: TableConfig) -> dict[str, str | None] | None:
@@ -171,7 +176,6 @@ def _copy_text(
     hand: GameState,
     shows: dict[int, tuple[int, int]],
     reviews: list[DecisionReview],
-    mixes: list[dict[Action, float]],
     gods: dict[int, GodView] | None,
     rated: list[str],
     summary: str,
@@ -189,10 +193,10 @@ def _copy_text(
         lines += held_text(hand, user, labels, shows)
     if solver:
         big_blind = hand.config.big_blind
-        for number, (decision, mix) in enumerate(zip(reviews, mixes), 1):
+        for number, decision in enumerate(reviews, 1):
             view = gods.get(decision.index) if god and gods else None
             styled = labels if god else None
-            lines += [""] + solver_decision_text(number, decision, labels, scale, big_blind, mix, styled, view)
+            lines += [""] + solver_decision_text(number, decision, labels, scale, big_blind, styled, view)
     result = _result(hand, user, scale, all_in_bb if solver else None)
     lines += ([""] + rated if rated else []) + ["", summary] + ([result] if result else [])
     return "\n".join(lines) + "\n"
@@ -277,16 +281,6 @@ def _chance(hand: GameState, user: int, bots: dict[int, Bot]) -> dict[str, Any]:
     return {"chance": round(overall.value, 3), "opponents": entries}
 
 
-def _strong_mix(hand: GameState, user: int, index: int) -> dict[Action, float]:
-    """How often the strong reference player takes each option at history action `index` (past
-    the end: now), holding the user's cards."""
-    view = observation(replay_states(hand)[index], user)
-    mix: dict[Action, float] = defaultdict(float)
-    for abstract, share in REFERENCE.action_probabilities(view).items():
-        mix[to_action(abstract, view)] += share
-    return dict(mix)
-
-
 def _worth(option: OptionValue, tournament: bool, big_blind: int, scale: int) -> tuple[float, float]:
     """An option's average result and its noise: chips shown on the table, or percent of the
     prize pool in a tournament."""
@@ -320,7 +314,6 @@ def _decision_json(
     styled: dict[int, str],
     scale: int,
     big_blind: int,
-    mix: dict[Action, float],
     god: GodView | None,
     finished: bool,
 ) -> dict[str, Any]:
@@ -346,7 +339,7 @@ def _decision_json(
                 "vs_bots_noise": vs_bots_noise,
                 "vs_cards": vs_cards,
                 "vs_cards_noise": vs_cards_noise,
-                "strong_share": round(mix.get(option.action, 0.0), 3),
+                "strong_share": round(review.reference_mix.get(option.action, 0.0), 3),
                 "chosen": option.action == review.chosen,
                 "best": option.action == best,
             }
@@ -357,7 +350,7 @@ def _decision_json(
         "board": [card_str(c) for c in review.board],
         "chosen": None if review.chosen is None else describe_action(review.chosen, scale),
         "verdict": None if review.chosen is None else review.verdict(),
-        "headline": decision_headline(review, scale, big_blind, mix),
+        "headline": decision_headline(review, scale, big_blind),
         "summary": decision_summary(review, scale, big_blind),
         "god_summary": god_summary(review, god, scale) if finished else None,
         "details": decision_details(review, labels, scale, big_blind),
@@ -401,11 +394,10 @@ def _coach_json(
     else:  # a move checked has its chance but no rating of moves not shown; a hint has neither
         chance, rating = (reviews[-1].reference_equity.value if moves else None), None
     rated, summary = rated_hand_text(hand, user, moves, chance, rating, scale)
-    mixes = [_strong_mix(hand, user, decision.index) for decision in reviews]
     finished = is_terminal(hand)
     decisions = [
-        _decision_json(d, plain, styled, scale, big_blind, mix, gods.get(d.index) if gods else None, finished)
-        for d, mix in zip(reviews, mixes)
+        _decision_json(d, plain, styled, scale, big_blind, gods.get(d.index) if gods else None, finished)
+        for d in reviews
     ]
     all_in = review.all_in_net_bb if review else None
     return {
@@ -417,7 +409,6 @@ def _coach_json(
             else None
         ),
         "finished": finished,
-        "hides_styles": runner.config.hide_styles,
         "decisions": decisions,
         "rated": rated,
         "result": result,
@@ -425,7 +416,7 @@ def _coach_json(
         "rating": rating,
         "band": None if rating is None else rating_band(rating),
         "texts": {
-            mode: _copy_text(mode, runner, scale, hand, shows, reviews, mixes, gods, rated, summary, all_in)
+            mode: _copy_text(mode, runner, scale, hand, shows, reviews, gods, rated, summary, all_in)
             for mode in TEXT_MODES
         },
     }
@@ -830,9 +821,8 @@ class WebTable(PlaySession):
         rating = hand_rating([(m.rating, m.stake) for m in moves]) if moves else None
         lines, summary = rated_hand_text(hand, user, moves, chance, rating, self.scale)
         reviews, all_in, gods = material
-        mixes = [_strong_mix(hand, user, review.index) for review in reviews]
         shows = self.shows.get(hand.hand_id, {})
-        text = _copy_text(mode, self.runner, self.scale, hand, shows, reviews, mixes, gods, lines, summary, all_in)
+        text = _copy_text(mode, self.runner, self.scale, hand, shows, reviews, gods, lines, summary, all_in)
         return {"text": text}
 
     def chance(self) -> Later:

@@ -17,9 +17,10 @@ from   functools                import cache
 import math
 from   thpoker.bots.abstraction import (AbstractAction, NEVER_FOLD_EQUITY,
                                         POT_FRACTIONS, PUSH_FOLD_BIG_BLINDS,
-                                        call_price, defense_share,
+                                        acts_last, call_price, defense_share,
                                         effective_stack, finish, last_bet,
-                                        legal_abstract_actions, sigmoid,
+                                        legal_abstract_actions,
+                                        raises_this_street, sigmoid,
                                         usual_raises)
 from   thpoker.bots.bot         import PRESETS, Policy, Style, TierBot
 from   thpoker.bots.equity_bot  import (EquityBot, bet_shifted, preflop_range,
@@ -37,6 +38,7 @@ from   thpoker.odds             import (Range, hand_range, range_equities,
 from   typing                   import Any
 
 _BLUFF_STREET_FACTOR = {Street.FLOP: 1.5, Street.TURN: 1.2, Street.RIVER: 1.0}
+_RERAISE_TOPS = (0.1, 0.04)
 # Chart thresholds sit on a half-big-blind grid; mix across about that width.
 _CHART_SOFTNESS_BB = 0.3
 # How much wider (above 1) or narrower a seat's continuing and re-raising chart rows are, from
@@ -235,15 +237,19 @@ def seat_range(
     limp: Range | None = None,
     floors: tuple[float, float] = (0.25, 0.25),
 ) -> Range:
-    """A seat's range from its public actions: charts stretched by `factors` (or the Tier 2
-    bands off-chart, with `limp` for a limp) preflop, then shifted toward strong hands by each
+    """A seat's range from its public actions: charts stretched by `factors` (or the bands
+    off-chart, re-raises read wide, with `limp` for a limp) preflop, then shifted toward strong hands by each
     of its postflop bets and raises, with `strength_weighted`'s `floors` on the flop and later."""
     charted = chart_range(view, seat, factors)
     # A line the charts give no weight to any hand leaves nothing to score against.
     if charted is not None and sum(charted) > 1.0:
         weights = charted
     else:
-        weights = preflop_range(view, seat) if limp is None else preflop_range(view, seat, limp)
+        weights = (
+            preflop_range(view, seat, reraise_tops=_RERAISE_TOPS)
+            if limp is None
+            else preflop_range(view, seat, limp, _RERAISE_TOPS)
+        )
     return bet_shifted(view, seat, weights, floors)
 
 
@@ -251,7 +257,7 @@ class RangeBot(TierBot):
     def __init__(self, name: str, style: Style):
         self.name = name
         self.style = style
-        self._fallback = EquityBot(name, style)
+        self._fallback = EquityBot(name, style, _RERAISE_TOPS)
 
     def chart_factors(
         self, view: Observation, order: tuple[int, ...], raisers: list[int], index: int, node: str
@@ -276,10 +282,7 @@ class RangeBot(TierBot):
         if view.street == Street.PREFLOP:
             charted = self._preflop(view)
             if charted is None:
-                for hole, (distribution, rationale) in self._fallback.decisions(view, holes).items():
-                    rule = f"tier 2 fallback: {rationale['rule_triggered']}"
-                    result[hole] = distribution, {**rationale, "rule_triggered": rule}
-                return result
+                return self._off_chart(view, holes)
             table, shared, thresholds = charted
             by_class: dict[int, Policy] = {}
             for hole in holes:
@@ -362,6 +365,48 @@ class RangeBot(TierBot):
                 rationale["chart_stretch"] = stretch
         table = [dict(zip(actions, row)) for row in rows]
         return table, {**rationale, "rule_triggered": f"preflop table: {rule}"}, None
+
+    def _off_chart(self, view: Observation, holes: list[int]) -> dict[int, Policy]:
+        """The Tier 2 policy, except that facing a re-raise the seat keeps at least
+        `_defense_floor` of its whole range, turning folds into calls from its strongest hand
+        classes down: even reading re-raises with their bluffs, Tier 2 calls with too few hands."""
+        floor = _defense_floor(view)
+        own = self.seat_range(view, view.seat) if floor is not None else None
+        combos = holes if own is None else sorted({i for i, w in enumerate(own) if w > 0} | set(holes))
+        decided = {
+            hole: (
+                dict(distribution),
+                {**rationale, "rule_triggered": f"tier 2 fallback: {rationale['rule_triggered']}"},
+            )
+            for hole, (distribution, rationale) in self._fallback.decisions(view, combos).items()
+        }
+        if own is not None:
+            assert floor is not None
+            fold, call = AbstractAction.FOLD, AbstractAction.CALL
+            held = [i for i in combos if own[i] > 0]
+            total = sum(own[i] for i in held)
+            short = floor * total - sum(own[i] * (1 - decided[i][0].get(fold, 0.0)) for i in held)
+            by_class: dict[int, list[int]] = {}
+            for i in combos:
+                by_class.setdefault(COMBO_CLASS[i], []).append(i)
+            # Hands of a class share one strength.
+            strength = {k: decided[group[0]][1]["equity_estimate"] for k, group in by_class.items()}
+            for klass in sorted(by_class, key=strength.__getitem__, reverse=True):
+                if short <= 1e-12:
+                    break
+                group = by_class[klass]
+                folded = sum(own[i] * decided[i][0].get(fold, 0.0) for i in group)
+                if folded <= 0:
+                    continue
+                moved = min(1.0, short / folded)
+                short -= moved * folded
+                for i in group:
+                    distribution, rationale = decided[i]
+                    shifted = moved * distribution.get(fold, 0.0)
+                    distribution[fold] = distribution.get(fold, 0.0) - shifted
+                    distribution[call] = distribution.get(call, 0.0) + shifted
+                    rationale["defense_floor"] = round(floor, 3)
+        return {hole: decided[hole] for hole in holes}
 
     def _postflop(
         self, view: Observation, holes: list[int]
@@ -481,6 +526,24 @@ class RangeBot(TierBot):
                 rationale,
             )
         return decided
+
+
+def _defense_floor(view: Observation) -> float | None:
+    """The least share of its range a raiser keeps when re-raised preflop off the charts: half
+    of it, or the minimum defense frequency if higher, against a 4-bet or more; against a 3-bet
+    0.8 of that frequency in position and 0.6 out of it, as solvers keep less than all of it.
+    None for anything else: a seat that has not raised holds no narrowed range to keep a share
+    of, and against an all-in folding most hands is right."""
+    raises = raises_this_street(view)
+    defense = defense_share(view)
+    raised = any(
+        e.seat == view.seat and e.street == view.street and e.action.type == ActionType.RAISE for e in view.history
+    )
+    if not raised or raises < 2 or defense is None or legal_actions(view).call_amount >= view.stacks[view.seat]:
+        return None
+    if raises >= 3:
+        return max(defense, 0.5)
+    return defense * (0.8 if acts_last(view, view.seat) else 0.6)
 
 
 def _defense(view: Observation, opponents: int) -> tuple[float, float]:
