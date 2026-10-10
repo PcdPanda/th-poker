@@ -24,10 +24,11 @@ import re
 import secrets
 from   thpoker.analysis.ev      import (OptionValue, PROFILES, Profile,
                                         pick_profile)
-from   thpoker.analysis.review  import (DecisionReview, HandRating, HandReview,
-                                        REFERENCE, best_option, hand_rating,
-                                        move_ratings, position_names,
-                                        range_view, rating_band, thresholds)
+from   thpoker.analysis.review  import (DecisionReview, GodView, HandRating,
+                                        HandReview, REFERENCE, RangeView,
+                                        best_option, hand_rating, move_ratings,
+                                        position_names, range_view,
+                                        rating_band, thresholds)
 from   thpoker.analysis.stats   import (DecisionRecord, hand_rows,
                                         write_hands_csv)
 from   thpoker.analysis.tracking \
@@ -39,9 +40,10 @@ from   thpoker.charts           import seats_from_button
 from   thpoker.cli              import (PlaySession, Task, add_device_argument,
                                         background, build_config,
                                         collect_shows, full_review, game_name,
-                                        logged_ratings, logged_shows,
-                                        parse_args, plain_history, result_or,
-                                        seat_labels, session_histories)
+                                        god_review, logged_ratings,
+                                        logged_shows, logged_times, parse_args,
+                                        plain_history, result_or, seat_labels,
+                                        session_histories)
 from   thpoker.game.cards       import PREFLOP_CLASSES, card_str
 from   thpoker.game.engine      import is_terminal, observation, replay_states
 from   thpoker.game.evaluator   import describe, evaluate
@@ -57,9 +59,10 @@ from   thpoker.table            import (EXPLOITS, MIN_HANDS, STYLE_WORDS,
                                         TableConfig, TableRunner)
 from   thpoker.text             import (chips_shown, decision_details,
                                         decision_headline, decision_summary,
-                                        describe_action, hand_history_text,
-                                        hand_result_text, percent_text,
-                                        plain_decision_text, rated_hand_text)
+                                        describe_action, god_summary,
+                                        hand_history_text, hand_result_text,
+                                        held_text, percent_text, range_lines,
+                                        rated_hand_text, solver_decision_text)
 import threading
 from   typing                   import Any, NamedTuple
 
@@ -74,6 +77,8 @@ MAX_BODY = 16_384
 MAX_SESSIONS = 8  # the oldest session is dropped beyond this
 RECENT_HANDS = 20  # rows of "Your hands" sent with the state
 HISTORY_LIMIT = 50  # newest saved sessions listed
+TEXT_MODES = ("plain", "solver", "god", "solver_god")
+TIMER_SECONDS = (10, 1000)
 _KINDS = {kind.value.lower(): kind for kind in ActionType}
 _PAST = {
     ActionType.FOLD: "folded",
@@ -159,6 +164,40 @@ def _result(hand: GameState, user: int, scale: int, all_in_bb: float | None) -> 
     return hand_result_text(net, all_in_bb, scale, hand.config.big_blind)
 
 
+def _copy_text(
+    mode: str,
+    runner: TableRunner,
+    scale: int,
+    hand: GameState,
+    shows: dict[int, tuple[int, int]],
+    reviews: list[DecisionReview],
+    mixes: list[dict[Action, float]],
+    gods: dict[int, GodView] | None,
+    rated: list[str],
+    summary: str,
+    all_in_bb: float | None,
+) -> str:
+    """One of the `TEXT_MODES` texts to paste into a chat assistant, ending with the rated moves,
+    the summary and the result; with the coach's numbers, the result also gives the average
+    from when the chips went in (`all_in_bb`). God's view applies to a finished hand only."""
+    user = runner.user_seat
+    assert user is not None
+    god, solver = mode.endswith("god") and is_terminal(hand), mode.startswith("solver")
+    labels = _god_labels(runner) if god else seat_labels(runner, False)
+    lines = hand_history_text(hand, user, labels, scale, game_name(runner), shows)
+    if god:
+        lines += held_text(hand, user, labels, shows)
+    if solver:
+        big_blind = hand.config.big_blind
+        for number, (decision, mix) in enumerate(zip(reviews, mixes), 1):
+            view = gods.get(decision.index) if god and gods else None
+            styled = labels if god else None
+            lines += [""] + solver_decision_text(number, decision, labels, scale, big_blind, mix, styled, view)
+    result = _result(hand, user, scale, all_in_bb if solver else None)
+    lines += ([""] + rated if rated else []) + ["", summary] + ([result] if result else [])
+    return "\n".join(lines) + "\n"
+
+
 def _player_view(history: list[str], rated: list[str], summary: str, result: str | None) -> str:
     """The hand as the user saw it, to copy for a chat assistant: no styles and no analysis,
     only the moves rated 0 to 1 and the hand's three numbers."""
@@ -195,6 +234,7 @@ def _page_rows(
             each = [
                 f"{hand.history[m.history_index].street.title()} {m.rating:.2f}"
                 + (" (after a hint)" if m.hinted else "")
+                + (" (time ran out)" if m.timed_out else "")
                 for m in rated.moves
             ]
             settled[hand.hand_id] = {
@@ -257,27 +297,55 @@ def _worth(option: OptionValue, tournament: bool, big_blind: int, scale: int) ->
     return chips_shown(option.ev, big_blind, scale), noise
 
 
+def _god_labels(runner: TableRunner) -> dict[int, str]:
+    """Seat names with each bot's style, for God's view of a finished hand: hidden styles too."""
+    labels = seat_labels(runner, False)
+    return labels | {s: f"{labels[s]} ({STYLE_WORDS[b.style.name]})" for s, b in runner.bots.items()}
+
+
+def _grids(ranges: dict[int, RangeView], names: dict[int, str]) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": names[seat],
+            "width": round(view.width, 3),
+            "classes": [round(w, 3) for w in view.classes],
+        }
+        for seat, view in ranges.items()
+    ]
+
+
 def _decision_json(
     review: DecisionReview,
     labels: dict[int, str],
+    styled: dict[int, str],
     scale: int,
     big_blind: int,
     mix: dict[Action, float],
+    god: GodView | None,
+    finished: bool,
 ) -> dict[str, Any]:
+    """A decision for the page: from what the user could know, and for a `finished` hand the God's
+    view extras (the bots' styles, and with `god` their cards) the page shows when that switch
+    is on. Before the hand ends nothing comes from the styles, which may be hidden."""
     tournament = review.tournament
     best = best_option(review.reference, tournament).action
-    reference = {o.action: o for o in review.reference}
+    bots = {o.action: o for o in review.exploitative}
+    cards = {o.action: o for o in god.options} if god is not None else {}
     options = []
-    for option in review.exploitative:
-        vs_bots, vs_bots_noise = _worth(option, tournament, big_blind, scale)
-        vs_strong, vs_strong_noise = _worth(reference[option.action], tournament, big_blind, scale)
+    for option in review.reference:
+        vs_strong, vs_strong_noise = _worth(option, tournament, big_blind, scale)
+        vs_bots, vs_bots_noise = _worth(bots[option.action], tournament, big_blind, scale) if finished else (None, None)
+        held = cards.get(option.action)
+        vs_cards, vs_cards_noise = (None, None) if held is None else _worth(held, tournament, big_blind, scale)
         options.append(
             {
                 "action": describe_action(option.action, scale),
-                "vs_bots": vs_bots,
-                "vs_bots_noise": vs_bots_noise,
                 "vs_strong": vs_strong,
                 "vs_strong_noise": vs_strong_noise,
+                "vs_bots": vs_bots,
+                "vs_bots_noise": vs_bots_noise,
+                "vs_cards": vs_cards,
+                "vs_cards_noise": vs_cards_noise,
                 "strong_share": round(mix.get(option.action, 0.0), 3),
                 "chosen": option.action == review.chosen,
                 "best": option.action == best,
@@ -291,17 +359,13 @@ def _decision_json(
         "verdict": None if review.chosen is None else review.verdict(),
         "headline": decision_headline(review, scale, big_blind, mix),
         "summary": decision_summary(review, scale, big_blind),
+        "god_summary": god_summary(review, god, scale) if finished else None,
         "details": decision_details(review, labels, scale, big_blind),
+        "god_details": range_lines(review.ranges, styled, "By their styles, ") if finished else None,
         "unit": "% of the prize pool" if tournament else "chips",
         "options": options,
-        "ranges": [
-            {
-                "name": labels[seat],
-                "width": round(view.width, 3),
-                "classes": [round(w, 3) for w in view.classes],
-            }
-            for seat, view in review.ranges.items()
-        ],
+        "ranges": _grids(review.reference_ranges, labels),
+        "god_ranges": _grids(review.ranges, styled) if finished else None,
     }
 
 
@@ -312,20 +376,22 @@ def _coach_json(
     reviews: list[DecisionReview],
     shows: dict[int, tuple[int, int]],
     review: HandReview | None = None,
-    hinted: set[int] | None = None,
+    marks: tuple[set[int], set[int]] = (set(), set()),
     kept: HandRating | None = None,
+    gods: dict[int, GodView] | None = None,
 ) -> dict[str, Any]:
     """A coach answer: the hand so far, each decision for the page, the user's result once the
-    hand is over, and two plain texts to paste into a chat assistant: the full analysis, and the
-    hand as the user saw it with each move rated. `review` is the whole hand's, for its rating
-    and its expected result from when the chips went in; a saved hand's rating as `kept` is
-    shown instead, so the texts match its row."""
+    hand is over, and the `TEXT_MODES` texts to paste into a chat assistant. `review` is the
+    whole hand's, for its rating and its expected result from when the chips went in; a saved
+    hand's rating as `kept` is shown instead, so the texts match its row. `marks` holds the
+    decisions made after a hint and when the move timer ran out; `gods` the God's view numbers
+    of a finished hand's decisions, by history index."""
     user = runner.user_seat
     assert user is not None
     result = _result(hand, user, scale, review.all_in_net_bb if review else None)
-    plain, styled = seat_labels(runner, False), seat_labels(runner, True)
+    plain, styled = seat_labels(runner, False), _god_labels(runner)
     big_blind = hand.config.big_blind
-    moves = move_ratings(reviews, hinted or set())
+    moves = move_ratings(reviews, *marks)
     chance: float | None
     rating: float | None
     if kept is not None:
@@ -335,24 +401,71 @@ def _coach_json(
     else:  # a move checked has its chance but no rating of moves not shown; a hint has neither
         chance, rating = (reviews[-1].reference_equity.value if moves else None), None
     rated, summary = rated_hand_text(hand, user, moves, chance, rating, scale)
-    copy = hand_history_text(hand, user, styled, scale, game_name(runner), shows) + [""]
-    decisions = []
-    for number, decision in enumerate(reviews, 1):
-        mix = _strong_mix(hand, user, decision.index)
-        decisions.append(_decision_json(decision, plain, scale, big_blind, mix))
-        copy += plain_decision_text(number, decision, styled, scale, big_blind, mix) + [""]
-    copy += (rated + [""] if rated else []) + [summary] + ([result] if result else [])
-    history = plain_history(runner, hand, scale, shows)
+    mixes = [_strong_mix(hand, user, decision.index) for decision in reviews]
+    finished = is_terminal(hand)
+    decisions = [
+        _decision_json(d, plain, styled, scale, big_blind, mix, gods.get(d.index) if gods else None, finished)
+        for d, mix in zip(reviews, mixes)
+    ]
+    all_in = review.all_in_net_bb if review else None
     return {
-        "history": history,
+        "history": plain_history(runner, hand, scale, shows),
+        "god_history": (
+            hand_history_text(hand, user, styled, scale, game_name(runner), shows)
+            + held_text(hand, user, styled, shows)
+            if finished
+            else None
+        ),
+        "finished": finished,
+        "hides_styles": runner.config.hide_styles,
         "decisions": decisions,
+        "rated": rated,
         "result": result,
         "summary": summary if review is not None else None,
         "rating": rating,
         "band": None if rating is None else rating_band(rating),
-        "copy_text": "\n".join(copy).strip() + "\n",
-        "hand_text": _player_view(history, rated, summary, _result(hand, user, scale, None)),
+        "texts": {
+            mode: _copy_text(mode, runner, scale, hand, shows, reviews, mixes, gods, rated, summary, all_in)
+            for mode in TEXT_MODES
+        },
     }
+
+
+def _together(*works: Callable[[], Any]) -> tuple[Any, ...]:
+    return tuple(work() for work in works)
+
+
+def _copy_material(
+    runner: TableRunner,
+    profile: Profile,
+    hand: GameState,
+    moves: list[Task[DecisionReview]],
+    rating: Task[HandReview] | None,
+    god: Task[dict[int, GodView]] | None,
+    solver: bool,
+    seeing: bool,
+) -> tuple[list[DecisionReview], float | None, dict[int, GodView] | None]:
+    """Outside the lock: the reviews a copy text with the coach's numbers needs (`solver`), with
+    the hand's average from when the chips went in, and the God's view numbers (`seeing`), from
+    the background tasks, or worked out now for a hand whose tasks are gone."""
+    _wait_for(moves + ([rating] if rating is not None else []))
+    user = runner.user_seat
+    assert user is not None
+    reviews: list[DecisionReview] = []
+    all_in = None
+    if solver and (rating is not None or (not moves and is_terminal(hand))):
+        review = result_or(rating, partial(full_review, runner, hand, profile))
+        reviews, all_in = review.decisions, review.all_in_net_bb
+    elif solver:  # mid-hand: the moves reviewed so far
+        futures = [task.future for task in moves]
+        reviews = [f.result() for f in futures if not f.cancelled() and not f.exception()]
+    if not seeing:
+        return reviews, all_in, None
+    work = partial(god_review, runner, hand, profile)
+    try:
+        return reviews, all_in, result_or(god, work)
+    except CancelledError:  # dropped with the hand's other jobs when the next hand began
+        return reviews, all_in, work()
 
 
 @dataclass(frozen=True)
@@ -386,6 +499,7 @@ class WebTable(PlaySession):
         log: SessionLog | None,
         profile: Profile,
         coach: bool,
+        timer: int | None,
     ):
         self.lines: list[str] = []
         self.shows: dict[str, dict[int, tuple[int, int]]] = {}
@@ -395,6 +509,7 @@ class WebTable(PlaySession):
         self.chance_task: tuple[tuple[str, int], Task[dict[str, Any]]] | None = None
         self.day = date.today().isoformat()
         self.coach = coach
+        self.timer = timer
         super().__init__(TableRunner(config), scale, log, profile)
         self.name = log.path.stem if log is not None else f"web-{config.session.seed}"
 
@@ -428,7 +543,9 @@ class WebTable(PlaySession):
         mode = self.runner.config.session.mode.value.lower()
         # Pending first: a rating landing meanwhile is then read as in, never as missing.
         pending = {h.hand_id for h in hands if self.rating_pending(h.hand_id)}
-        rows = hand_rows(hands, user, self.scale, self.name, self.day, mode, [], self.histories, self.ratings)
+        rows = hand_rows(
+            hands, user, self.scale, self.name, self.day, mode, [], self.histories, self.ratings, self.hand_times
+        )
         return _page_rows(rows, hands, user, self.scale, self.ratings, pending, self.settled)
 
     def turn_started(self, hand: GameState, user: int):
@@ -466,7 +583,15 @@ class WebTable(PlaySession):
         if not isinstance(kind, str):
             raise WebError("the action needs a kind")
         legal = self.runner.user_legal_actions()
-        if kind == "allin":
+        if kind == "timeout":
+            hand = self.runner.hand
+            assert hand is not None
+            if payload.get("turn") != f"{hand.hand_id}:{len(hand.history)}":
+                raise WebError("that turn is over")
+            action = Action(ActionType.CHECK if legal.can_check else ActionType.FOLD)
+            self.note_timeout(hand.hand_id, len(hand.history))
+            self.say(f"Time ran out, so you {'checked' if legal.can_check else 'folded'}.")
+        elif kind == "allin":
             action = (
                 Action(ActionType.RAISE if legal.can_raise else ActionType.BET, legal.max_raise_to)
                 if legal.max_raise_to
@@ -566,6 +691,7 @@ class WebTable(PlaySession):
             "your_turn": runner.user_to_act(),
             "step": 1 / self.scale,  # the smallest chip amount, in the units shown
             "coach": self.coach,
+            "timer": self.timer,
             "hands": shown_hands,
             "pending": sum(r["pending"] for r in shown_hands),
             "hud_min_hands": MIN_HANDS,
@@ -591,7 +717,8 @@ class WebTable(PlaySession):
                 result["hand_number"] = int(view.hand_id.rpartition("-")[2])
 
         if runner.user_to_act():
-            assert view is not None
+            assert view is not None and hand is not None
+            result["turn"] = f"{hand.hand_id}:{len(hand.history)}"
             legal = runner.user_legal_actions()
             result["legal"] = {
                 "fold": legal.can_fold,
@@ -608,14 +735,20 @@ class WebTable(PlaySession):
             result["call_needs"] = thresholds(view).required_equity
         return result
 
-    def _answer(self, hand: GameState, found: DecisionReview | HandReview) -> dict[str, Any]:
-        """The coach's answer for one decision, or for the whole hand with its rating."""
+    def _answer(
+        self,
+        hand: GameState,
+        found: DecisionReview | tuple[HandReview, dict[int, GodView]],
+    ) -> dict[str, Any]:
+        """The coach's answer for one decision, or for the whole hand with its rating and God's
+        view numbers."""
         shows = self.shows.get(hand.hand_id, {})
         jobs = self.jobs.get(hand.hand_id)
-        hinted = jobs.hinted if jobs is not None else set()
-        if isinstance(found, HandReview):
-            return _coach_json(self.runner, self.scale, hand, found.decisions, shows, found, hinted)
-        return _coach_json(self.runner, self.scale, hand, [found], shows, None, hinted)
+        marks = (jobs.hinted, jobs.timed_out) if jobs is not None else (set(), set())
+        if isinstance(found, tuple):
+            review, gods = found
+            return _coach_json(self.runner, self.scale, hand, review.decisions, shows, review, marks, gods=gods)
+        return _coach_json(self.runner, self.scale, hand, [found], shows, None, marks)
 
     def hint(self) -> Later:
         if not self.coach:
@@ -645,11 +778,23 @@ class WebTable(PlaySession):
         playing = current is not None and not is_terminal(current)
         if hand is None or user is None or playing:
             raise WebError("a review needs a finished hand")
-        return Later(self.review_work(hand), partial(self._answer, hand), self)
 
-    def copy(self, number: int) -> Later:
-        """Hand `number` as the user saw it with its moves rated, once the reviews already
-        under way are done: a finished hand, or the hand being played so far."""
+    def review(self) -> Later:
+        """The user's last finished hand, which after a fast-forward is not the hand shown."""
+        hand, user, current = self.finished, self.runner.user_seat, self.runner.hand
+        playing = current is not None and not is_terminal(current)
+        if hand is None or user is None or playing:
+            raise WebError("a review needs a finished hand")
+        jobs = self.jobs.get(hand.hand_id)
+        god = partial(god_review, self.runner, hand, self.profile)
+        seeing = partial(result_or, jobs.god if jobs is not None else None, god)
+        return Later(partial(_together, self.review_work(hand), seeing), partial(self._answer, hand), self)
+
+    def copy(self, number: int, mode: str) -> Later:
+        """Hand `number` as one of the `TEXT_MODES` texts, once the reviews it needs are done: a
+        finished hand, or the hand being played so far."""
+        if mode not in TEXT_MODES:
+            raise KeyError(mode)
         hand_id, current = f"hand-{number}", self.runner.hand
         hand = self.hands.get(hand_id)
         if hand is None and current is not None and current.hand_id == hand_id:
@@ -657,12 +802,18 @@ class WebTable(PlaySession):
         if hand is None:
             raise WebError(f"no hand {number} to copy")
         jobs = self.jobs.get(hand_id)
-        tasks: list[Task[Any]] = [] if jobs is None else list(jobs.moves.values())
-        if jobs is not None and jobs.rating is not None:
-            tasks.append(jobs.rating)
-        return Later(partial(_wait_for, tasks), partial(self._copy_answer, hand), self)
+        moves = [jobs.moves[i] for i in sorted(jobs.moves)] if jobs is not None else []
+        rating, god = (jobs.rating, jobs.god) if jobs is not None else (None, None)
+        solver, seeing = mode.startswith("solver"), mode.endswith("god") and is_terminal(hand)
+        work = partial(_copy_material, self.runner, self.profile, hand, moves, rating, god, solver, seeing)
+        return Later(work, partial(self._copy_answer, hand, mode), self)
 
-    def _copy_answer(self, hand: GameState, waited: object) -> dict[str, Any]:
+    def _copy_answer(
+        self,
+        hand: GameState,
+        mode: str,
+        material: tuple[list[DecisionReview], float | None, dict[int, GodView] | None],
+    ) -> dict[str, Any]:
         user = self.runner.user_seat
         assert user is not None
         rated = self.ratings.get(hand.hand_id)
@@ -673,13 +824,16 @@ class WebTable(PlaySession):
             jobs = self.jobs.get(hand.hand_id)
             futures = [jobs.moves[i].future for i in sorted(jobs.moves)] if jobs is not None else []
             done = [f.result() for f in futures if f.done() and not f.cancelled() and not f.exception()]
-            moves = move_ratings(done, jobs.hinted if jobs is not None else set())
+            marks = (jobs.hinted, jobs.timed_out) if jobs is not None else (set(), set())
+            moves = move_ratings(done, *marks)
             chance = done[-1].reference_equity.value if done else None
         rating = hand_rating([(m.rating, m.stake) for m in moves]) if moves else None
         lines, summary = rated_hand_text(hand, user, moves, chance, rating, self.scale)
-        history = plain_history(self.runner, hand, self.scale, self.shows.get(hand.hand_id, {}))
-        result = _result(hand, user, self.scale, None)
-        return {"text": _player_view(history, lines, summary, result)}
+        reviews, all_in, gods = material
+        mixes = [_strong_mix(hand, user, review.index) for review in reviews]
+        shows = self.shows.get(hand.hand_id, {})
+        text = _copy_text(mode, self.runner, self.scale, hand, shows, reviews, mixes, gods, lines, summary, all_in)
+        return {"text": text}
 
     def chance(self) -> Later:
         """A training helper: the user's chance to win now, normally already worked out when
@@ -756,6 +910,7 @@ class _Saved:
         self.hands: list[GameState] = []
         self.shows: dict[str, dict[int, tuple[int, int]]] = {}
         self.ratings: dict[str, HandRating] = {}
+        self.started: dict[str, str] = {}
         self.histories: dict[str, str] = {}  # filled when the session's hands are first asked for
         self.settled: dict[str, dict[str, Any]] = {}  # page fields of rated hands, by id
         self.read(path)
@@ -778,12 +933,14 @@ class _Saved:
         except (KeyError, TypeError) as error:
             raise ValueError(f"damaged log: {error!r}") from error
         shows, ratings = logged_shows(records), logged_ratings(records)
+        started = logged_times(records)
         # Kept only once every new line has parsed, so a damaged one is met again, not skipped.
         self.offset = offset
         self.hands += hands
         for hand_id, shown in shows.items():
             self.shows.setdefault(hand_id, {}).update(shown)
         self.ratings.update(ratings)
+        self.started.update(started)
 
     @property
     def user(self) -> int:
@@ -841,10 +998,10 @@ class App:
             return table.hands_csv()
         if method == "GET" and command == "chance":
             return table.chance()
-        if method == "GET" and command == "hands" and len(parts) == 5 and parts[4] == "copy":
+        if method == "GET" and command == "hands" and len(parts) == 6 and parts[4] == "copy":
             if not parts[3].isdigit():
                 raise WebError("the hand number must be a whole number")
-            return table.copy(int(parts[3]))
+            return table.copy(int(parts[3]), parts[5])
         if method == "POST" and command == "action":
             table.act(payload)
             return table.state()
@@ -863,12 +1020,16 @@ class App:
         raise KeyError(parts)
 
     def _create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        timer = payload.get("timer")
+        low, high = TIMER_SECONDS
+        if timer is not None and (not isinstance(timer, int) or isinstance(timer, bool) or not low <= timer <= high):
+            raise WebError(f"pick {low} to {high} seconds per move, or leave it blank")
         try:
             args = parse_args(_session_argv(payload))
             config, scale = build_config(args)
             coach = args.hints if args.hints is not None else config.session.mode != Mode.TOURNAMENT
             log = SessionLog(self.log_dir / f"session-{config.session.seed}.jsonl") if self.log_dir else None
-            table = WebTable(config, scale, log, self.profile, coach)
+            table = WebTable(config, scale, log, self.profile, coach, timer)
             table.next_hand()
         except WebError:
             raise
@@ -947,6 +1108,7 @@ class App:
             self._decisions(),
             saved.histories,
             saved.ratings,
+            saved.started,
         )
         pending = rating - set(saved.ratings)
         return _page_rows(rows, hands, user, saved.scale, saved.ratings, pending, saved.settled)
@@ -1007,16 +1169,21 @@ class App:
             hand = next((h for h in saved.hands if h.hand_id == f"hand-{number}"), None)
             if hand is None:
                 raise WebError(f"no hand {number} in that session")
-            assert saved.runner is not None
-            work = partial(full_review, saved.runner, hand, self.profile)
+            runner = saved.runner
+            assert runner is not None
+            god = partial(god_review, runner, hand, self.profile)
+            work = partial(_together, partial(full_review, runner, hand, self.profile), god)
             return Later(work, partial(self._saved_answer, saved, hand))
         raise KeyError(parts)
 
-    def _saved_answer(self, saved: _Saved, hand: GameState, review: HandReview) -> dict[str, Any]:
+    def _saved_answer(
+        self, saved: _Saved, hand: GameState, done: tuple[HandReview, dict[int, GodView]]
+    ) -> dict[str, Any]:
         assert saved.runner is not None
+        review, gods = done
         shows = saved.shows.get(hand.hand_id, {})
         rated = saved.ratings.get(hand.hand_id)
-        return _coach_json(saved.runner, saved.scale, hand, review.decisions, shows, review, kept=rated)
+        return _coach_json(saved.runner, saved.scale, hand, review.decisions, shows, review, kept=rated, gods=gods)
 
     def _delete(self, paths: list[Path]) -> dict[str, Any]:
         """Delete saved sessions. A table still writing one is dropped first, its reviews

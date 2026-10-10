@@ -7,10 +7,10 @@ from   collections.abc          import Callable, Sequence
 import functools
 import math
 from   thpoker.analysis.ev      import OptionValue
-from   thpoker.analysis.review  import (DecisionReview, HandReview, MoveRating,
-                                        RATING_CLOSE, RangeView,
+from   thpoker.analysis.review  import (DecisionReview, GodView, HandReview,
+                                        MoveRating, RATING_CLOSE, RangeView,
                                         SessionSummary, best_option,
-                                        position_names)
+                                        hindsight_best, position_names)
 from   thpoker.analysis.training \
                                 import Calibration, RECENT
 from   thpoker.game.cards       import RANKS, cards_str
@@ -416,25 +416,68 @@ def _icm_or_ev(option: OptionValue, tournament: bool) -> float:
 
 
 def decision_summary(review: DecisionReview, scale: int, big_blind: int) -> list[str]:
-    """The two or three lines a newcomer reads under the headline."""
-    error = "" if review.equity.exact else f" (± {_share(review.equity.stderr)})"
+    """The two or three lines a newcomer reads under the headline, from what the user could know:
+    the others' hands as a strong player reads them, not the bots' styles."""
+    equity = review.reference_equity
+    error = "" if equity.exact else f" (± {_share(equity.stderr)})"
     lines = [] if review.chosen is None else [f"Rated {review.rating():.2f} of 1 (1 is the best option you had)."]
-    lines.append(f"You win about {_share(review.equity.value)}{error} of the time against the hands they likely hold.")
+    lines.append(
+        "Your chance at showdown against the hands a strong player would put them on: about "
+        f"{_share(equity.value)}{error}."
+    )
     required = review.thresholds.required_equity
     if required is not None:
         to_call = _chips(review.situation.to_call_bb, big_blind, scale)
         lines.append(f"Calling costs {to_call}: it pays if you win at least {_share(required)} of the time.")
+    return lines
+
+
+def god_summary(review: DecisionReview, god: GodView | None, scale: int) -> list[str]:
+    """God's view lines under the summary: the chance against the hands the bots' styles would
+    hold, the better play against these bots, and with their cards known (`god`), the chance
+    against those cards and the move that would have won more in hindsight."""
+    error = "" if review.equity.exact else f" (± {_share(review.equity.stderr)})"
+    lines = [f"Against the hands these players' styles would hold here: about {_share(review.equity.value)}{error}."]
     if review.exploit_spot():
         best_bot = best_option(review.exploitative, review.tournament)
         lines.append(
             f"Against these particular opponents, {describe_action(best_bot.action, scale)} does better than the standard play."
         )
+    if god is None:
+        return lines
+    about = "" if god.equity.exact else "about "
+    lines.append(f"Against the cards they really held: {about}{_share(god.equity.value)}.")
+    best = hindsight_best(review, god) if review.chosen is not None else None
+    if best is not None:
+        chosen = next(o for o in god.options if o.action == review.chosen)
+        estimate = "" if best.exact and chosen.exact else " (an estimate)"
+        lines.append(
+            f"Seeing their cards, {describe_action(best.action, scale)} would have won more"
+            f"{estimate}. You couldn't see them, so the rating stands."
+        )
+    return lines
+
+
+def range_lines(ranges: dict[int, RangeView], labels: dict[int, str], lead: str = "") -> list[str]:
+    """What each opponent likely holds, opponents who read the same named together."""
+    alike: dict[str, list[str]] = {}
+    for seat, view in ranges.items():
+        groups = ""
+        if view.groups is not None:
+            groups = (
+                " (" + ", ".join(f"{_GROUP_WORDS[name]} {_share(share)}" for name, share in view.groups.items()) + ")"
+            )
+        alike.setdefault(f"about {_share(view.width)} of all starting hands{groups}", []).append(labels[seat])
+    lines = []
+    for holding, names in alike.items():
+        who = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+        lines.append(f"{lead}{who} likely {'holds' if len(names) == 1 else 'each hold'} {holding}.")
     return lines
 
 
 def decision_details(review: DecisionReview, labels: dict[int, str], scale: int, big_blind: int) -> list[str]:
-    """Everything else, in words: the spot, the board, what each opponent likely holds, and the
-    break-even numbers."""
+    """Everything else, in words: the spot, the board, what each opponent likely holds as a strong
+    player reads them, and the break-even numbers."""
     spot = review.situation
     after = "last" if spot.in_position else "first"
     where = (
@@ -454,17 +497,7 @@ def decision_details(review: DecisionReview, labels: dict[int, str], scale: int,
         words = [_TEXTURE_WORDS[t] for t in (tags.high, tags.pairing, tags.suits, tags.connectivity)]
         change = f"; {_TEXTURE_WORDS[tags.change]}" if tags.change else ""
         lines.append(f"The board: {', '.join(words)}{change}.")
-    alike: dict[str, list[str]] = {}  # opponents who read the same, named together
-    for seat, view in review.ranges.items():
-        groups = ""
-        if view.groups is not None:
-            groups = (
-                " (" + ", ".join(f"{_GROUP_WORDS[name]} {_share(share)}" for name, share in view.groups.items()) + ")"
-            )
-        alike.setdefault(f"about {_share(view.width)} of all starting hands{groups}", []).append(labels[seat])
-    for holding, names in alike.items():
-        who = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
-        lines.append(f"{who} likely {'holds' if len(names) == 1 else 'each hold'} {holding}.")
+    lines += range_lines(review.reference_ranges, labels)
     if review.percentile is not None:
         lines.append(f"Your hand is stronger than {_share(review.percentile)} of the hands you would likely have here.")
     defense = review.thresholds.defense_share
@@ -478,21 +511,25 @@ def decision_details(review: DecisionReview, labels: dict[int, str], scale: int,
         )
     if review.reference_note is not None:
         lines.append(f"The strong-player numbers here come from a {review.reference_note}.")
-    if not all(o.exact for o in review.exploitative + review.reference):
+    if not all(o.exact for o in review.reference):
         lines.append("Numbers with ± are estimates from sampling: options closer than that are too close to call.")
     if not review.tournament:
         lines.append(f"1 big blind = {_chips(1, big_blind, scale)} chips.")
     return lines
 
 
-def plain_decision_text(
+def solver_decision_text(
     number: int,
     review: DecisionReview,
     labels: dict[int, str],
     scale: int,
     big_blind: int,
     mix: dict[Action, float],
+    styled: dict[int, str] | None,
+    god: GodView | None,
 ) -> list[str]:
+    """One decision with the coach's numbers, from what the user could know; with `styled`
+    (God's view, seat names with styles) also the bots' styles and, from `god`, their cards."""
     board = pretty_cards(review.board) if review.board else "none yet"
     chose = "" if review.chosen is None else f"; you chose {describe_action(review.chosen, scale)}"
     lines = [
@@ -500,27 +537,56 @@ def plain_decision_text(
         decision_headline(review, scale, big_blind, mix),
     ]
     lines += decision_summary(review, scale, big_blind)
+    if styled is not None:
+        lines += god_summary(review, god, scale)
     lines += decision_details(review, labels, scale, big_blind)
+    if styled is not None:
+        lines += range_lines(review.ranges, styled, "By their styles, ")
     unit = "share of the prize pool" if review.tournament else "chips"
+    columns = ["against a strong player"]
+    if styled is not None:
+        columns += ["against these players' styles", "against the cards they held, in hindsight"]
+    lines.append(f"Options (average result in {unit}: {' | '.join(columns)} | how often a strong player does it):")
     best = best_option(review.reference, review.tournament).action
-    reference = {o.action: o for o in review.reference}
-    lines.append(
-        f"Options (average result in {unit}: against these bots | against a strong player | how often a strong player does it):"
-    )
-    for option in review.exploitative:
+    bots = {o.action: o for o in review.exploitative}
+    cards = {o.action: o for o in god.options} if god is not None else {}
+    for option in review.reference:
         marks = [
             m
             for m, on in (
                 ("your choice", option.action == review.chosen),
-                ("best", option.action == best),
+                ("best against a strong player", option.action == best),
             )
             if on
         ]
+        values = [_worth(option, review, big_blind, scale)]
+        if styled is not None:
+            values.append(_worth(bots[option.action], review, big_blind, scale))
+            held = cards.get(option.action)
+            values.append("-" if held is None else _worth(held, review, big_blind, scale))
         lines.append(
-            f"  {describe_action(option.action, scale)}: {_worth(option, review, big_blind, scale)} | "
-            f"{_worth(reference[option.action], review, big_blind, scale)} | {_share(mix.get(option.action, 0.0))}"
+            f"  {describe_action(option.action, scale)}: {' | '.join(values)} | {_share(mix.get(option.action, 0.0))}"
             + (f" ({', '.join(marks)})" if marks else "")
         )
+    return lines
+
+
+def held_text(hand: GameState, user: int, labels: dict[int, str], shown: dict[int, tuple[int, int]]) -> list[str]:
+    """For God's view of a finished hand: the cards each opponent held that the user never saw."""
+    lines = []
+    for seat, cards in enumerate(hand.hole_cards):
+        if seat == user or not hand.dealt_in[seat] or seat in hand.shown or seat in shown:
+            continue
+        assert cards is not None
+        folds = [e.street for e in hand.history if e.seat == seat and e.action.type == ActionType.FOLD]
+        how = (
+            "didn't have to show"
+            if not folds
+            else "folded before the flop"
+            if folds[0] == Street.PREFLOP
+            else f"folded on the {_STREET_WORDS[folds[0]].lower()}"
+        )
+        lines.append(f"{labels[seat]} held {pretty_cards(cards)} ({how}).")
     return lines
 
 
@@ -544,8 +610,9 @@ def rated_moves_text(hand: GameState, user: int, moves: Sequence[MoveRating], sc
     for move in moves:
         entry = hand.history[move.history_index]
         words = _move_text(entry.action, user, states[move.history_index], "you", True, chips)
-        hinted = " (after a hint)" if move.hinted else ""
-        lines.append(f"  {_STREET_WORDS[entry.street]}: {words}, rated {move.rating:.2f}{hinted}")
+        marks = " (after a hint)" if move.hinted else ""
+        marks += " (time ran out)" if move.timed_out else ""
+        lines.append(f"  {_STREET_WORDS[entry.street]}: {words}, rated {move.rating:.2f}{marks}")
     return lines
 
 

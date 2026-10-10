@@ -3,6 +3,7 @@ import http.client
 import io
 import json
 import pytest
+import re
 from   thpoker.analysis.ev      import PROFILES
 import thpoker.analysis.review
 from   thpoker.bots.equity_bot  import public_seed
@@ -215,6 +216,13 @@ def test_the_server_answers_malformed_and_foreign_requests_without_dropping_them
         server.server_close()
 
 
+def known(decision: dict[str, Any]) -> dict[str, Any]:
+    """A decision as the page shows it before the hand is over: without God's view."""
+    hidden = ("vs_bots", "vs_bots_noise", "vs_cards", "vs_cards_noise")
+    options = [{k: v for k, v in o.items() if k not in hidden} for o in decision["options"]]
+    return {k: v for k, v in decision.items() if not k.startswith("god_")} | {"options": options}
+
+
 def hidden_cards(app: App, key: str) -> set[str]:
     """The bots' cards in the current hand that were never shown, as the page writes cards."""
     table = app.tables[key]
@@ -241,37 +249,62 @@ def test_the_move_check_matches_the_hand_review_and_counts_as_a_hint(tmp_path):
     went_on = state["your_turn"]
     checked = call(app, "POST", ["sessions", key, "analyze"], {})
     hidden = hidden_cards(app, key)
-    assert hidden and not any(card in checked["copy_text"] for card in hidden)
-    # The hand as played so far with the move rated, for the copy without the coach; the log's
-    # copy has every move rated so far.
+    texts = checked["texts"]
+    assert hidden and not any(card in text for text in texts.values() for card in hidden)
+    # Mid-hand, God's view adds nothing: the bots' cards and styles wait for the end of the hand.
+    assert (texts["god"], texts["solver_god"]) == (texts["plain"], texts["solver"])
+    # A hint and a move check read only what the player could know: no styles, nothing from them.
+    assert not any(word in str(hint) + str(checked) for word in STYLE_WORDS.values())
+    for decision in (hint, *checked["decisions"]):
+        assert all(o["vs_bots"] is None and o["vs_cards"] is None for o in decision["options"])
+        assert decision["god_summary"] is decision["god_details"] is decision["god_ranges"] is None
+    # The hand as played so far with the move rated; the table's copy has every move rated so far.
     played = "\n".join(checked["history"]) + "\n"
     rated = "rated " + checked["decisions"][0]["summary"][0].split()[1]  # "Rated 0.97 of 1 ..."
-    assert checked["hand_text"].startswith(played) and rated in checked["hand_text"]
+    assert texts["plain"].startswith(played) and rated in texts["plain"]
     number = call(app, "GET", ["sessions", key], {})["hand_number"]
-    copied = call(app, "GET", ["sessions", key, "hands", str(number), "copy"], {})["text"]
+    copy = ["sessions", key, "hands", str(number), "copy"]
+    copied = call(app, "GET", [*copy, "plain"], {})["text"]
     assert copied.startswith(played) and rated in copied
     assert not any(card in copied for card in hidden)
+    assert call(app, "GET", [*copy, "solver_god"], {})["text"] == call(app, "GET", [*copy, "solver"], {})["text"]
+    with pytest.raises(KeyError):
+        app.handle("GET", [*copy, "everything"], {})
     # Fold to any bet (checking when it is free). With seed 8 a bot folds before the user acts,
     # so its cards are never shown.
     while state["your_turn"]:
         kind = "fold" if state["legal"]["call"] is not None else "check"
         state = call(app, "POST", ["sessions", key, "action"], {"kind": kind})
     reviewed = call(app, "POST", ["sessions", key, "review"], {})
-    # The first decision of the hand, checked right after it, reads as the review reads it later.
-    assert checked["decisions"][0] == reviewed["decisions"][0]
+    # The first decision of the hand, checked right after it, reads as the review reads it later,
+    # which adds God's view now that the hand is over.
+    assert known(checked["decisions"][0]) == known(reviewed["decisions"][0])
     hidden = hidden_cards(app, key)
-    assert hidden and not any(card in reviewed["copy_text"] for card in hidden)
+    texts = reviewed["texts"]
+    assert hidden and not any(card in texts[m] for m in ("plain", "solver") for card in hidden)
+    # God's view, once the hand is over, names each bot with its style and the cards it held.
+    for mode in ("god", "solver_god"):
+        assert all(card in texts[mode] for card in hidden) and " held " in texts[mode]
+        assert any(word in texts[mode] for word in STYLE_WORDS.values())
+    assert reviewed["finished"] and all(o["vs_cards"] is not None for d in reviewed["decisions"] for o in d["options"])
+    copy = ["sessions", key, "hands", str(number), "copy"]
+    for mode, text in texts.items():
+        assert call(app, "GET", [*copy, mode], {})["text"] == text
     row = call(app, "GET", ["sessions", key], {})["hands"][-1]
     assert f"your cards {pretty_cards(parse_cards(row['cards']))}" in row["history"]
     assert not any(card in row["history"] for card in hidden)
-    lines = reviewed["hand_text"].splitlines()
+    lines = texts["plain"].splitlines()
     assert lines[: len(reviewed["history"])] == reviewed["history"]
     assert lines[-2] == reviewed["summary"] and reviewed["result"].startswith(lines[-1])
     assert "With the cards" not in lines[-1]  # the all-in average is the coach's, not the hand's
-    # The player's view: no option values, ranges or styles, only the ratings.
-    words = ("Options", "likely hold", *STYLE_WORDS.values())
-    assert not any(word in reviewed["hand_text"] for word in words)
-    assert reviewed["summary"] in reviewed["copy_text"]
+    # The player's view: no option values, ranges or styles, only the ratings. The coach's
+    # numbers come from what the player could know, so still no styles; God's view adds them.
+    styles = tuple(STYLE_WORDS.values())
+    assert not any(word in texts["plain"] for word in ("Options", "likely hold", *styles))
+    assert "Options" in texts["solver"] and not any(word in texts["solver"] for word in styles)
+    assert "Options" not in texts["god"]
+    assert "against the cards they held, in hindsight" in texts["solver_god"]
+    assert reviewed["summary"] in texts["solver"]
     (log,) = tmp_path.glob("session-*.jsonl")
     hints = [r for r in read_session_log(log) if r["type"] == "hint"]
     assert len(hints) == 1 + went_on  # the hint, and the check if play went on
@@ -306,7 +339,7 @@ def test_no_move_is_reviewed_twice(monkeypatch):
         pytest.fail("no hand with two decisions")
     reviewed = call(app, "POST", ["sessions", key, "review"], {})["decisions"]
     REVIEWS.submit(int).result()
-    assert reviewed == checked
+    assert [known(d) for d in reviewed] == [known(d) for d in checked]
     hand = app.tables[key].finished
     assert hand is not None and len(computed) == len(set(computed))
     mine = [i for i, e in enumerate(hand.history) if e.seat == 0]
@@ -472,9 +505,9 @@ def test_past_sessions_read_back_the_same_hands_as_the_live_table(tmp_path):
     # The review highlights the hand's rating as its row gives it, in the band of its verdicts.
     shown = round(weighted, 2)
     band = "best" if shown == 1 else "close" if shown >= 0.75 else "mistake"
-    assert (round(review["rating"], 2), review["band"], row["band"]) == (row["rating"], band, band)
-    assert review["copy_text"].startswith("No-limit Texas Hold'em cash game")
-    assert review["copy_text"].count(review["result"]) == 1 and review["result"] not in review["history"]
+    assert review["texts"]["solver"].startswith("No-limit Texas Hold'em cash game")
+    assert review["texts"]["solver"].count(review["result"]) == 1 and review["result"] not in review["history"]
+    assert review["finished"] and " held " in review["texts"]["god"]
     everything = app.handle("GET", ["history.csv"], {})
     assert isinstance(everything, Download)
     *_, exported = csv.DictReader(io.StringIO(everything.text))
@@ -541,7 +574,7 @@ def test_ticked_sessions_are_deleted_together_and_nothing_brings_them_back(tmp_p
 def test_the_state_counts_the_chips_in_the_pot_the_pot_odds_and_the_hand_result():
     # A 10-chip big-blind ante: dead money, in the pot but in nobody's bet.
     argv = ["--seats", "3", "--tier", "1", "--seed", "8", "--ante", "10", "--ante-type", "bb-ante"]
-    table = WebTable(*build_config(parse_args(argv)), None, PROFILES["pc"], True)
+    table = WebTable(*build_config(parse_args(argv)), None, PROFILES["pc"], True, None)
     table.next_hand()
     for _ in range(10):  # deal until the user faces a bet
         state = table.state()
@@ -600,3 +633,73 @@ def test_the_decision_json_counts_chips_on_the_table_or_shares_of_the_prize_pool
     tournament = _decision_json(fold_to_a_bet(True), {}, 1, 100, mix)
     assert tournament["unit"] == "% of the prize pool"
     assert [o["vs_bots"] for o in tournament["options"]] == [30, 33, 31]
+
+
+def test_the_decision_json_counts_chips_on_the_table_or_shares_of_the_prize_pool():
+    mix = {Action(ActionType.CALL): 0.75}
+    cash = _decision_json(fold_to_a_bet(False), {}, {}, 1, 100, mix, None, True)["options"]
+    assert [(o["vs_bots"], o["vs_bots_noise"], o["strong_share"], o["vs_cards"]) for o in cash] == [
+        (0, 0, 0, None),
+        (150, 10, 0.75, None),
+        (25, 10, 0, None),
+    ]
+    small = _decision_json(fold_to_a_bet(False), {}, {}, 100, 100, mix, None, True)["options"]
+    assert [o["vs_strong"] for o in small] == [0, 1.5, 0.25]  # blinds 0.5/1
+    unfinished = _decision_json(fold_to_a_bet(False), {}, {}, 1, 100, mix, None, False)
+    assert [o["vs_bots"] for o in unfinished["options"]] == [None] * 3
+    tournament = _decision_json(fold_to_a_bet(True), {}, {}, 1, 100, mix, None, True)
+    assert tournament["unit"] == "% of the prize pool"
+    assert [o["vs_bots"] for o in tournament["options"]] == [30, 33, 31]
+
+
+def test_a_move_timer_checks_when_it_can_and_folds_otherwise(tmp_path):
+    app = App(tmp_path)
+    for timer in (9, 1001, True, 30.0):
+        with pytest.raises(WebError, match="seconds per move"):
+            call(app, "POST", ["sessions"], {**SETUP, "timer": timer})
+    created = call(app, "POST", ["sessions"], {**SETUP, "timer": 30})
+    key = your_turn(app, created["id"])
+    assert created["state"]["timer"] == 30
+    done: set[ActionType] = set()
+    for _ in range(30):
+        state = call(app, "GET", ["sessions", your_turn(app, key)], {})
+        while state["your_turn"]:
+            turn = state["turn"]
+            kind = ActionType.CHECK if state["legal"]["check"] else ActionType.FOLD
+            if kind in done:
+                answer = {"kind": "check" if kind == ActionType.CHECK else "call"}
+                state = call(app, "POST", ["sessions", key, "action"], answer)
+                continue
+            with pytest.raises(WebError, match="turn is over"):
+                call(
+                    app,
+                    "POST",
+                    ["sessions", key, "action"],
+                    {"kind": "timeout", "turn": "hand-0:0"},
+                )
+            state = call(app, "POST", ["sessions", key, "action"], {"kind": "timeout", "turn": turn})
+            hand = app.tables[key].runner.hand
+            assert hand is not None and hand.history[int(turn.rpartition(":")[2])].action.type == kind
+            word = "checked" if kind == ActionType.CHECK else "folded"
+            assert f"Time ran out, so you {word}." in state["log"]
+            done.add(kind)
+        if len(done) == 2:
+            break
+        call(app, "POST", ["sessions", key, "next"], {})
+    else:
+        pytest.fail("no free check and no bet to face in 30 hands")
+    REVIEWS.submit(int).result()
+    (log,) = tmp_path.glob("session-*.jsonl")
+    records = read_session_log(log)
+    logged = {(r["hand_id"], r["index"]) for r in records if r["type"] == "timeout"}
+    rated = {
+        (r["hand_id"], m["history_index"])
+        for r in records
+        if r["type"] == "rating"
+        for m in r["moves"]
+        if m["timed_out"]
+    }
+    assert len(logged) == 2 and rated == logged
+    # Every hand has its UTC start time in the log.
+    hands = [r for r in records if r["type"] == "hand"]
+    assert hands and all(re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", h["started"]) for h in hands)

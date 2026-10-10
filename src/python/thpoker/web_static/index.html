@@ -77,6 +77,12 @@
           <label title="Empty for 100: 10,000 chips with 50/100 blinds">Starting chips (big blinds)
             <input name="stack" type="number" min="1" step="1" placeholder="100">
           </label>
+          <label>Time limit per move (seconds)
+            <input name="timer" type="number" min="10" max="1000" step="1" placeholder="No limit"
+              aria-describedby="timer-hint">
+          </label>
+          <small id="timer-hint" class="hint-line">Leave blank to play without a clock. When time runs out
+            you check if you can, otherwise you fold.</small>
         </details>
         <button type="submit" class="primary">Start playing</button>
       </form>
@@ -107,6 +113,7 @@
           <span id="presets"></span>
         </div>
         <div id="between"></div>
+        <span id="clock-live" class="visually-hidden" aria-live="polite"></span>
         <p class="error" id="table-error" role="alert"></p>
       </div>
       <div id="chance-mode" role="radiogroup" aria-labelledby="chance-mode-title" hidden>
@@ -116,13 +123,25 @@
         <label title="Guess it on every turn, then see it. Your guesses aren't saved."><input type="radio" name="chance"
             value="guess"> Guess first</label>
       </div>
+      <div class="copy-host">
+        <div class="review-switches" role="group" aria-label="Reviews and copies">
+          <span>Reviews and copies:</span>
+          <label class="switch" title="Show the coach's numbers for every decision, in hand reviews and copies"><input
+              type="checkbox" name="solver"> Solver</label>
+          <label class="switch god-switch"
+            title="Also show the bots' styles and cards, and the numbers knowing them (finished hands)"><input
+              type="checkbox" name="god"> God's view</label>
+          <span class="tools" id="copy-tools"></span>
+        </div>
+        <p id="god-later" class="hint-line" hidden>Their cards and styles show once the hand is over.</p>
+      </div>
       <div id="panels">
         <section class="panel">
-          <h2>Hand log <span class="tools" id="log-tools"></span></h2>
+          <h2>Hand log</h2>
           <div id="log"></div>
         </section>
         <section class="panel" id="coach-panel" hidden>
-          <h2>Coach <span class="tools" id="coach-tools"></span></h2>
+          <h2>Coach</h2>
           <div id="coach"></div>
         </section>
       </div>
@@ -144,7 +163,16 @@
       <div id="sessions"></div>
       <div id="session-hands"></div>
       <section class="panel" id="history-coach-panel" hidden>
-        <h2>Review <span class="tools" id="history-tools"></span></h2>
+        <h2>Review</h2>
+        <div class="review-switches" role="group" aria-label="Reviews and copies">
+          <span>Reviews and copies:</span>
+          <label class="switch" title="Show the coach's numbers for every decision, in hand reviews and copies"><input
+              type="checkbox" name="solver"> Solver</label>
+          <label class="switch god-switch"
+            title="Also show the bots' styles and cards, and the numbers knowing them (finished hands)"><input
+              type="checkbox" name="god"> God's view</label>
+          <span class="tools" id="history-tools"></span>
+        </div>
         <div id="history-coach"></div>
       </section>
     </section>
@@ -153,11 +181,11 @@
       <summary>Poker words</summary>
       <dl>
         <dt>Blinds</dt>
-        <dd>Two forced bets made before the cards are dealt, so there is always something to win: the small blind, and
-          the big blind (usually twice as much). They move one seat each hand.</dd>
+        <dd>Two forced bets made before the cards are dealt, so there is always something to win: the small
+          blind, and the big blind (usually twice as much). They move one seat each hand.</dd>
         <dt>Big blind</dt>
-        <dd>The larger forced bet. Amounts are often counted in big blinds: with 50/100 blinds, 10,000 chips is 100 big
-          blinds.</dd>
+        <dd>The larger forced bet. Amounts are often counted in big blinds: with 50/100 blinds, 10,000 chips is
+          100 big blinds.</dd>
         <dt>Pot</dt>
         <dd>All the chips bet so far in the hand. The winner takes it.</dd>
         <dt>Check</dt>
@@ -165,29 +193,30 @@
         <dt>Call</dt>
         <dd>Match the current bet to stay in the hand.</dd>
         <dt>Bet, raise</dt>
-        <dd>Put chips in first (bet), or more than the current bet (raise). The others must then call, raise or fold.
-        </dd>
+        <dd>Put chips in first (bet), or more than the current bet (raise). The others must then call, raise or
+          fold.</dd>
         <dt>Fold</dt>
         <dd>Give up the hand. You lose the chips you have already put in, but nothing more.</dd>
         <dt>All-in</dt>
         <dd>Bet every chip you have left.</dd>
         <dt>Dealer</dt>
-        <dd>The button (D) marks the dealer. The dealer acts last after the flop, which is an advantage: you see what
-          the others do first.</dd>
+        <dd>The button (D) marks the dealer. The dealer acts last after the flop, which is an advantage: you see
+          what the others do first.</dd>
         <dt>Position</dt>
-        <dd>Where you sit relative to the dealer. Acting later is better, because you know more when you decide. First
-          to act is called UTG, then come the hijack (HJ), the cutoff (CO), the dealer (BTN) and the blinds (SB, BB).
-        </dd>
+        <dd>Where you sit relative to the dealer. Acting later is better, because you know more when you decide.
+          First to act is called UTG, then come the hijack (HJ), the cutoff (CO), the dealer (BTN) and the
+          blinds (SB, BB).</dd>
         <dt>Flop, turn, river</dt>
-        <dd>The shared cards: three at once (the flop), then a fourth (the turn), then a fifth (the river). There is a
-          round of betting before and after each.</dd>
+        <dd>The shared cards: three at once (the flop), then a fourth (the turn), then a fifth (the river).
+          There is a round of betting before and after each.</dd>
         <dt>Pot odds</dt>
-        <dd>What a call costs compared with what you can win. If calling 100 into a pot of 200 needs you to win 1 time
-          in 3 (33%), and you win more often than that, the call pays.</dd>
+        <dd>What a call costs compared with what you can win. If calling 100 into a pot of 200 needs you to win
+          1 time in 3 (33%), and you win more often than that, the call pays.</dd>
         <dt>Chance to win</dt>
         <dd>How often your hand would win against the hands the others likely hold, if all the cards were dealt.
           Also called equity. On each player you'll also see your chance against that player alone. In Your
-          hands it is your chance at your last move, reading the others' hands from their play the way a strong
+          hands it is your chance at your last move, reading the others' hands from their play the way a
+          strong
           player would, so it can differ from the chance shown during play.</dd>
         <dt>Top %</dt>
         <dd>Your two starting cards are in this top share of all starting hands: lower is stronger, and aces
@@ -199,8 +228,14 @@
         <dt>Likely hands</dt>
         <dd>The hands a player could have, given what they have done so far. Also called a range.</dd>
         <dt>Average result</dt>
-        <dd>What an option wins or loses on average if you played the same spot many times. Also called expected value,
-          or EV.</dd>
+        <dd>What an option wins or loses on average if you played the same spot many times. Also called expected
+          value, or EV.</dd>
+        <dt>Solver</dt>
+        <dd>The coach's numbers for each of your decisions in a hand review or a copy: your chance to win and
+          what each option averages, all from what you could know at the table.</dd>
+        <dt>God's view</dt>
+        <dd>After a hand, the same numbers also using what you couldn't know: the bots' styles and the cards
+          they held. It never changes your rating.</dd>
         <dt>Strong player</dt>
         <dd>The trainer's model of a solid opponent. Your moves are judged by how they do against it.</dd>
         <dt>Tight, loose, aggressive</dt>

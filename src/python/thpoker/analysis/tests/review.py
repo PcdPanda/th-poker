@@ -1,14 +1,15 @@
 from   dataclasses              import replace
 import numpy as np
 import pytest
-from   thpoker.analysis.ev      import OptionValue, PROFILES
+from   thpoker.analysis.ev      import MIN_BRANCH, OptionValue, PROFILES
 from   thpoker.analysis.review  import (DecisionReview, TRIAGE_BRANCH,
-                                        all_in_net, hand_rating, hint,
-                                        move_ratings, needs_full_review,
-                                        position_names, range_view,
-                                        rating_band, review_decision,
-                                        review_hand, situation, summarize,
-                                        thresholds, with_choice)
+                                        all_in_net, god_views, hand_rating,
+                                        hindsight_best, hint, move_ratings,
+                                        needs_full_review, position_names,
+                                        range_view, rating_band,
+                                        review_decision, review_hand,
+                                        situation, summarize, thresholds,
+                                        with_choice)
 from   thpoker.analysis.tests.tracking \
                                 import Calls, REFERENCE
 from   thpoker.bots.abstraction import AbstractAction, legal_abstract_actions
@@ -398,7 +399,7 @@ def test_a_short_stack_facing_a_shove_plays_for_what_it_can_cover():
     decision = replace(base, situation=spot, reference=options, exploitative=options, chosen=FOLD)
     # Folding away 3 big blinds in a 30 big blind pot: 0.7 * (1 - 3 / 4.8) + 0.3 * (1 - ln(7) / ln(201)).
     assert decision.rating() == pytest.approx(0.3 * (1 - np.log(7) / np.log(201)))
-    assert move_ratings([decision], set())[0].stake == 30.0
+    assert move_ratings([decision], set(), set())[0].stake == 30.0
 
 
 def test_a_hand_rating_weights_each_move_by_the_chips_at_stake():
@@ -422,3 +423,24 @@ def test_a_review_made_before_acting_completes_with_the_action_taken():
     betting = review_decision(play(before, bet), 1, bots, REFERENCE, 2, None, TRIAGE_BRANCH, None)
     assert with_choice(ahead, before, bet) == betting
     assert with_choice(ahead, before, Action(ActionType.BET, 123)) is None
+
+
+def test_gods_view_values_a_decision_knowing_the_cards_the_bot_held():
+    # The bot holds a royal flush on the river and bets the pot; the user calls with eights.
+    state = heads_up("JhTh", "8c8d", "AhKhQh2c3d")
+    called = play(state, CALL, CHECK, *[CHECK] * 4, CHECK, Action(ActionType.BET, 200), CALL)
+    bots = {0: BetsTheRiver()}
+    review = review_hand(called, 1, bots, REFERENCE).decisions[-1]
+    views = god_views(called, 1, bots, REFERENCE, None, MIN_BRANCH)
+    god = views[review.index]
+    god = god_views(called, 1, bots, REFERENCE, None, MIN_BRANCH)[review.index]
+    # Against the royal flush the eights never win: the call loses the 2 big blind bet.
+    assert (god.equity.value, god.equity.exact) == (0.0, True)
+    values = {o.action: o.ev for o in god.options}
+    assert values[CALL] == pytest.approx(-2.0) and values[FOLD] == pytest.approx(0.0)
+    best = hindsight_best(review, god)
+    assert best is not None and best.action == FOLD
+    # Heads-up, the turn counts every river card; the flop samples its runouts.
+    views = god_views(called, 1, bots, REFERENCE, None, MIN_BRANCH)
+    by_street = {called.history[i].street: view.equity.exact for i, view in views.items()}
+    assert (by_street[Street.TURN], by_street[Street.FLOP]) == (True, False)

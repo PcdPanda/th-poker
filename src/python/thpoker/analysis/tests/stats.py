@@ -15,8 +15,8 @@ from   thpoker.analysis.tests.tracking \
 from   thpoker.bots.abstraction import AbstractAction, legal_abstract_actions
 from   thpoker.bots.bot         import Bot, PRESETS
 from   thpoker.game.engine      import new_hand
-from   thpoker.game.state       import (Action, ActionType, GameConfig, AnteType,
-                                        Observation, Street)
+from   thpoker.game.state       import (Action, ActionType, AnteType,
+                                        GameConfig, Observation, Street)
 from   thpoker.game.tests.decks import (CALL, CHECK, FOLD, heads_up, play,
                                         stacked_deck)
 from   thpoker.odds             import hand_rank
@@ -203,11 +203,13 @@ def test_hand_rows_count_the_chips_put_in_and_join_the_review():
         {"hand-7": "You raise to 300."},
         # The raise was worth 1.5 big blinds at stake and rated 0.6; the call 6 and rated 1.
         {"hand-7": HandRating(0.4321, (MoveRating(0, 0.6, 1.5, False), MoveRating(2, 1.0, 6.0, True)))},
+        {"hand-7": "2026-01-02T03:04:05Z"},
     )
     picked = [
         {
             k: row[k]
             for k in (
+                "started_utc",
                 "position",
                 "put_in",
                 "result",
@@ -222,6 +224,7 @@ def test_hand_rows_count_the_chips_put_in_and_join_the_review():
     ]
     assert picked == [
         {
+            "started_utc": "2026-01-02T03:04:05Z",
             "position": "BTN",
             "put_in": 300,
             "result": -300,
@@ -232,6 +235,7 @@ def test_hand_rows_count_the_chips_put_in_and_join_the_review():
             "loss_bb": 1.5,
         },
         {
+            "started_utc": "",
             "position": "BTN",
             "put_in": 100,
             "result": 100,
@@ -248,14 +252,12 @@ def test_hand_rows_count_the_chips_put_in_and_join_the_review():
     write_hands_csv([{**rows[0], "page_only": "not written"}], stream)
     assert stream.getvalue().splitlines() == [
         ",".join(HAND_COLUMNS),
-        f"s,2026-01-02,cash,2,100,0,none,7,BTN,As Kd,2c 3d 7h 8s 9c,300,-300,-3.0,yes,{rows[0]['hand_rank']},0.432,0.92,1,1,1.5,,You raise to 300.",
+        f"s,2026-01-02,cash,2,100,0,none,7,2026-01-02T03:04:05Z,BTN,As Kd,2c 3d 7h 8s 9c,300,-300,-3.0,yes,{rows[0]['hand_rank']},0.432,0.92,1,1,1.5,,You raise to 300.",
     ]
     # Blinds 200/400 with a 300 big-blind ante, kept at 100 internal units per chip shown.
     config = GameConfig(2, 20_000, 40_000, 30_000, AnteType.BIG_BLIND_ANTE)
-    ante_hand = play(
-        new_hand(config, 1, 0, (1_000_000, 1_000_000), hand_id="hand-9", deck=deck)[0], FOLD
-    )
-    (ante_row,) = hand_rows([ante_hand], 0, 100, "s", "2026-01-02", "tournament", [], {}, {})
+    ante_hand = play(new_hand(config, 1, 0, (1_000_000, 1_000_000), hand_id="hand-9", deck=deck)[0], FOLD)
+    (ante_row,) = hand_rows([ante_hand], 0, 100, "s", "2026-01-02", "tournament", [], {}, {}, {})
     assert (ante_row["big_blind"], ante_row["ante"], ante_row["ante_type"]) == (
         400,
         300,

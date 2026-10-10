@@ -39,7 +39,7 @@ from   thpoker.game.state       import (Action, ActionType, GameState,
                                         Observation, Street)
 from   thpoker.odds             import (Equity, Texture, hand_equity,
                                         preflop_class_equities, range_equities,
-                                        texture)
+                                        settled_equity, texture)
 
 MISTAKE_BB = 0.5
 RATING_POT_SHARE = 0.4
@@ -106,6 +106,7 @@ class DecisionReview:
     board: tuple[int, ...]
     situation: Situation
     ranges: dict[int, RangeView]  # by opponent seat
+    reference_ranges: dict[int, RangeView]
     equity: Equity
     reference_equity: Equity
     percentile: float | None  # where the hand sits in the user's own range, 1 = strongest
@@ -208,6 +209,7 @@ class MoveRating:
     rating: float
     stake: float  # big blinds at stake once called, less what the user cannot cover
     hinted: bool  # made after a coach hint
+    timed_out: bool = False
 
 
 @dataclass(frozen=True)
@@ -222,7 +224,7 @@ class HandRating:
         return hand_rating([(m.rating, m.stake) for m in self.moves])
 
 
-def move_ratings(decisions: Sequence[DecisionReview], hinted: set[int]) -> tuple[MoveRating, ...]:
+def move_ratings(decisions: Sequence[DecisionReview], hinted: set[int], timed_out: set[int]) -> tuple[MoveRating, ...]:
     """The rating of each move made; a coach hint, asked before acting, has none."""
     return tuple(
         MoveRating(
@@ -230,6 +232,7 @@ def move_ratings(decisions: Sequence[DecisionReview], hinted: set[int]) -> tuple
             d.rating(),
             d.situation.pot_bb + 2 * d.situation.to_call_bb - d.situation.owed_bb,
             d.index in hinted,
+            d.index in timed_out,
         )
         for d in decisions
         if d.chosen is not None
@@ -244,7 +247,7 @@ class HandReview:
     all_in_net_bb: float | None  # expected result at the moment all chips went in
 
     def rating(self) -> float | None:
-        return hand_rating([(m.rating, m.stake) for m in move_ratings(self.decisions, set())])
+        return hand_rating([(m.rating, m.stake) for m in move_ratings(self.decisions, set(), set())])
 
     def chance(self) -> float | None:
         """The chance to win at the user's last decision, as a strong player reads the others."""
@@ -496,6 +499,7 @@ def _review_decision(
         state.board,
         situation(view),
         {s: range_view(w, state.board) for s, w in opponents.items()},
+        {s: range_view(w, state.board) for s, w in reference_snapshot.ranges.items() if s != user},
         hand_equity(hole, state.board, list(opponents.values()), Rng(public_seed(view))),
         hand_equity(hole, state.board, read, Rng(public_seed(view))),
         _percentile(view, snapshot.ranges[user], list(opponents.values())),
@@ -641,6 +645,58 @@ def review_hand(
     net = hand.stacks[user] - hand.starting_stacks[user]
     expected = all_in_net(hand, user)
     return HandReview(hand, decisions, net / big_blind, None if expected is None else expected / big_blind)
+
+
+@dataclass(frozen=True)
+class GodView:
+    """A decision of a finished hand valued knowing the bots' styles and the cards they held."""
+
+    options: list[OptionValue]
+    equity: Equity  # against the cards still in the hand
+
+
+def god_views(
+    hand: GameState,
+    user: int,
+    bots: dict[int, Bot],
+    reference: Bot,
+    payouts: Sequence[float] | None,
+    min_branch: float,
+) -> dict[int, GodView]:
+    """Each decision of `user` in the finished `hand`, by history index, with every opponent still
+    in holding the cards it was dealt and answering with its own policy. Hindsight: it never
+    changes a rating. As in `option_values`, the walk ends with the street and later streets
+    come from the realization model, so before the river the values are estimates."""
+    hole = hand.hole_cards[user]
+    assert hole is not None
+    states = replay_states(hand)
+    views = {}
+    for index, entry in enumerate(hand.history):
+        if entry.seat != user:
+            continue
+        state = states[index]
+        held = {}
+        for seat, cards in enumerate(hand.hole_cards):
+            if seat != user and state.dealt_in[seat] and not state.folded[seat]:
+                assert cards is not None
+                weights = np.zeros(len(COMBOS))
+                weights[combo_index(*cards)] = 1.0
+                held[seat] = weights
+        options = option_values(state, bots, reference, held, entry.action, payouts, min_branch)
+        seed = Rng(public_seed(observation(state, user)))
+        views[index] = GodView(options, settled_equity(hole, state.board, list(held.values()), seed))
+    return views
+
+
+def hindsight_best(review: DecisionReview, god: GodView) -> OptionValue | None:
+    """The best option knowing the cards, when it beats the move made by more than the noise and
+    the mistake threshold, as `DecisionReview.verdict` judges a move."""
+    loss, stderr = review.loss(god.options)
+    threshold = review.icm_threshold if review.tournament else MISTAKE_BB
+    assert threshold is not None
+    if loss > threshold and loss > 2 * stderr:
+        return best_option(god.options, review.tournament)
+    return None
 
 
 def review_decision(

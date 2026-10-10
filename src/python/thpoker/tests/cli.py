@@ -4,6 +4,7 @@ from   dataclasses              import replace
 import json
 from   pathlib                  import Path
 import pytest
+import re
 from   thpoker.analysis.review  import position_names
 from   thpoker.analysis.stats   import DecisionRecord, progress
 from   thpoker.charts           import seat_names
@@ -148,6 +149,7 @@ def test_a_logged_session_can_be_reviewed_after_a_hand_and_later(monkeypatch, ca
     assert [row["hand"] for row in rows] == logged
     for row in rows:
         assert f"your cards {pretty_cards(parse_cards(row['cards']))}" in row["history"]
+        assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", row["started_utc"])
     played = {h.removeprefix("hand-") for h in user_hands}
     assert {row["hand"] for row in rows if row["rating"] and row["win_chance"]} == played
     reviewed = DecisionRecord.read(Path(decisions), "decision")
@@ -230,15 +232,18 @@ def test_a_hint_is_shown_logged_and_kept_out_of_the_statistics(monkeypatch, caps
     assert "your move" in capsys.readouterr().out
     log = tmp_path / "session-8.jsonl"
     (hinted,) = [json.loads(line) for line in log.read_text().splitlines() if json.loads(line)["type"] == "hint"]
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    hands = [r["hand"] for r in records if r["type"] == "hand"]
+    user = {(h["hand_id"], i) for h in hands for i, e in enumerate(h["history"]) if e["seat"] == 0}
+    # A move the web table's timer made is left out like a hinted one.
+    timed = max(user - {(hinted["hand_id"], hinted["index"])})
+    SessionLog(log).append("timeout", {"hand_id": timed[0], "index": timed[1]})
     decisions = tmp_path / "decisions.jsonl"
     assert main(["review", str(log), "--decisions-log", str(decisions)]) == 0
     recorded = {(r["hand_id"], r["index"]) for r in map(json.loads, decisions.read_text().splitlines())}
     # The hint was asked at one of the user's decisions; every other decision is recorded.
-    records = [json.loads(line) for line in log.read_text().splitlines()]
-    hands = [r["hand"] for r in records if r["type"] == "hand"]
-    user = {(h["hand_id"], i) for h in hands for i, e in enumerate(h["history"]) if e["seat"] == 0}
     assert (hinted["hand_id"], hinted["index"]) in user
-    assert recorded == user - {(hinted["hand_id"], hinted["index"])}
+    assert recorded == user - {(hinted["hand_id"], hinted["index"]), timed}
 
 
 def test_hints_are_off_by_default_in_tournaments(monkeypatch, capsys, tmp_path):

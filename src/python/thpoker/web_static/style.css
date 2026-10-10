@@ -166,7 +166,8 @@ label.choice small {
 
 #tier-hint {
   display: block;
-  min-height: 4.2em;  /* three lines on a phone, so the form doesn't move with the choice */
+  min-height: 4.2em;
+  /* three lines on a phone, so the form doesn't move with the choice */
 }
 
 details.more>summary {
@@ -683,6 +684,7 @@ button.chip.quiet {
   background: var(--panel);
   padding: 0.7rem;
   border-radius: 10px;
+  min-width: 0;
 }
 
 .panel h2 {
@@ -1150,4 +1152,38 @@ table.hands label.inline {
     width: 1.25rem;
     height: 1.25rem;
   }
+}
+
+.clock {
+  display: inline-block;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  padding: 0.35rem 0.9rem;
+  margin-right: 0.4rem;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.clock.low {
+  border-color: var(--bad);
+  color: var(--bad);
+  font-weight: 700;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.review-switches {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem 1rem;
+  margin: 0 0 0.5rem;
+  color: var(--muted);
 }

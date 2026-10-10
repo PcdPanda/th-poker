@@ -284,6 +284,7 @@ HAND_COLUMNS = (
     "ante",
     "ante_type",
     "hand",
+    "started_utc",
     "position",
     "cards",
     "board",
@@ -316,14 +317,16 @@ def hand_rows(
     decisions: list[DecisionRecord],
     histories: dict[str, str],
     ratings: Mapping[str, HandRating],
+    started: Mapping[str, str],
 ) -> list[dict[str, Any]]:
     """One row per hand the user was dealt into, in chips as shown on the table, for a
-    spreadsheet; the big blind and ante are the hand's own, as they rise in a tournament. 
+    spreadsheet; the big blind and ante are the hand's own, as they rise in a tournament.
     Only the user's own cards appear. `hand_rank` is the share of starting hands
     at least as strong; the chance to win at the last move and the hand's rating come from
     `ratings`, by hand id, and stay blank for hands never rated. The review columns come from
     `decisions` (records written by `thpoker review`) and stay blank for hands never reviewed;
-    `histories` holds each hand's moves as the user saw them, by hand id."""
+    `histories` holds each hand's moves as the user saw them, and `started` its UTC start time,
+    by hand id."""
     reviewed: dict[str, list[DecisionRecord]] = defaultdict(list)
     for decision in decisions:
         if decision.session == session:
@@ -351,6 +354,7 @@ def hand_rows(
                 "ante": _number(hand.config.ante / scale),
                 "ante_type": hand.config.ante_type.lower(),
                 "hand": int(hand.hand_id.rpartition("-")[2]),
+                "started_utc": started.get(hand.hand_id, ""),
                 "position": position_names(observation(hand, user))[user],
                 "cards": cards_str(hole),
                 "board": cards_str(hand.board),

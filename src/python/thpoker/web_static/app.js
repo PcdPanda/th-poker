@@ -49,8 +49,14 @@ let refreshes = 0;  // counts what the hands tables show, so a re-read for an ol
 let handsOrder = null;  // the hands tables' sort as { column, up }, or null for the newest hand first
 const SEAT_ORDER = Object.keys(SEAT_WORDS);
 const RATING_TIP = "Your moves this hand, rated 0 to 1, with moves in bigger pots counting for more: 1 means you picked the best option every time";
-const COPY_TIP = "Copy the hand as you saw it, with your moves rated 0 to 1, for an AI chat";
-const ANALYSIS_TIP = "Copy the hand with the coach's full analysis and ratings, for an AI chat";
+const GOD_TIP = "Also show the bots' styles and cards, and the numbers knowing them (finished hands)";
+// What hand reviews and copies show, for the whole page: off at every visit, and never stored.
+const switches = { solver: false, god: false };
+let coachShown = null;  // the coach panel's answer and whether it reviews a whole hand
+let historyShown = null;  // the Past sessions review panel's answer
+let clock = null;  // the move timer of this turn: { turn, deadline, warned, fired }, or null
+let clockPaused = null;  // when a coach request began: waiting on it isn't the player's time
+let timeoutNote = "";  // what the timer did, shown with the status until the next move
 // Title, tip, class, and the value a click on the title sorts by.
 const COLUMNS = [
   ["Hand", null, null, (row) => row.hand],
@@ -118,7 +124,7 @@ function copyIcon(name, tip, text) {
   node.append(icon(name));
   node.addEventListener("click", async () => {
     if (node.classList.contains("waiting")) return;
-    const panel = node.closest(".panel");
+    const panel = node.closest(".panel, .copy-host");
     const pending = Promise.resolve(typeof text === "function" ? text() : text);
     node.classList.add("waiting");
     try {
@@ -151,15 +157,41 @@ function copyIcon(name, tip, text) {
 }
 
 function tools(id) {
-  // A panel's copy icons, emptied along with any copy box they left behind.
+  // A copy icon's place, emptied along with any copy box it left behind.
   const target = document.getElementById(id);
-  target.closest(".panel").querySelector(".copy-fallback")?.remove();
+  target.closest(".panel, .copy-host").querySelector(".copy-fallback")?.remove();
   target.replaceChildren();
   return target;
 }
 
-function copyTools(id, answer) {
-  tools(id).append(copyIcon("copy", COPY_TIP, answer.hand_text), copyIcon("chat", ANALYSIS_TIP, answer.copy_text));
+function copyMode() {
+  if (switches.solver) return switches.god ? "solver_god" : "solver";
+  return switches.god ? "god" : "plain";
+}
+
+function copyTip(hand) {
+  const on = (flag) => (flag ? "on" : "off");
+  return "Copy hand " + hand + " for an AI chat (solver " + on(switches.solver) + ", God's view " + on(switches.god) + ")";
+}
+
+function renderSwitches() {
+  // The table's copy icon copies the hand shown, as the switches set it.
+  const target = tools("copy-tools");
+  if (state.hand_number) {
+    const path = "sessions/" + session + "/hands/" + state.hand_number + "/copy/";
+    target.append(copyIcon("copy", copyTip(state.hand_number), () => api(path + copyMode()).then((answer) => answer.text)));
+  }
+  document.getElementById("god-later").hidden = !(switches.god && state.hand_number && !state.hand_over);
+  const hidden = state.seats.some((seat) => !seat.is_user && !seat.style);
+  for (const label of document.querySelectorAll("#table .god-switch")) label.title = GOD_TIP + (hidden ? ". This shows the hidden styles." : "");
+}
+
+function renderHistoryCopy() {
+  const target = tools("history-tools");
+  if (!historyShown) return;
+  target.append(copyIcon("copy", copyTip(historyShown.hand), () => historyShown.answer.texts[copyMode()]));
+  const hidden = historyShown.answer.hides_styles ? ". This shows the hidden styles." : "";
+  document.querySelector("#history .god-switch").title = GOD_TIP + hidden;
 }
 
 
@@ -399,7 +431,7 @@ function statusText() {
 }
 
 function renderStatus() {
-  document.getElementById("status").textContent = statusText();
+  document.getElementById("status").textContent = (timeoutNote ? timeoutNote + " " : "") + statusText();
   document.body.classList.toggle("your-turn", Boolean(state.your_turn));
   const odds = document.getElementById("odds");
   odds.textContent = "";
@@ -575,6 +607,7 @@ function renderActions() {
   between.replaceChildren();
   if (state.your_turn) {
     const legal = state.legal;
+    startClock(actions);
     if (legal.fold && !legal.check) actions.append(button("Fold", () => act({ kind: "fold" }), "neutral", "f"));
     if (legal.check) actions.append(button("Check", () => act({ kind: "check" }), "call", "k"));
     if (legal.call !== null) {
@@ -589,6 +622,7 @@ function renderActions() {
     if (state.coach) actions.append(button("Ask the coach", hint, "secondary", "h"));
     renderSizing(legal.raise, raiseButton);
   } else {
+    clock = nulkl;
     renderSizing(null, null);
   }
   const check = state.coach && state.acted ? button("Check my last move", analyze, "secondary") : null;
@@ -608,6 +642,53 @@ function renderActions() {
   }
 }
 
+function startClock(actions) {
+  // The move timer: a pill first in the actions, counting down from when the turn began.
+  if (!state.timer) return;
+  if (!clock || clock.turn !== state.turn) {
+    clock = { turn: state.turn, deadline: Date.now() + state.timer * 1000, warned: false, fired: false };
+    document.getElementById("clock-live").textContent = "";
+  }
+  const pill = element("span", "clock");
+  pill.id = "clock";
+  actions.append(pill);
+  tickClock();
+}
+
+function tickClock() {
+  const pill = document.getElementById("clock");
+  if (!clock || !pill) return;
+  const left = Math.max(0, Math.ceil((clock.deadline - (clockPaused ?? Date.now())) / 1000));
+  pill.textContent = left + " s left" + (clockPaused ? ", paused" : "");
+  const low = left <= Math.min(10, state.timer / 3);
+  pill.classList.toggle("low", low);
+  if (low && !clock.warned) {
+    clock.warned = true;
+    document.getElementById("clock-live").textContent = left + " seconds left to act";
+  }
+  if (left === 0 && !clockPaused && !clock.fired) timeUp(clock.turn, state.legal.check);
+}
+
+async function timeUp(turn, checks) {
+  // Check if that's free, otherwise fold; the server picks, and refuses a turn already over.
+  if (busy) return;  // another request is on its way: the next tick tries again
+  clock.fired = true;
+  await run("table-error", async (current) => {
+    let answer;
+    try {
+      answer = await api("sessions/" + session + "/action", { kind: "timeout", turn });
+    } catch (error) {
+      return;  // the player acted at the same moment
+    }
+    if (!current()) return;
+    state = answer;
+    timeoutNote = "Time ran out, so you " + (checks ? "checked" : "folded") + ".";
+    clearCoach();
+    render();
+  });
+}
+
+
 function renderLog() {
   const log = document.getElementById("log");
   log.replaceChildren();
@@ -625,11 +706,6 @@ function renderLog() {
     }
   }
   log.scrollTop = log.scrollHeight;
-  const logTools = tools("log-tools");
-  if (state.hand_number) {
-    const path = "sessions/" + session + "/hands/" + state.hand_number + "/copy";
-    logTools.append(copyIcon("copy", COPY_TIP, () => api(path).then((answer) => answer.text)));
-  }
 }
 
 function handsTable(rows, reviewer) {
@@ -795,13 +871,14 @@ function render() {
   renderStatus();
   renderActions();
   renderLog();
+  renderSwitches();
   renderHands();
   showChance();
 }
 
 function clearCoach() {
+  coachShown = null;
   document.getElementById("coach").replaceChildren();
-  tools("coach-tools");
   document.getElementById("coach-panel").hidden = true;
 }
 
@@ -810,6 +887,7 @@ async function act(action) {
     const answer = await api("sessions/" + session + "/action", action);
     if (!current()) return;
     state = answer;
+    timeoutNote = "";
     clearCoach();
     render();
   });
@@ -820,6 +898,7 @@ async function next() {
     const answer = await api("sessions/" + session + "/next", {});
     if (!current()) return;
     state = answer;
+    timeoutNote = "";
     clearCoach();
     render();
   });
@@ -838,6 +917,8 @@ function newGame() {
   if (!window.confirm("Leave this game and start a new one?")) return;
   session = null;
   state = null;
+  clock = null;
+  timeoutNote = "";
   clearCoach();
   document.getElementById("table-error").textContent = "";
   show("setup");
@@ -848,17 +929,23 @@ async function coach(path, waiting) {
     const panel = document.getElementById("coach-panel");
     const target = document.getElementById("coach");
     panel.hidden = false;
-    tools("coach-tools");
+    coachShown = null;
     target.replaceChildren(element("p", "waiting", waiting));
+    if (clock) clockPaused = Date.now();
+    tickClock();
     try {
       const answer = await api("sessions/" + session + "/" + path, {});
       if (!current()) return;
-      target.replaceChildren(coachView(answer, path === "review"));
-      copyTools("coach-tools", answer);
+      coachShown = { answer, full: path === "review" };
+      target.replaceChildren(coachView(answer, coachShown.full));
     } catch (error) {
       target.replaceChildren();
       panel.hidden = true;
       throw error;
+    } finally {
+      if (clock && clockPaused !== null) clock.deadline += Date.now() - clockPaused;
+      clockPaused = null;
+      tickClock();
     }
   });
 }
@@ -877,16 +964,23 @@ function review() {
 
 // The coach's answers
 
-function optionsTable(decision) {
+function optionsTable(decision, god) {
+  // What each option averages: against a strong player, and with God's view against these
+  // players' styles and, in hindsight, against the cards they held.
   const table = element("table", "options");
   const head = element("tr");
   const unit = decision.unit === "chips" ? "" : " (" + decision.unit + ")";
   const titles = [
     ["Option", ""],
     ["Strong player", "How often a strong player makes this move here"],
-    ["vs these players" + unit, "Average result against the players at this table"],
     ["vs a strong player" + unit, "Average result against a strong player"],
   ];
+  if (god) {
+    titles.push(
+      ["vs their styles" + unit, "Average result against the hands these players' styles would hold, played their way"],
+      ["vs their cards" + unit, "In hindsight: the average result if you could see their cards, an estimate before the river"],
+    );
+  }
   for (const [title, tip] of titles) {
     const cell = element("th", "", title);
     if (tip) cell.title = tip;
@@ -894,6 +988,7 @@ function optionsTable(decision) {
   }
   table.append(head);
   const value = (worth, noise) => {
+    if (worth === null) return element("td", "muted", "–");
     const cell = element("td", "", decision.unit === "chips" ? signed(worth) : worth.toFixed(2) + "%");
     if (noise) cell.title = "± " + chips(noise) + ": an estimate from sampling";
     return cell;
@@ -902,15 +997,22 @@ function optionsTable(decision) {
     const tr = element("tr", option.best ? "best" : "");
     const name = element("td", "", option.action);
     if (option.chosen) name.append(element("span", "mark", "your move"));
-    if (option.best) name.append(element("span", "mark best", "best"));
+    if (option.best) {
+      const mark = element("span", "mark best", "best");
+      mark.title = "best against a strong player";
+      name.append(mark);
+    }
     const share = element("td", "share");
     const bar = element("span", "bar");
     bar.style.width = Math.round(100 * option.strong_share) + "%";
     share.append(bar, element("span", "", percent(option.strong_share)));
-    tr.append(name, share, value(option.vs_bots, option.vs_bots_noise), value(option.vs_strong, option.vs_strong_noise));
+    tr.append(name, share, value(option.vs_strong, option.vs_strong_noise));
+    if (god) tr.append(value(option.vs_bots, option.vs_bots_noise), value(option.vs_cards, option.vs_cards_noise));
     table.append(tr);
   }
-  return table;
+  const scroll = element("div", "options-scroll");
+  scroll.append(table);
+  return scroll;
 }
 
 function rangeGrid(classes, label) {
@@ -932,7 +1034,7 @@ function rangeGrid(classes, label) {
   return grid;
 }
 
-function decisionView(decision, open) {
+function decisionView(decision, open, god) {
   const box = element("article", "decision verdict-" + (decision.verdict || "hint"));
   const title = element("div", "decision-title");
   title.append(element("span", "street", STREETS[decision.street] + ":"));
@@ -943,15 +1045,15 @@ function decisionView(decision, open) {
   }
   if (decision.chosen) title.append(element("span", "chose", "you chose " + decision.chosen));
   box.append(title, element("p", "headline", decision.headline));
-  for (const line of decision.summary) box.append(element("p", "summary", line));
-  box.append(optionsTable(decision));
+  for (const line of decision.summary.concat(god ? decision.god_summary : [])) box.append(element("p", "summary", line));
+  box.append(optionsTable(decision, god));
   const details = element("details");
   details.open = open;
   details.append(element("summary", "", "Show details"));
   const list = element("ul");
-  for (const line of decision.details) list.append(element("li", "", line));
+  for (const line of decision.details.concat(god ? decision.god_details : [])) list.append(element("li", "", line));
   details.append(list);
-  for (const range of decision.ranges) {
+  for (const range of god ? decision.god_ranges : decision.ranges) {
     if (range.width >= 0.6) continue;  // nearly every hand: the grid would be solid colour
     const label = range.name + " likely holds about " + percent(range.width) + " of hands";
     details.append(element("p", "grid-title", range.name + "'s likely hands (brighter means more likely):"), rangeGrid(range.classes, label));
@@ -961,18 +1063,39 @@ function decisionView(decision, open) {
 }
 
 function coachView(answer, full) {
+  // A hand review follows the switches; a hint or a move check always shows the coach's
+  // numbers from what the player could know.
+  const solver = !full || switches.solver;
+  const god = full && switches.god && answer.finished;
   const view = element("div", "coach-view");
   const story = element("details", "story");
   story.open = full;
   story.append(element("summary", "", full ? "The hand" : "The hand so far"));
-  for (const line of answer.history) story.append(prettyLine(line, line.startsWith(" ") ? "story-line" : "story-head"));
+  for (const line of god ? answer.god_history : answer.history) story.append(prettyLine(line, line.startsWith(" ") ? "story-line" : "story-head"));
   view.append(story);
-  if (!answer.decisions.length) view.append(element("p", "", "You made no decision in that hand."));
-  for (const decision of answer.decisions) view.append(decisionView(decision, false));
+  if (solver) {
+    if (!answer.decisions.length) view.append(element("p", "", "You made no decision in that hand."));
+    for (const decision of answer.decisions) view.append(decisionView(decision, false, god));
+  } else {
+    for (const line of answer.rated) view.append(element("p", line.startsWith(" ") ? "rated-move" : "summary", line.trim()));
+  }
   if (answer.summary) view.append(handSummary(answer.summary, answer.rating, answer.band));
   if (answer.result) view.append(element("p", "result", answer.result));
   return view;
 }
+
+function switchChanged(input) {
+  // One state for the page: every copy of the switch follows, and what it shows is redrawn.
+  switches[input.name] = input.checked;
+  for (const other of document.querySelectorAll(".review-switches input[name=" + input.name + "]")) other.checked = input.checked;
+  if (session && state) renderSwitches();
+  if (coachShown && coachShown.full) document.getElementById("coach").replaceChildren(coachView(coachShown.answer, true));
+  if (historyShown) {
+    document.getElementById("history-coach").replaceChildren(coachView(historyShown.answer, true));
+    renderHistoryCopy();
+  }
+}
+
 
 // Past sessions
 
@@ -985,6 +1108,7 @@ async function openHistory() {
   show("history");
   document.getElementById("session-hands").replaceChildren();
   document.getElementById("history-coach-panel").hidden = true;
+  historyShown = null;
   await run("history-error", async () => listSessions(await api("history")));
 }
 
@@ -1078,6 +1202,7 @@ async function deleteSessions(names) {
       show("history");
       hands.replaceChildren();
       document.getElementById("history-coach-panel").hidden = true;
+      historyShown = null;
     }
     listSessions(answer);
   });
@@ -1088,12 +1213,14 @@ async function reviewSaved(name, hand) {
     const panel = document.getElementById("history-coach-panel");
     const target = document.getElementById("history-coach");
     panel.hidden = false;
-    tools("history-tools");
+    historyShown = null;
+    renderHistoryCopy();
     target.replaceChildren(element("p", "waiting", "Reviewing hand " + hand + "..."));
     try {
       const answer = await api("history/" + encodeURIComponent(name) + "/review", { hand });
+      historyShown = { answer, hand };
       target.replaceChildren(coachView(answer, true));
-      copyTools("history-tools", answer);
+      renderHistoryCopy();
       panel.scrollIntoView({ behavior: "smooth" });
     } catch (error) {
       target.replaceChildren();
@@ -1211,6 +1338,7 @@ setupForm.addEventListener("submit", (event) => {
   };
   if (options.mode !== "tournament") options.blinds = form.get("blinds");
   if (form.get("stack")) options.stack = Number(form.get("stack"));
+  if (form.get("timer")) options.timer = Number(form.get("timer"));
   if (options.mode === "training") {
     if (form.get("position")) options.position = form.get("position");
     if (handsSpec()) options.hands = handsSpec();
@@ -1219,6 +1347,8 @@ setupForm.addEventListener("submit", (event) => {
     const created = await api("sessions", options);
     session = created.id;
     state = created.state;
+    clock = null;
+    timeoutNote = "";
     clearCoach();
     show("table");
     render();
@@ -1239,11 +1369,24 @@ hideHelpers.addEventListener("change", () => {
   document.body.classList.toggle("no-helpers", hideHelpers.checked);
 });
 
-const chanceBox = document.getElementById("show-chance");
-chanceBox.checked = window.localStorage.getItem(CHANCE_KEY) === "1";
-chanceBox.addEventListener("change", () => {
-  window.localStorage.setItem(CHANCE_KEY, chanceBox.checked ? "1" : "0");
-  showChance();
+const chanceSaved = window.localStorage.getItem(CHANCE_KEY);
+for (const radio of document.querySelectorAll("input[name=chance]")) {
+  radio.checked = radio.value === (["show", "guess"].includes(chanceSaved) ? chanceSaved : "off");
+  radio.addEventListener("change", () => {
+    window.localStorage.setItem(CHANCE_KEY, radio.value);
+    revealed = false;
+    guess = null;
+    if (chance === null) showChance();
+    else drawChance();
+  });
+}
+
+for (const input of document.querySelectorAll(".review-switches input")) input.addEventListener("change", () => switchChanged(input));
+setInterval(tickClock, 250);
+
+const rangeDialog = document.getElementById("range-dialog");
+rangeDialog.addEventListener("click", (event) => {
+  if (event.target === rangeDialog) rangeDialog.close();  // a click on the backdrop
 });
 
 document.addEventListener("keydown", (event) => {

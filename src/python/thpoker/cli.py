@@ -6,7 +6,7 @@ from   concurrent.futures       import (CancelledError, Future,
                                         ThreadPoolExecutor)
 from   contextlib               import suppress
 from   dataclasses              import asdict, dataclass, field, replace
-from   datetime                 import date
+from   datetime                 import date, datetime, timezone
 from   functools                import partial
 import math
 from   operator                 import attrgetter
@@ -22,11 +22,11 @@ from   thpoker.analysis.drills  import (ChartQuestion, DrillResult, ICM,
                                         new_threshold_question,
                                         threshold_question)
 from   thpoker.analysis.ev      import PROFILES, Profile, pick_profile
-from   thpoker.analysis.review  import (DecisionReview, HandRating, HandReview,
-                                        MoveRating, REFERENCE, hint,
-                                        move_ratings, review_decision,
-                                        review_hand, summarize, triaged_review,
-                                        with_choice)
+from   thpoker.analysis.review  import (DecisionReview, GodView, HandRating,
+                                        HandReview, MoveRating, REFERENCE,
+                                        god_views, hint, move_ratings,
+                                        review_decision, review_hand,
+                                        summarize, triaged_review, with_choice)
 from   thpoker.analysis.stats   import (DecisionRecord, hand_rows, loss_by_tag,
                                         patterns, progress, record,
                                         write_hands_csv)
@@ -91,6 +91,12 @@ def full_review(
         profile.solver_seconds,
         reviewed,
     )
+
+
+def god_review(runner: TableRunner, hand: GameState, profile: Profile) -> dict[int, GodView]:
+    user = runner.user_seat
+    assert user is not None
+    return god_views(hand, user, runner.bots, REFERENCE, runner.config.payouts, profile.min_branch)
 
 
 class Task(Generic[T]):
@@ -158,16 +164,20 @@ def result_or(task: Task[T] | None, work: Callable[[], T]) -> T:
 class HandJobs:
     """One hand's background reviews by history index: of each user decision from the moment it
     is the user's turn (`ahead`, with the state then), of each move once made, and of the whole
-    hand once it ends (`rating`). `hinted` holds the decisions made after a coach hint."""
+    hand once it ends (`rating`, then `god`: the decisions knowing the bots' cards). `hinted`
+    and `timed_out` hold the decisions made after a coach hint or when the move timer ran out."""
 
     ahead: dict[int, tuple[GameState, Task[DecisionReview]]] = field(default_factory=dict)
     moves: dict[int, Task[DecisionReview]] = field(default_factory=dict)
     hinted: set[int] = field(default_factory=set)
+    timed_out: set[int] = field(default_factory=set)
     rating: Task[HandReview] | None = None
+    god: Task[dict[int, GodView]] | None = None
 
     def cancel(self):
         """Newest first, so a task never starts on an input about to be cancelled."""
-        tasks: list[Task[Any]] = [] if self.rating is None else [self.rating]
+        tasks: list[Task[Any]] = [] if self.god is None else [self.god]
+        tasks += [] if self.rating is None else [self.rating]
         tasks += [self.moves[i] for i in sorted(self.moves, reverse=True)]
         tasks += [self.ahead[i][1] for i in sorted(self.ahead, reverse=True)]
         for task in tasks:
@@ -216,7 +226,7 @@ def _rate_hand(
     )
     chance = hand_review.chance()
     assert chance is not None
-    rated = HandRating(chance, move_ratings(hand_review.decisions, jobs.hinted))
+    rated = HandRating(chance, move_ratings(hand_review.decisions, jobs.hinted, jobs.timed_out))
     ratings[hand.hand_id] = rated
     if log is not None:
         with suppress(OSError):
@@ -249,6 +259,7 @@ class PlaySession:
         self.finished: GameState | None = None  # the user's last finished hand, for review
         self.jobs: dict[str, HandJobs] = {}  # background reviews by hand id, until rated
         self.ratings: dict[str, HandRating] = {}  # rated hands by hand id
+        self.hand_times: dict[str, str] = {}
         if log is not None:
             log.append("table_config", {"config": asdict(runner.config), "scale": scale})
         self.record(runner.opening_events)
@@ -267,6 +278,9 @@ class PlaySession:
 
     def record(self, events: list[Event]):
         hand = self.runner.hand
+        if hand is not None and hand.hand_id not in self.hand_times:
+            now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            self.hand_times[hand.hand_id] = now
         for event in events:
             if self.log is not None:
                 self.log.append("event", {"hand_id": hand.hand_id if hand else None, "event": event.to_dict()})
@@ -317,7 +331,8 @@ class PlaySession:
         self.finished = hand
         if self.log is not None:
             read = self.runner.reads.get(hand.hand_id)
-            logged = {"hand": hand.to_dict()} | ({} if read is None else {"read": asdict(read)})
+            logged = {"hand": hand.to_dict(), "started": self.hand_times[hand.hand_id]}
+            logged |= {} if read is None else {"read": asdict(read)}
             self.log.append("hand", logged)
         jobs, user = self.jobs.get(hand.hand_id), self.runner.user_seat
         if jobs is not None and jobs.moves and jobs.rating is None:
@@ -335,12 +350,15 @@ class PlaySession:
                 self.ratings,
             )
             jobs.rating = background(work)
+            jobs.god = background(partial(god_review, runner, hand, self.profile))
 
     def close(self, wait: bool):
         """Stop the reviews nobody will read: an unfinished hand's, and in an unsaved session
         every one still to run. With `wait`, a saved session's finished hands are rated first,
-        so its log is complete."""
+        so its log is complete. The God's view numbers are never logged, so they always stop"""
         for jobs in self.jobs.values():
+            if jobs.god is not None:
+                jobs.god.cancel()
             if jobs.rating is None or self.log is None:
                 jobs.cancel()
             elif wait:
@@ -371,6 +389,15 @@ class PlaySession:
         jobs = self.jobs.get(hand_id)
         if jobs is not None:
             jobs.hinted.add(index)
+
+    def note_timeout(self, hand_id: str, index: int):
+        """Log that the move timer made the decision at `index`, so the statistics leave it out and
+        its rating says so."""
+        if self.log is not None:
+            self.log.append("timeout", {"hand_id": hand_id, "index": index})
+        jobs = self.jobs.get(hand_id)
+        if jobs is not None:
+            jobs.timed_out.add(index)
 
     def hint_work(self) -> tuple[GameState, Callable[[], DecisionReview]]:
         """The five steps for the decision the user faces now (DESIGN.md Section 7.8): noted as
@@ -911,6 +938,11 @@ def logged_ratings(records: list[dict[str, Any]]) -> dict[str, HandRating]:
         raise ValueError(f"damaged log: {error!r}") from error
 
 
+def logged_times(records: list[dict[str, Any]]) -> dict[str, str]:
+    """Each logged hand's UTC start time, by hand id."""
+    return {r["hand"]["hand_id"]: r["started"] for r in records if r["type"] == "hand" and "started" in r}
+
+
 def plain_history(runner: TableRunner, hand: GameState, scale: int, shown: dict[int, tuple[int, int]]) -> list[str]:
     """The hand as the user saw it, with no styles: what the page copies and the CSV keeps."""
     user = runner.user_seat
@@ -994,13 +1026,13 @@ def review_main(argv: list[str]) -> int:
         reviews.append(triaged_review(hand, user, bots, REFERENCE, config.payouts, profile))
     print(file=sys.stderr)
     payouts = config.payouts
-    hinted = {(r["hand_id"], r["index"]) for r in records if r["type"] == "hint"}
+    skipped = {(r["hand_id"], r["index"]) for r in records if r["type"] in ("hint", "timeout")}
     record_decisions(
         reviews,
         args.log.stem,
         len(payouts) if payouts else None,
         args.decisions_log,
-        hinted,
+        skipped,
         config.session.mode == Mode.TRAINING,
     )
     summary = summarize(reviews, args.top)
@@ -1242,13 +1274,14 @@ def session_rows(
     decisions: list[DecisionRecord],
     histories: dict[str, str],
     ratings: dict[str, HandRating],
+    started: dict[str, str],
 ) -> list[dict[str, Any]]:
     """One CSV row per hand of a logged session, dated by the log's last write."""
     user = config.session.user_seat
     assert user is not None  # checked by load_session
     mode = config.session.mode.value.lower()
     day = date.fromtimestamp(path.stat().st_mtime).isoformat()
-    return hand_rows(hands, user, scale, path.stem, day, mode, decisions, histories, ratings)
+    return hand_rows(hands, user, scale, path.stem, day, mode, decisions, histories, ratings, started)
 
 
 def export_main(argv: list[str]) -> int:
@@ -1274,7 +1307,7 @@ def export_main(argv: list[str]) -> int:
         except (OSError, ValueError) as error:
             print(f"Skipping {path}: {error}", file=sys.stderr)
             continue
-        rows += session_rows(path, config, scale, hands, decisions, histories, ratings)
+        rows += session_rows(path, config, scale, hands, decisions, histories, ratings, logged_times(records))
     if args.out is None:
         write_hands_csv(rows, sys.stdout)
     else:

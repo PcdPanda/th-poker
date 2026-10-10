@@ -1,7 +1,8 @@
 import functools
+import pytest
 from   thpoker.analysis.ev      import OptionValue
-from   thpoker.analysis.review  import (DecisionReview, MoveRating, Situation,
-                                        Thresholds)
+from   thpoker.analysis.review  import (DecisionReview, GodView, MoveRating,
+                                        Situation, Thresholds)
 from   thpoker.game.cards       import parse_cards
 from   thpoker.game.engine      import new_hand
 from   thpoker.game.state       import (Action, ActionType, AnteType, Event,
@@ -9,10 +10,10 @@ from   thpoker.game.state       import (Action, ActionType, AnteType, Event,
 from   thpoker.game.tests.decks import CALL, CHECK, FOLD, play, stacked_deck
 from   thpoker.odds             import Equity
 from   thpoker.text             import (decision_headline, decision_summary,
-                                        format_chips, hand_history_text,
-                                        hand_summary_text, narrate,
-                                        percent_text, plain_decision_text,
-                                        rated_moves_text)
+                                        format_chips, god_summary,
+                                        hand_history_text, hand_summary_text,
+                                        narrate, percent_text,
+                                        rated_moves_text, solver_decision_text)
 
 LABELS = {0: "You", 1: "Blake"}
 RAISE_300 = Action(ActionType.RAISE, 300)
@@ -134,6 +135,7 @@ def fold_to_a_bet(tournament: bool) -> DecisionReview:
         (10, 20, 30),
         spot,
         {},
+        {},
         Equity(0.4, 0.01, False),
         Equity(0.35, 0.01, False),
         0.8,
@@ -159,11 +161,12 @@ def test_coach_amounts_are_chips_on_the_table_or_shares_of_the_prize_pool():
     assert decision_summary(cash, 1, 100)[0] == "Rated 0.36 of 1 (1 is the best option you had)."
     assert decision_summary(tournament, 1, 100)[0] == decision_summary(cash, 1, 100)[0]
     assert decision_summary(cash, 1, 100)[2] == "Calling costs 200: it pays if you win at least 25% of the time."
-    options = plain_decision_text(1, cash, {}, 1, 100, {Action(ActionType.CALL): 0.75})[-3:]
+    mix = {Action(ActionType.CALL): 0.75}
+    options = solver_decision_text(1, cash, {}, 1, 100, mix, None, None)[-3:]
     assert options == [
-        "  fold: 0 | 0 | 0% (your choice)",
-        "  call: +150 ± 10 | +150 ± 10 | 75% (best)",
-        "  raise to 900: +25 ± 10 | +25 ± 10 | 0%",
+        "  fold: 0 | 0% (your choice)",
+        "  call: +150 ± 10 | 75% (best against a strong player)",
+        "  raise to 900: +25 ± 10 | 0%",
     ]
 
 
@@ -196,3 +199,25 @@ def test_the_rated_moves_and_the_summary_read_like_the_hand():
     )
     # A share shows a decimal only where a whole percent would read as none or all.
     assert [percent_text(s) for s in (0, 0.004, 0.06, 0.996, 1)] == ["0", "0.4", "6", "99.6", "100"]
+
+
+@pytest.mark.parametrize("tournament", [False, True])
+def test_the_hindsight_line_needs_a_gap_beyond_the_noise_and_the_mistake_threshold(tournament):
+    # The user folded; seeing the cards, calling was worth a little more or a little less than
+    # the mistake threshold (half a big blind, or the 1% of the prize pool it is worth here)
+    # beyond twice the noise.
+    review = fold_to_a_bet(tournament)
+    fold = OptionValue(None, Action(ActionType.FOLD), 0.0, 0.0, True, 0.30, 0.0)
+    line = "Seeing their cards, call would have won more (an estimate). You couldn't see them, so the rating stands."
+    for gap, shown in ((0.011, True), (0.009, False)):
+        call = OptionValue(None, Action(ActionType.CALL), 50 * gap, 0.0, False, 0.30 + gap, 0.0)
+        god = GodView([fold, call], Equity(0.6, 0.0, True))
+        lines = god_summary(review, god, 1)
+        assert (line in lines) == shown
+        assert lines[-2 if shown else -1] == "Against the cards they really held: 60%."
+    # A gap inside twice the noise is not shown either.
+    noisy = OptionValue(None, Action(ActionType.CALL), 0.6, 0.4, False, 0.32, 0.02)
+    assert line not in god_summary(review, GodView([fold, noisy], Equity(0.6, 0.0, True)), 1)
+    # Nor when the move made was the best one seeing the cards.
+    worse = OptionValue(None, Action(ActionType.CALL), -2.0, 0.0, True, 0.28, 0.0)
+    assert line not in god_summary(review, GodView([fold, worse], Equity(0.0, 0.0, True)), 1)
