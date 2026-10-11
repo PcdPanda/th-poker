@@ -1,14 +1,17 @@
 import pytest
 
-from   thpoker.bots.abstraction import (AbstractAction, defense_share,
-                                        last_bet, legal_abstract_actions,
-                                        to_action, usual_raises)
+from   thpoker.bots.abstraction import (AbstractAction, bet_fractions,
+                                        defense_share, last_bet,
+                                        legal_abstract_actions, to_action,
+                                        usual_raises)
+from   thpoker.bots.bot         import PRESETS
+from   thpoker.bots.range_bot   import RangeBot
 from   thpoker.game.engine      import (apply_action, is_terminal, new_hand,
                                         observation)
 from   thpoker.game.rng         import Rng
 from   thpoker.game.rules       import check_action
 from   thpoker.game.state       import Action, ActionType, AnteType, GameConfig
-from   thpoker.game.tests.decks import CALL, FOLD, play
+from   thpoker.game.tests.decks import CALL, CHECK, FOLD, play
 
 
 def test_open_is_two_and_a_half_big_blinds_plus_one_per_limper():
@@ -121,3 +124,14 @@ def test_no_defense_is_owed_once_someone_has_called():
     assert defense_share(observation(called, 0)) is None
     facing = play(flop, Action(ActionType.BET, 300))
     assert defense_share(observation(facing, 2)) == pytest.approx(1 - 0.5**0.5)  # pot bet, two to act
+
+
+def test_bet_fractions_count_a_short_all_in_call_at_what_it_could_put_in():
+    # The short small blind calls a 1,000 flop bet all in for 400: the turn's reads must see a
+    # 600 flop pot, not one that the full call would have shrunk to nothing.
+    state, _ = new_hand(GameConfig(3), 1, 0, (10_000, 600, 10_000))
+    flop = play(state, Action(ActionType.RAISE, 200), CALL, CALL)
+    turn = play(flop, CHECK, Action(ActionType.BET, 1_000), CALL, CALL)
+    view = observation(turn, turn.to_act)
+    assert bet_fractions(view) == {len(flop.history) + 1: 1_000 / 600}
+    assert RangeBot("hard", PRESETS["balanced"]).policy(view)

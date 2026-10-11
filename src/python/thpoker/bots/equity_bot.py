@@ -12,8 +12,8 @@ from   functools                import lru_cache
 import hashlib
 import math
 from   thpoker.bots.abstraction import (AbstractAction, NEVER_FOLD_EQUITY,
-                                        acts_last, bet_sizes, call_price,
-                                        effective_stack, finish,
+                                        acts_last, bet_fractions, bet_sizes,
+                                        call_price, effective_stack, finish,
                                         legal_abstract_actions, players_behind,
                                         position_width, raises_this_street,
                                         usual_raises)
@@ -22,26 +22,33 @@ from   thpoker.game.cards       import COMBOS, COMBO_CLASS
 from   thpoker.game.evaluator   import evaluate_combos
 from   thpoker.game.rng         import Rng
 from   thpoker.game.rules       import can_act, legal_actions
-from   thpoker.game.state       import (ActionType, LegalActions, Observation,
-                                        Street)
+from   thpoker.game.state       import (ActionType, AnteType, LegalActions,
+                                        Observation, Street)
 from   thpoker.odds             import (FULL_RANGE, Range, equity_to_reach_top,
                                         equity_vs_random, range_equities,
                                         ranked_range, representative_equities)
 
+# Assumed preflop ranges of a typical opponent, as preflop percentile bands: the widths read for
+# a 3-bet and a 4-bet.
 RERAISE_TOPS = (0.06, 0.025)
-# Assumed preflop ranges of a typical opponent, as preflop percentile bands.
-_THREE_BET_TOP = 0.06
-_FOUR_BET_TOP = 0.025
 # The narrowest read of an oversized raise, reached 50bb deep: read tighter, a defender calls
 # a 100bb shove so rarely that shoving any two cards profits; this width leaves a calling range
 # (about 88+, AJ+) that makes a deep shove worse than a normal raise for weak and strong hands.
 _TIGHTEST_TOP = 0.15
+# A strong reader's deep all-in read (Tier 3) widens with fewer players left to call it, since any
+# two cards profit once they rarely call: heads-up they must together call above about 2.5%.
+_SHOVE_CAP = 0.075
 _DEEP_BIG_BLINDS = 25  # up to this deep, an oversized raise reads like a normal one
 _FULL_DEPTH_BIG_BLINDS = 50  # from this deep, it reads down to the narrowest width
 _CALL_RANGE = ranked_range(0.04, 0.3)
 _LIMP_RANGE = ranked_range(0.1, 0.6)
 _CHECKED_OPTION_RANGE = ranked_range(0.08, 1.0)
 _STREET_CARDS = {Street.FLOP: 3, Street.TURN: 4, Street.RIVER: 5}
+_BET_FLOOR = 0.25  # `strength_weighted`'s default floor for a bet's read
+# A sized read keeps this much weight on the weakest hands: rank is made-hand rank, so draws
+# sit at the bottom, and jams carry draws.
+_SIZED_FLOOR = 0.05
+_SIZED_POWER = 8.0
 
 
 def public_seed(view: Observation) -> int:
@@ -64,24 +71,48 @@ def _open_width(view: Observation, opener: int) -> float:
 
 
 def preflop_range(
-    view: Observation, seat: int, limp: Range = _LIMP_RANGE, reraise_tops: tuple[float, float] = RERAISE_TOPS
+    view: Observation,
+    seat: int,
+    limp: Range = _LIMP_RANGE,
+    reraise_tops: tuple[float, float] = RERAISE_TOPS,
+    shove_top: float | None = None,
 ) -> Range:
     """A seat's range from its preflop actions: percentile bands by its strongest action, with
-    `limp` for a limp. A raise bigger than usual from a deep stack reads as a stronger range, in
-    proportion to its size (a 100bb open-shove is not a 2.5bb open), phased in between 25bb and
-    50bb deep since short stacks shove as a matter of course; it never reads looser than the
-    usual band."""
+    `limp` for a limp and `reraise_tops` for a 3-bet and a 4-bet or more. A raise bigger than
+    usual from a deep stack reads as a stronger range, in proportion to its size (a 100bb
+    open-shove is not a 2.5bb open), phased in between 25bb and 50bb deep since short stacks
+    shove as a matter of course; it never reads looser than the usual band, nor tighter than the
+    narrowest width. With `shove_top`, an all-in raise reads down to that width against five
+    possible callers and the blinds alone in the pot, wider against fewer callers and more chips:
+    `min(_SHOVE_CAP, shove_top * (5 / callers) ** 0.6)`, times `(pot / 1.5bb) ** 0.6` for the
+    chips in before it (blinds, antes, limps, calls, an open), at most the narrowest width."""
     big_blind = view.config.big_blind
     sizes = iter(usual_raises(view))
     raises = 0
     strongest: Range | None = None
-    for entry in view.history:
+    last = max((i for i, e in enumerate(view.history) if e.seat == seat), default=None)
+    folded = 0
+    antes = view.dead_money + (
+        view.config.ante * sum(view.dealt_in) if view.config.ante_type == AnteType.PER_PLAYER else 0
+    )
+    committed = {view.small_blind_seat: view.config.small_blind, view.big_blind_seat: big_blind}
+    level = big_blind
+    for index, entry in enumerate(view.history):
         if entry.street != Street.PREFLOP:
             continue
         kind = entry.action.type
         if kind in (ActionType.BET, ActionType.RAISE):
             _, amount, usual = next(sizes)
             if entry.seat == seat:
+                narrowest = _TIGHTEST_TOP
+                # All in now with nothing after this raise: the raise put the stack in.
+                if shove_top is not None and view.all_in[seat] and index == last:
+                    callers = sum(view.dealt_in) - 1 - folded
+                    pot = antes + sum(committed.values())
+                    narrowest = min(
+                        _TIGHTEST_TOP,
+                        min(_SHOVE_CAP, shove_top * (5 / callers) ** 0.6) * (pot / (1.5 * big_blind)) ** 0.6,
+                    )
                 top = _open_width(view, seat) if raises == 0 else reraise_tops[min(raises, 2) - 1]
                 depth = effective_stack(view, seat) / big_blind
                 if amount > usual and depth > _DEEP_BIG_BLINDS:
@@ -89,11 +120,16 @@ def preflop_range(
                         1.0,
                         (depth - _DEEP_BIG_BLINDS) / (_FULL_DEPTH_BIG_BLINDS - _DEEP_BIG_BLINDS),
                     )
-                    floor = top + (_TIGHTEST_TOP - top) * ramp
+                    floor = top + (narrowest - top) * ramp
                     top = min(top, max(floor, top * usual / amount))
                 strongest = ranked_range(0.0, top)
             raises += 1
-        elif entry.seat == seat and kind == ActionType.CALL and strongest is None:
+            committed[entry.seat] = level = amount
+        elif kind == ActionType.FOLD:
+            folded += 1
+        elif kind == ActionType.CALL:
+            committed[entry.seat] = level
+        if entry.seat == seat and kind == ActionType.CALL and strongest is None:
             strongest = _CALL_RANGE if raises else limp
         elif entry.seat == seat and kind == ActionType.CHECK and strongest is None:
             strongest = _CHECKED_OPTION_RANGE
@@ -101,10 +137,10 @@ def preflop_range(
 
 
 @lru_cache(maxsize=128)
-def strength_weighted(weights: Range, board: tuple[int, ...], floor: float = 0.25) -> Range:
+def strength_weighted(weights: Range, board: tuple[int, ...], floor: float = 0.25, power: float = 1.0) -> Range:
     """Shift a range toward hands that are strong on `board`: weight times floor + (1 - floor) *
-    rank, where rank is the hand's made-hand percentile (0 weakest, 1 strongest) within the
-    range. Cached: every bot decision on a street rebuilds the same seat ranges."""
+    rank ** power, where rank is the hand's made-hand percentile (0 weakest, 1 strongest) within
+    the range. Cached: every bot decision on a street rebuilds the same seat ranges."""
     live = [i for i, (a, b) in enumerate(COMBOS) if weights[i] and a not in board and b not in board]
     if len(live) < 2:
         return weights
@@ -119,23 +155,39 @@ def strength_weighted(weights: Range, board: tuple[int, ...], floor: float = 0.2
         # Equal hands share their group's midpoint rank, so suits do not tilt the weights.
         rank = (start + end) / 2 / (len(live) - 1)
         for position in order[start : end + 1]:
-            shifted[live[position]] *= floor + (1 - floor) * rank
+            shifted[live[position]] *= floor + (1 - floor) * rank**power
         start = end + 1
     return tuple(shifted)
 
 
-def bet_shifted(view: Observation, seat: int, weights: Range, floors: tuple[float, float] = (0.25, 0.25)) -> Range:
+def bet_shifted(
+    view: Observation,
+    seat: int,
+    weights: Range,
+    floors: tuple[float, float] = (0.25, 0.25),
+    sized: bool = False,
+) -> Range:
     """`weights` shifted toward strong hands by each of the seat's bets and raises after the
-    flop, with `strength_weighted`'s floor for flop bets and for later ones. Only public cards
-    count: the range must not depend on whose hand is being scored."""
-    for entry in view.history:
+    flop, with `strength_weighted`'s floor for flop bets and for later ones. `sized` reads a bet
+    over the pot as stronger: the floor's default part shrinks with the square of its size (to
+    `_SIZED_FLOOR`) and rank counts to a power rising from 1 at a pot to 8, so a 17x-pot jam is
+    not read like a third-pot bet. Only public cards count: the range must not depend on whose
+    hand is being scored."""
+    fractions = bet_fractions(view) if sized else {}
+    for index, entry in enumerate(view.history):
         if (
             entry.seat == seat
             and entry.street != Street.PREFLOP
             and entry.action.type in (ActionType.BET, ActionType.RAISE)
         ):
+            board = view.board[: _STREET_CARDS[entry.street]]
             floor = floors[entry.street != Street.FLOP]
-            weights = strength_weighted(weights, view.board[: _STREET_CARDS[entry.street]], floor)
+            power = 1.0
+            size = fractions.get(index, 0.0)
+            if size > 1:
+                floor = max(_SIZED_FLOOR, floor - _BET_FLOOR + _BET_FLOOR / size**2)
+                power = min(_SIZED_POWER, 1 + 3 * (size - 1))
+            weights = strength_weighted(weights, board, floor, power)
     return weights
 
 
@@ -186,10 +238,17 @@ class _Context:
 
 
 class EquityBot(TierBot):
-    def __init__(self, name: str, style: Style, reraise_tops: tuple[float, float] = RERAISE_TOPS):
+    def __init__(
+        self,
+        name: str,
+        style: Style,
+        reraise_tops: tuple[float, float] = RERAISE_TOPS,
+        shove_top: float | None = None,
+    ):
         self.name = name
         self.style = style
-        self.reraise_tops = reraise_tops
+        self.reraise_tops = reraise_tops  # how wide it reads the re-raises it faces
+        self.shove_top = shove_top  # and a deep all-in raise
 
     def _context(self, view: Observation) -> _Context:
         ranges = assumed_ranges(view)
@@ -216,7 +275,12 @@ class EquityBot(TierBot):
             # range only, with a penalty for each other player still in.
             kind = "preflop"
             if view.last_aggressor is not None:
-                strongest = preflop_range(view, view.last_aggressor, reraise_tops=self.reraise_tops)
+                strongest = preflop_range(
+                    view,
+                    view.last_aggressor,
+                    reraise_tops=self.reraise_tops,
+                    shove_top=self.shove_top,
+                )
             else:
                 strongest = _LIMP_RANGE
         return _Context(

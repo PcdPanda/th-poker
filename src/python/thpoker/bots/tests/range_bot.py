@@ -1,5 +1,8 @@
 from   dataclasses              import replace
+import numpy as np
 import pytest
+from   thpoker.analysis.tracking \
+                                import track
 from   thpoker.bots             import range_bot
 from   thpoker.bots.abstraction import AbstractAction, legal_abstract_actions
 from   thpoker.bots.bot         import PRESETS
@@ -9,7 +12,8 @@ from   thpoker.bots.range_bot   import (ExpertBot, NEUTRAL, RangeBot,
                                         stretched)
 from   thpoker.charts           import push_chart, strategy
 from   thpoker.game.cards       import (COMBOS, COMBOS_OF_CLASS, COMBO_CLASS,
-                                        PREFLOP_CLASSES, combo_index)
+                                        PREFLOP_CLASSES, combo_index,
+                                        parse_cards)
 from   thpoker.game.engine      import (apply_action, is_terminal, new_hand,
                                         observation)
 from   thpoker.game.rng         import Rng
@@ -154,11 +158,16 @@ def test_a_that_has_not_raised_keeps_the_tier_2_policy_facing_a_re_raise():
 
 
 def test_an_oversized_deep_open_leaves_the_charts():
-    # The charts were solved for a 2.5bb open; a 100bb open-shove goes to the size-aware Tier 2.
+    # The charts were solved for a 2.5bb open; a 100bb open-shove leaves them and, with one
+    # player left to call, reads as the top 7.5% (Tier 2 keeps reading 15%).
     state, _ = new_hand(GameConfig(2), 1, 0, (10_000, 10_000))
     shoved = play(state, Action(ActionType.RAISE, 10_000))
     assert chart_range(observation(shoved, 1), 0) is None
-    assert seat_range(observation(shoved, 1), 0) == preflop_range(observation(shoved, 1), 0)
+    assert seat_range(observation(shoved, 1), 0) == ranked_range(0.0, 0.075)
+    assert preflop_range(observation(shoved, 1), 0) == ranked_range(0.0, 0.15)
+    # A 30bb open that is not all in keeps the read in proportion to its size.
+    raised = play(state, Action(ActionType.RAISE, 3_000))
+    assert seat_range(observation(raised, 1), 0) == preflop_range(observation(raised, 1), 0)
     opened = play(state, Action(ActionType.RAISE, 250))
     assert chart_range(observation(opened, 1), 0) is not None
     # The charts' own all-in 4-bet after a 3-bet stays on them.
@@ -188,7 +197,7 @@ def test_a_deep_shove_leaves_the_charts_even_for_a_short_viewer():
     state, _ = new_hand(GameConfig(3), 1, 0, (10_000, 1_200, 10_000))
     view = observation(play(state, Action(ActionType.RAISE, 10_000)), 1)
     assert chart_range(view, 0) is None
-    assert seat_range(view, 0) == preflop_range(view, 0)
+    assert seat_range(view, 0) == ranked_range(0.0, 0.03 * 2.5**0.6)
 
 
 def test_a_short_stack_calling_an_open_leaves_the_charts():
@@ -375,3 +384,137 @@ def test_the_tally_counts_each_spot_against_what_a_solid_player_would_do():
     assert tally.observed["bets_flop"] == 0 and 0 < tally.expected["bets_flop"] < 1
     assert tally.read().folds_flop == (1 + 4) / (0.5 + 4)
     assert tally.read().limp_width == (1 + 5) / (2 + 10)
+
+
+@pytest.mark.parametrize(
+    "seats, hard_calls",
+    [(6, {"AA", "KK"}), (2, {"AA", "KK", "QQ", "JJ", "AKs", "AKo"})],
+)
+def test_hard_calls_a_deep_shove_off_the_charts_tighter_the_more_players_could_call(seats, hard_calls):
+    # A 100bb open-shove into five players reads as about QQ+ and AK, so the big blind calls
+    # with KK+; heads-up it reads wider and the big blind calls more, as any two cards would
+    # otherwise profit. Medium keeps reading it at 15% and calls far wider.
+    state, _ = new_hand(GameConfig(seats), 1, 0, (10_000,) * seats)
+    state = play(state, Action(ActionType.RAISE, 10_000), *[FOLD] * (seats - 2))
+    view = observation(state, state.big_blind_seat)
+
+    def called(bot) -> set[str]:
+        decisions = bot.policies(view, ONE_PER_CLASS)
+        return {
+            name
+            for name, hole in zip(PREFLOP_CLASSES, ONE_PER_CLASS)
+            if decisions[hole].get(AbstractAction.CALL, 0.0) >= 0.5
+        }
+
+    assert called(RangeBot("hard", BALANCED)) == hard_calls
+    assert called(EquityBot("medium", BALANCED)) >= hard_calls | {"TT", "99", "88", "AQo"}
+
+
+def _big_blind_facing_a_flop_bet(bat: int) -> Observation:
+    """Heads-up, 100bb: the button bets 'bet' into 500 on A-T-8 after the big blind checks."""
+    state = heads_up("KsQs", "2c3d", "AdTh8h4c2d")
+    return observation(play(state, Action(ActionType.RAISE, 250), CALL, CHECK, Action(ActionType.BET, bat)), 1)
+
+
+def _folds(view: Observation, *hands: str) -> list[float]:
+    holes = [combo_index(*parse_cards(hand)) for hand in hands]
+    decisions = RangeBot("hard", BALANCED).policies(view, holes)
+    return [decisions[h].get(AbstractAction.FOLD, 0.0) for h in holes]
+
+
+def test_bets_over_the_pot_read_stronger_so_hard_folds_more_against_them():
+
+    def folds(bet: int, *hands: str) -> list[float]:
+        state = heads_up("KsQs", "2c3d", "AdTh8h4c2d")
+        return _folds(
+            observation(play(state, Action(ActionType.RAISE, 250), CALL, Action(ActionType.BET, bet)), 0), *hands
+        )
+
+    weak = ("8d3d", "KhQh", "9c9d", "Td9d")
+    assert max(folds(500, *weak)) == 0.0
+    assert min(folds(9_750, *weak)) >= 0.75
+    assert folds(9_750, "Ah8d", "AsJs") == [0.0, 0.0]
+
+
+def test_the_answer_to_a_bet_moves_smoothly_from_one_pot_to_two():
+    def kept(bet: int) -> float:
+        view = _big_blind_facing_a_flop_bet(bet)
+        own = seat_range(view, 1)
+        holes = [i for i, (a, b) in enumerate(COMBOS) if own[i] and not {a, b} & set(view.board)]
+        decisions = RangeBot("hard", BALANCED).policies(view, holes)
+        folded = sum(own[h] * decisions[h].get(AbstractAction.FOLD, 0.0) for h in holes)
+        return 1 - folded / sum(own[h] for h in holes)
+
+    shares = [kept(bet) for bet in (500, 600, 700, 750, 800, 900, 1_000)]
+    assert shares == sorted(shares, reverse=True)
+    assert max(a - b for a, b in zip(shares, shares[1:])) < 0.03
+    # The read itself has no jump just above a pot.
+    at_pot, above = (seat_range(_big_blind_facing_a_flop_bet(bet), 0) for bet in (500, 505))
+    assert max(abs(a - b) for a, b in zip(at_pot, above)) < 0.02
+
+
+def _checked_to_on(street_checks: int, stack: int) -> Observation:
+    """Heads-up after a 2.5bb open and a call (a 500 pot), checked to the button after
+    `street_checks` more checks."""
+    state = heads_up("KsQs", "2c3d", "AdTh8h4c2d", (stack, stack))
+    return observation(play(state, Action(ActionType.RAISE, 250), CALL, *[CHECK] * street_checks), 0)
+
+
+def test_with_little_behind_hard_sizes_its_bets_toward_all_in():
+    hard = RangeBot("hard", BALANCED)
+    # 350 behind a 500 pot: every bet is all in.
+    distribution, rationale = hard.policy(_checked_to_on(1, 600))
+    assert set(distribution) <= {AbstractAction.CHECK, AbstractAction.ALL_IN}
+    assert rationale["bet_size_pot"] == 0.7
+    # 2,000 behind on the turn: a pot, the size that gets it in by the river, over the
+    # board's three quarters.
+    _, rationale = hard.policy(_checked_to_on(3, 2_250))
+    assert rationale["bet_size_pot"] == ((1 + 2 * 4) ** (1 / 2) - 1) / 2
+    # 5,000 behind: the board's size, three quarters of the pot on this wet flop.
+    _, rationale = hard.policy(_checked_to_on(1, 5_250))
+    assert rationale["bet_size_pot"] == 0.75 + 0.3 * (BALANCED.sizing_preference - 0.5)
+
+
+def test_a_river_jam_of_two_pots_bet_singly_strong_hands_for_value():
+    # 1,000 behind a 500 river pot: the bet is all in at two pots, needing 0.74 for value.
+    view = _checked_to_on(5, 1_250)
+    distribution, rationale = RangeBot("hard", BALANCED).policy(view)
+    assert set(distribution) <= {AbstractAction.CHECK, AbstractAction.ALL_IN}
+    assert (rationale["bet_size_pot"], rationale["value_bar"]) == (2.0, 0.74)
+    # Top pair, good kicker (0.88 equity) jams; T9 (0.60) mostly checks.
+    good, middling = (combo_index(*parse_cards(h)) for h in ("AsJs", "Td9d"))
+    decisions = RangeBot("hard", BALANCED).policies(view, [good, middling])
+    assert decisions[good] == {AbstractAction.ALL_IN: 1.0}
+    assert decisions[middling].get(AbstractAction.ALL_IN, 0.0) < 0.5
+
+
+def test_all_in_bluffs_come_from_draws_first():
+    board = tuple(parse_cards("AdTh8h"))
+    draw, weak_pair, air, aces = (combo_index(*parse_cards(h)) for h in ("Jh4h", "8s7s", "KcQc", "AsAc"))
+    equities = {draw: 0.35, weak_pair: 0.44, air: 0.15, aces: 0.95}
+    own = tuple(1.0 if i in equities else 0.0 for i in range(len(COMBOS)))
+    combos = sorted(equities)
+    bluffs = range_bot._jam_bluffs(board, combos, equities, own, 1.0)
+    assert bluffs == {draw: 1.0, weak_pair: 0.0, air: 0.0, aces: 0.0}
+    bluffs = range_bot._jam_bluffs(board, combos, equities, own, 1.5)
+    assert (bluffs[draw], bluffs[weak_pair]) == (1.0, 0.5)
+    # Asking about 30 unpaired six-high hands outside the range does not change who bluffs.
+    low = [i for i, (a, b) in enumerate(COMBOS) if max(a, b) // 4 < 5 and a // 4 != b // 4]
+    extra = low[:30]
+    more = range_bot._jam_bluffs(board, combos + extra, equities, own, 1.0)
+    assert {i: more[i] for i in combos} == {draw: 1.0, weak_pair: 0.0, air: 0.0, aces: 0.0}
+
+
+def test_after_checking_every_street_hard_still_defends_its_real_range_against_a_big_bet():
+    # Both seats are Hard, checking it down to the river; the button then jams 3.5 pots. Over the
+    # hands the big blind really holds (tracked exactly from its own play), it folds at most
+    # 88%: a pure bluff of that size then cannot profit by much.
+    hard = RangeBot("hard", BALANCED)
+    state = heads_up("KsQs", "4c3d", "Kc7d2s9h3c")
+    river = play(state, Action(ActionType.RAISE, 250), CALL, *[CHECK] * 5)
+    held = track(river, None, {0: hard, 1: hard}, None)[-1].ranges[1]
+    view = observation(play(river, Action(ActionType.BET, 1_750)), 1)
+    holes = [int(i) for i in np.flatnonzero(held)]
+    decisions = hard.policies(view, holes)
+    folded = sum(held[h] * decisions[h].get(AbstractAction.FOLD, 0.0) for h in holes)
+    assert folded / sum(held[h] for h in holes) <= 0.88

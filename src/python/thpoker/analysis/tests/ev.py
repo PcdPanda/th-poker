@@ -1,13 +1,13 @@
 from   dataclasses              import replace
-from   typing                   import Any
-
 import pytest
-
 import thpoker.analysis.ev
-from   thpoker.analysis.ev      import (PHONE_SECONDS, PROFILES, icm_equities,
-                                        option_values, pick_profile)
+from   thpoker.analysis.ev      import (PHONE_SECONDS, PROFILES, future_share,
+                                        icm_equities, option_values,
+                                        pick_profile)
 from   thpoker.analysis.tests.tracking \
                                 import Calls, REFERENCE, weights
+from   thpoker.analysis.tracking \
+                                import track
 from   thpoker.bots.abstraction import AbstractAction, legal_abstract_actions
 from   thpoker.bots.bot         import Bot, PRESETS
 from   thpoker.bots.equity_bot  import public_seed
@@ -19,7 +19,9 @@ from   thpoker.game.state       import (Action, ActionType, GameConfig,
                                         GameState, Observation)
 from   thpoker.game.tests.decks import (CALL, CHECK, heads_up, play,
                                         stacked_deck)
-from   thpoker.odds             import settled_equity
+from   thpoker.odds             import Equity, settled_equity
+from   typing                   import Any
+
 
 BOARD = "Qh9d4c3s2d"
 USER_HOLE = "KsKc"
@@ -174,7 +176,7 @@ class RarelyShoves(Bot):
 
 def test_pruned_branches_make_a_value_inexact_with_an_error():
     ranges = {0: weights(*VILLAIN_HANDS)}
-    full = option_values(spot(), {0: RarelyShoves()}, REFERENCE, ranges)
+    full = option_values(spot(), {0: RarelyShoves()}, REFERENCE, ranges, min_branch=0.0)
     rough = option_values(spot(), {0: RarelyShoves()}, REFERENCE, ranges, min_branch=1e-2)
     small_bet = Action(ActionType.BET, 100)  # the smallest bet; a third of the pot rounds up to it
     kept = next(v for v in full if v.action == small_bet)
@@ -262,3 +264,88 @@ def test_a_phone_prunes_more_and_solves_longer():
     pc, phone = PROFILES["pc"], PROFILES["phone"]
     assert phone.min_branch > pc.min_branch and phone.triage_branch > pc.triage_branch
     assert phone.solver_seconds > pc.solver_seconds
+
+
+def _reference_values(state: GameState, user: int, payouts: list[float] | None = None) -> dict:
+    """Option values by abstract action as the review's reference sees the decision now."""
+    ranges = track(state, user, {}, REFERENCE, reference_view=True)[-1].ranges
+    bots: dict[int, Bot] = {s: REFERENCE for s in ranges if s != user}
+    values = option_values(state, bots, REFERENCE, {s: w for s, w in ranges.items() if s != user}, payouts=payouts)
+    return {v.abstract: v for v in values}
+
+
+def _flop(user_hole: str, stack: int = 10_000) -> GameState:
+    """Heads-up after a 2.5bb open and a call (a 500 pot): the big blind (seat 1) acts first."""
+    state = heads_up("AsKd", user_hole, BOARD, (stack, stack))
+    return play(state, Action(ActionType.RAISE, 250), CALL)
+
+
+def test_a_deep_set_keeps_its_value_without_going_all_in():
+    # Before, a line that kept chips behind was worth at most the pot as it stood (5bb).
+    values = _reference_values(_flop("9c9h"), 1)
+    assert values[AbstractAction.ALL_IN].ev - values[AbstractAction.CHECK].ev < 5
+
+
+def test_a_flop_air_jam_rates_below_checking():
+    values = _reference_values(_flop("7c6h", 7_750), 1)  # 7,500 behind a 500 pot
+    assert values[AbstractAction.ALL_IN].ev < values[AbstractAction.CHECK].ev
+
+
+def test_a_100bb_open_shove_rates_below_folding_trash_and_below_opening_queens():
+    deck = stacked_deck(0, 6, dict(enumerate(["KdQd", "9s9c", "Th6h", "7c2d", "Jc3s", "8h8s"])), "")
+    state, _ = new_hand(GameConfig(6), 1, 0, (10_000,) * 6, deck=deck)
+    assert _reference_values(state, 3)[AbstractAction.ALL_IN].ev < 0
+    # Heads-up only one player can call, so the read is wider and the same holds.
+    assert _reference_values(heads_up("7c2h", "8c8d"), 0)[AbstractAction.ALL_IN].ev < 0
+    queens = _reference_values(heads_up("QcQd", "8c8d"), 0)
+    assert queens[AbstractAction.ALL_IN].ev < queens[AbstractAction.OPEN].ev
+    # Over a limper the pot holds more, so the read widens and the same holds.
+    for hole, worse_than in (("QcQd", AbstractAction.OPEN), ("7c2h", AbstractAction.FOLD)):
+        seats = ["KdQh", "9s9c", "Th6h", "AsJs", hole, "8h8s"]
+        state, _ = new_hand(GameConfig(6), 1, 0, (10_000,) * 6, deck=stacked_deck(0, 6, dict(enumerate(seats)), ""))
+        values = _reference_values(play(state, CALL), 4)
+        assert values[AbstractAction.ALL_IN].ev < values[worse_than].ev
+
+
+def test_with_nothing_behind_the_leaf_is_the_equity_and_the_error_grows_with_the_slope():
+    assert future_share(Equity(0.62, 0.0, True), 0.0, 2, 1, True, "bettor", False) == (
+        0.62,
+        0.0,
+    )
+    exact = future_share(Equity(0.8, 0.0, True), 10.0, 2, 1, True, "bettor", False)
+    noisy = future_share(Equity(0.8, 0.02, True), 10.0, 2, 1, True, "bettor", False)
+    higher = future_share(Equity(0.81, 0.0, True), 10.0, 2, 1, True, "bettor", False)
+    assert exact and noisy and higher
+    slope = (higher[0] - exact[0]) / 0.01
+    assert noisy[1] - exact[1] == pytest.approx(0.02 * slope, rel=0.05)
+    # Stacks this deep let a strong hand win much more than its equity of the pot.
+    assert slope > 1 and exact[0] > 1
+
+
+def test_the_shipped_fit_rises_with_equity_and_with_stacks_for_strong_hands():
+    def won(equity: float, spr: float) -> float:
+        share = future_share(Equity(equity, 0.0, True), spr, 2, 1, True, "bettor", False)
+        assert share is not None
+        return share[0]
+
+    assert won(0.2, 6) < won(0.5, 6) < won(0.8, 6)
+    # Hard's small deep sizes and weaker hands folding flatten the gain past about SPR 4.
+    assert won(0.85, 1) < won(0.85, 4) and won(0.85, 1) < won(0.85, 12)
+
+
+def test_side_pots_tournaments_and_rivers_keep_their_values(monkeypatch):
+    deck = stacked_deck(0, 3, {0: "JhJc", 1: USER_HOLE, 2: "AhAc"}, BOARD)
+    state, _ = new_hand(GameConfig(3), 1, 0, (10_000, 1_000, 10_000), deck=deck)
+    side_pot = play(state, Action(ActionType.RAISE, 1_000), CALL, CALL)  # the short seat is all in
+    spots = [
+        (side_pot, 2, None),
+        (_flop("9c9h"), 1, [0.65, 0.35]),
+        (play(_flop("9c9h"), *[CHECK] * 4), 1, None),
+    ]
+    with_fit = [_reference_values(state, user, payouts) for state, user, payouts in spots]
+    deep = _reference_values(_flop("9c9h"), 1)
+    monkeypatch.setattr(thpoker.analysis.ev, "_leaf_fits", lambda: {})
+    for (state, user, payouts), values in zip(spots, with_fit):
+        assert _reference_values(state, user, payouts) == values
+    # The control: without the fit the deep heads up flop is valued differently.
+    assert _reference_values(_flop("9c9h"), 1) != deep

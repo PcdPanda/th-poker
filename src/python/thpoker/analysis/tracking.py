@@ -2,19 +2,18 @@
 
 Bots are queried for the probability of their observed action with every hand they could hold,
 so their ranges are exact given their policies. The user's range is tracked with a reference
-policy (how a good opponent would read the user), where every bet or raise counts as one action
-whatever its size and a small floor keeps unusual plays from emptying the range; the same reading
-can be applied to every seat.
+policy (how a good opponent would read the user), where every bet or raise short of all in
+counts as one action whatever its size, all in as another, and a small floor keeps unusual plays
+from emptying the range; the same reading can be applied to every seat.
 """
 
 from   dataclasses              import dataclass
-
 import numpy as np
-
 from   thpoker.bots.abstraction import legal_abstract_actions, to_action
 from   thpoker.bots.bot         import Bot
 from   thpoker.game.cards       import COMBOS
 from   thpoker.game.engine      import observation, replay_states
+from   thpoker.game.rules       import legal_actions
 from   thpoker.game.state       import Action, GameState
 
 REFERENCE_FLOOR = 0.02
@@ -32,17 +31,22 @@ class Snapshot:
 
 def _likelihoods(bot: Bot, state: GameState, seat: int, holes: list[int], taken: Action, exact: bool) -> np.ndarray:
     """Chance that `seat` would take `taken` holding each combo in `holes`. `exact` matches the
-    chip amount; otherwise every bet or raise counts as the same action."""
+    chip amount; otherwise every bet or raise short of all in counts as the same action, and
+    all in as another."""
     view = observation(state, seat)
     concrete = {a: to_action(a, view) for a in legal_abstract_actions(view)}
+    top = legal_actions(view).max_raise_to
     policies = bot.policies(view, holes)
     result = np.zeros(len(COMBOS))
     for hole, distribution in policies.items():
         total = 0.0
         for abstract, probability in distribution.items():
             action = concrete[abstract]
-            # In one spot every bet or raise size shares its action type.
-            matches = (action == taken) if exact else (action.type == taken.type)
+            matches = (
+                action == taken
+                if exact
+                else action.type == taken.type and (action.amount == top) == (taken.amount == top)
+            )
             if matches:
                 total += probability
         result[hole] = total
@@ -51,9 +55,9 @@ def _likelihoods(bot: Bot, state: GameState, seat: int, holes: list[int], taken:
 
 def track(
     hand: GameState,
-    user_seat: int,
+    user_seat: int | None,
     bots: dict[int, Bot],
-    reference: Bot,
+    reference: Bot | None,
     reference_view: bool = False,
 ) -> list[Snapshot]:
     """Snapshots before every action of a finished hand and after its last one, seen from
@@ -61,11 +65,14 @@ def track(
 
     Bots are read exactly with their own policies; the user is read with `reference`. With
     `reference_view`, every seat is read with `reference` the way the user is, which is how a
-    good opponent would see the hand. Raises `ValueError` if a bot's observed action is
-    impossible under its own policy (the hand was not played by `bots`).
+    good opponent would see the hand. With no user seat, every seat is a bot read exactly,
+    nothing is removed for anyone's cards, and each snapshot is taken before the board cards
+    dealt with its state are removed, so a street's first snapshot holds the ranges as the
+    street before it closed. Raises `ValueError` if a bot's observed action is impossible
+    under its own policy (the hand was not played by `bots`).
     """
     states = replay_states(hand)
-    user_cards = hand.hole_cards[user_seat]
+    user_cards = () if user_seat is None else hand.hole_cards[user_seat]
     assert user_cards is not None
     live = [s for s in range(hand.config.num_seats) if hand.dealt_in[s]]
     ranges = {}
@@ -77,17 +84,21 @@ def track(
         ranges[seat] = weights
     snapshots = []
     for index, state in enumerate(states):
+        in_hand = [s for s in live if not state.folded[s]]
+        if user_seat is None:
+            snapshots.append(Snapshot(state, {s: ranges[s] / ranges[s].sum() for s in in_hand}))
         for weights in ranges.values():
             for card in state.board:
                 weights[_HOLDING[card]] = 0.0
-        in_hand = [s for s in live if not state.folded[s]]
-        snapshots.append(Snapshot(state, {s: ranges[s] / ranges[s].sum() for s in in_hand}))
+        if user_seat is not None:
+            snapshots.append(Snapshot(state, {s: ranges[s] / ranges[s].sum() for s in in_hand}))
         if index == len(hand.history):
             break
         entry = hand.history[index]
         seat = entry.seat
         holes = [int(i) for i in np.flatnonzero(ranges[seat])]
         if seat == user_seat or reference_view:
+            assert reference is not None
             likelihood = _likelihoods(reference, state, seat, holes, entry.action, exact=False)
             likelihood = REFERENCE_FLOOR + (1 - REFERENCE_FLOOR) * likelihood
         else:

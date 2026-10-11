@@ -5,8 +5,9 @@ import enum
 from   functools                import lru_cache
 import math
 from   thpoker.game.rules       import legal_actions
-from   thpoker.game.state       import (Action, ActionType, GameState,
-                                        LegalActions, Observation, Street)
+from   thpoker.game.state       import (Action, ActionType, AnteType,
+                                        GameState, LegalActions, Observation,
+                                        Street)
 from   types                    import MappingProxyType
 
 
@@ -89,6 +90,59 @@ def last_bet(view: Observation) -> tuple[int, int] | None:
         elif entry.action.type == ActionType.CALL:
             committed[entry.seat] = min(level, now[entry.seat])
     return found
+
+
+def bet_fractions(view: Observation) -> dict[int, float]:
+    """Each postflop bet or raise in the history, by index: the chips it added over the pot
+    before it, as `last_bet` measures it. One pass forward from the antes and blinds, each call
+    capped at what the seat had left, since range reads call this at every opponent node of a
+    review."""
+    n = view.config.num_seats
+    start = view.starting_stacks
+    spent = [0] * n  # chips each seat put in on earlier streets, antes included
+    if view.config.ante_type == AnteType.PER_PLAYER:
+        spent = [min(view.config.ante, start[s]) if view.dealt_in[s] else 0 for s in range(n)]
+    spent[view.big_blind_seat] += view.dead_money
+    pot = sum(spent)
+    committed = {
+        seat: min(blind, start[seat] - spent[seat])
+        for seat, blind in (
+            (view.small_blind_seat, view.config.small_blind),
+            (view.big_blind_seat, view.config.big_blind),
+        )
+    }
+    level, street = view.config.big_blind, Street.PREFLOP
+    fractions = {}
+    for index, entry in enumerate(view.history):
+        if entry.street != street:
+            for seat, chips in committed.items():
+                spent[seat] += chips
+                pot += chips
+            committed, level, street = {}, 0, entry.street
+        if entry.action.type in (ActionType.BET, ActionType.RAISE):
+            amount = entry.action.amount
+            assert amount is not None
+            if street != Street.PREFLOP:
+                added = amount - committed.get(entry.seat, 0)
+                fractions[index] = added / (pot + sum(committed.values()))
+            committed[entry.seat] = level = amount
+        elif entry.action.type == ActionType.CALL:
+            committed[entry.seat] = min(level, start[entry.seat] - spent[entry.seat])
+
+    return fractions
+
+
+def stack_to_pot(view: GameState | Observation, seat: int) -> float:
+    """The chips `seat` can still put in against the deepest live opponent with chips behind,
+    over the pot once it has called; 0 when nobody can bet against it."""
+    level = max(view.committed_this_street)
+    call = min(level - view.committed_this_street[seat], view.stacks[seat])
+    others = [
+        view.stacks[s] - min(level - view.committed_this_street[s], view.stacks[s])
+        for s in range(view.config.num_seats)
+        if s != seat and view.dealt_in[s] and not view.folded[s] and not view.all_in[s]
+    ]
+    return min(view.stacks[seat] - call, max(others, default=0)) / (view.pot + call)
 
 
 def defense_share(view: Observation) -> float | None:

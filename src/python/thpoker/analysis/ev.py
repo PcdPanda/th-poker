@@ -5,8 +5,11 @@ The rest of the current betting round is walked exactly: each opponent answers w
 applied to every hand in its range, so the range splits by action and later answers see the
 updated range, and the player's own later actions in the round follow the reference policy.
 When the round closes, the hand is valued from equity against the ranges that got there: exact
-once the hand is over or nobody can bet any more, otherwise scaled by the preflop solver's
-realization model, since later streets are not walked (a walk of every later street does not fit
+once the hand is over or nobody can bet any more, otherwise from a fit of what Hard self-play
+wins from such a spot (`data/leaf_values.json.gz`, by `generators/leaf_values.py`): with stacks
+behind, a strong hand wins more than the pot on later streets. Outside the fit (tournaments, side
+pots, all-in players, stacks deeper than it saw) the preflop solver's realization model scales
+the equity instead, as later streets are not walked (a walk of every later street does not fit
 a phone's budget). In tournaments every leaf is also valued in ICM equity; each pot then goes to
 the player with probability equal to its share of that pot, and a pot it cannot win is split
 evenly in chance among the players who can.
@@ -25,21 +28,26 @@ times a small fixed workload to choose one. The PC profile is the analysis defau
 
 from   collections.abc          import Sequence
 from   dataclasses              import dataclass
-import time
-
+from   functools                import cache, lru_cache
+import gzip
+import json
+import math
 import numpy as np
-
+from   pathlib                  import Path
 from   thpoker.bots.abstraction import (AbstractAction, acts_last,
-                                        legal_abstract_actions, to_action)
+                                        legal_abstract_actions, stack_to_pot,
+                                        to_action)
 from   thpoker.bots.bot         import Bot
 from   thpoker.bots.equity_bot  import public_seed
-from   thpoker.game.cards       import COMBOS
+from   thpoker.game.cards       import COMBOS, combo_index
 from   thpoker.game.engine      import (Pot, apply_action, build_pots,
                                         is_terminal, observation)
+from   thpoker.game.evaluator   import evaluate_combos
 from   thpoker.game.rng         import Rng
 from   thpoker.game.state       import Action, ActionType, GameState, Street
-from   thpoker.odds             import (caller_share, hand_equity,
+from   thpoker.odds             import (Equity, caller_share, hand_equity,
                                         settled_equity)
+import time
 
 
 @dataclass(frozen=True)
@@ -78,6 +86,103 @@ def pick_profile(name: str = "auto") -> Profile:
 
 # Branches reached less often than this from the option are dropped, their siblings renormalized.
 MIN_BRANCH = PROFILES["pc"].min_branch
+
+LEAF_VALUES = Path(__file__).resolve().parents[1] / "data" / "leaf_values.json.gz"
+STREETS_LEFT = {Street.FLOP: 2, Street.TURN: 1}
+# A hand counts as a draw when its equity beats what it wins on the board as it is by this much.
+DRAW_GAIN = 0.15
+_HOLDING = [np.array([i for i, combo in enumerate(COMBOS) if card in combo]) for card in range(52)]
+
+
+# Stack-to-pot ratios where the leaf fit sets its coefficients; between them they move linearly in
+# log(1 + SPR), and past the ends they stay flat.
+LEAF_KNOTS = np.log1p([0.5, 1.5, 3.0, 6.0, 12.0, 24.0])
+
+
+def leaf_terms(equity: float, spr: float, in_position: bool, role: str, draw: bool) -> tuple[np.ndarray, np.ndarray]:
+    """The leaf fit's terms, each scaled by log(1 + SPR) in the fit (a hand wins its equity of the
+    pot when nothing is behind, and these move it from there), and their slopes in equity."""
+    knots = np.array([np.interp(math.log1p(spr), LEAF_KNOTS, unit) for unit in np.eye(len(LEAF_KNOTS))])
+    base = [1.0, equity, equity**2, in_position, role == "bettor", role == "caller", draw]
+    return np.outer(base, knots).ravel(), np.outer([0, 1, 2 * equity, 0, 0, 0, 0], knots).ravel()
+
+
+def leaf_key(streets: int, multiway: bool) -> str:
+    return f"{streets}-{'multiway' if multiway else 'heads-up'}"
+
+
+def leaf_group(in_position: bool, role: str) -> str:
+    """The position and role within a fit whose sampled equities bound where it is used."""
+    return f"{role}-{'in' if in_position else 'out of'} position"
+
+
+@cache
+def _leaf_fits() -> dict[str, dict]:
+    data = json.loads(gzip.decompress(LEAF_VALUES.read_bytes()))
+    return {
+        key: {**fit, "coef": np.array(fit["coef"]), "cov": np.array(fit["cov"])} for key, fit in data["fits"].items()
+    }
+
+
+def future_share(
+    equity: Equity,
+    spr: float,
+    streets: int,
+    opponents: int,
+    in_position: bool,
+    role: str,
+    draw: bool,
+) -> tuple[float, float] | None:
+    """What a hand wins from a closed street to the end of the hand as a share of the pot, and
+    its error (the fit's, plus the equity's times how fast the value moves with equity); None
+    where the fit has no data: deeper than it saw, or an equity outside what it saw for this
+    position and role (a quadratic strays fast past its data)."""
+    fit = _leaf_fits().get(leaf_key(streets, opponents > 1))
+    if fit is None or spr > fit["max_spr"]:
+        return None
+    low, high = fit["equities"].get(leaf_group(in_position, role), (1.0, 0.0))
+    if not low <= equity.value <= high:
+        return None
+    coef, scale = fit["coef"], math.log1p(spr)
+    terms, slopes = leaf_terms(equity.value, spr, in_position, role, draw)
+    share = equity.value + scale * float(terms @ coef)
+    slope = 1 + scale * float(slopes @ coef)
+    error = scale * math.sqrt(max(0.0, float(terms @ fit["cov"] @ terms)))
+    return min(max(share, -spr), 1 + opponents * spr), error + equity.stderr * abs(slope)
+
+
+@lru_cache(maxsize=64)
+def _board_values(board: tuple[int, ...]) -> np.ndarray:
+    """Every combo's hand value on `board` (-1 where it holds a board card)."""
+    live = [i for i, combo in enumerate(COMBOS) if not set(combo) & set(board)]
+    values = np.full(len(COMBOS), -1, dtype=np.int64)
+    values[live] = evaluate_combos(board, [COMBOS[i] for i in live])
+    return values
+
+
+def showdown_share(hole: tuple[int, int], board: tuple[int, ...], ranges: list[np.ndarray]) -> float:
+    """The share of the pot `hole` would win if the board stopped here: against each range,
+    hands it beats plus half the ties, multiplied across ranges."""
+    values = _board_values(board)
+    mine = values[combo_index(*hole)]
+    possible = values >= 0
+    for card in hole:
+        possible[_HOLDING[card]] = False
+    share = 1.0
+    for weights in ranges:
+        w = weights * possible
+        total = w.sum()
+        if total > 0:
+            share *= (w[values < mine].sum() + 0.5 * w[values == mine].sum()) / total
+    return float(share)
+
+
+def last_raiser(state: GameState, street: Street) -> int | None:
+    """Who made the last bet or raise of `street`, if anyone."""
+    raisers = [
+        e.seat for e in state.history if e.street == street and e.action.type in (ActionType.BET, ActionType.RAISE)
+    ]
+    return raisers[-1] if raisers else None
 
 
 @dataclass(frozen=True)
@@ -242,9 +347,25 @@ class _Walk:
                     if settled
                     else hand_equity(self.hole, self.root.board, ranges, rng)
                 )
+                if (
+                    not settled
+                    and self.payouts is None
+                    and len(pots) == 1
+                    and not any(state.all_in[s] for s in pot.eligible)
+                ):
+                    future = self._future(state, equity, ranges)
+                    if future is not None:
+                        won, error = future
+                        start = self.root.stacks[self.user]
+                        return (
+                            np.array([behind[self.user] + won * pot.amount - start]),
+                            np.array([error * pot.amount]),
+                            False,
+                        )
                 share = equity.value if settled else self._realized(state, equity.value)
                 contested.append((index, share, equity.stderr))
                 exact = exact and equity.exact and settled
+
         if self.payouts is None:
             won = float(sum(pot.amount for pot in pots if pot.eligible == (self.user,)))
             won += sum(share * pots[index].amount for index, share, _ in contested)
@@ -297,18 +418,33 @@ class _Walk:
             error += equity_error * np.abs(swing)
         return value, error
 
+    def _future(self, state: GameState, equity: Equity, ranges: list[np.ndarray]) -> tuple[float, float] | None:
+        """`future_share` for the user at this street's close; preflop the realization model
+        stays, since the preflop charts were solved with it."""
+        if self.root.street == Street.PREFLOP:
+            return None
+        raiser = last_raiser(state, self.root.street)
+        role = "none" if raiser is None else "bettor" if raiser == self.user else "caller"
+        board = self.root.board
+        draw = equity.value - showdown_share(self.hole, board, ranges) > DRAW_GAIN
+        return future_share(
+            equity,
+            stack_to_pot(state, self.user),
+            STREETS_LEFT[self.root.street],
+            len(ranges),
+            acts_last(state, self.user),
+            role,
+            draw,
+        )
+
     def _realized(self, state: GameState, equity: float) -> float:
         """Pot share when betting continues on later streets. The caller of the round's last
         bet, or the player out of position when nobody bet, realizes `caller_share`; the other
         side wins the rest, as in the preflop solver."""
         in_position = acts_last(state, self.user)
-        raisers = [
-            e.seat
-            for e in state.history
-            if e.street == self.root.street and e.action.type in (ActionType.BET, ActionType.RAISE)
-        ]
-        if raisers:
-            is_caller = raisers[-1] != self.user
+        raiser = last_raiser(state, self.root.street)
+        if raiser is not None:
+            is_caller = raiser != self.user
         else:
             is_caller = not in_position
         if is_caller:

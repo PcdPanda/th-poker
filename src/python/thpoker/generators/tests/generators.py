@@ -1,6 +1,9 @@
 import numpy as np
 import pytest
+from   thpoker.analysis.ev      import LEAF_KNOTS, leaf_group, leaf_terms
 from   thpoker.game.cards       import COMBOS_OF_CLASS, PREFLOP_CLASSES
+from   thpoker.game.rng         import Rng
+from   thpoker.generators       import leaf_values
 from   thpoker.generators.preflop_equity \
                                 import generate
 from   thpoker.generators.preflop_ranges \
@@ -113,3 +116,40 @@ def test_regret_matching_plays_the_better_action_and_drops_negative_regret():
     # Shoving beat the even mix (0.25) by 0.75; folding's regret would be negative, so it is zero.
     assert np.allclose(regret[0], 0.75) and np.allclose(regret[1], 0.0)
     assert np.allclose(_current(regret), 1.0)
+
+
+def test_leaf_samples_are_repeatable_and_won_stays_within_the_stacks():
+    rows = leaf_values.sample((7, 0, 30))
+    assert rows and rows == leaf_values.sample((7, 0, 30))
+    for key, terms, _, won_less_equity, spr, _, equity in rows:
+        # The second term at each knot is the equity weighted by that knot; together, the equity.
+        assert sum(terms[len(LEAF_KNOTS) : 2 * len(LEAF_KNOTS)]) == pytest.approx(equity)
+        assert 0 <= equity <= 1
+        if key.endswith("heads-up"):  # multiway, a winner can take several stacks
+            assert -spr - 1e-9 <= won_less_equity + equity <= 1 + spr + 1e-9
+
+
+def test_the_leaf_fit_recovers_known_coefficients():
+    rng = Rng(3)
+    truth = np.array([0.05 * ((i % 7) - 3) for i in range(7 * len(LEAF_KNOTS))])
+    rows = []
+    for _ in range(8_000):
+        equity, spr = rng.random(), 30 * rng.random() ** 2
+        # Out of position the hands are never stronger than 0.6, and callers are rare.
+        in_position = rng.random() < 0.5
+        equity = equity if in_position else 0.6 * equity
+        role = ("none", "bettor", "caller")[rng.randbelow(3)]
+        if role == "caller" and not in_position and rng.random() > 0.05:
+            role = "bettor"
+        terms, _ = leaf_terms(equity, spr, in_position, role, rng.random() < 0.2)
+        noise = 0.01 * (rng.random() - 0.5) * (1 + spr)
+        won = np.log1p(spr) * terms @ truth + noise
+        group = leaf_group(in_position, role)
+        rows.append(("2-heads-up", terms.tolist(), np.log1p(spr), won, spr, group, equity))
+    rows.append(("1-multiway", *rows[0][1:]))
+    fits = leaf_values.fit(rows)
+    assert set(fits) == {"2-heads-up"}  # too few samples for the other key
+    assert np.allclose(fits["2-heads-up"]["coef"], truth, atol=0.02)
+    seen = fits["2-heads-up"]["equities"]
+    assert "caller-out of position" not in seen  # too few samples to be used
+    assert seen["bettor-out of position"][1] <= 0.6 < seen["bettor-in position"][1]

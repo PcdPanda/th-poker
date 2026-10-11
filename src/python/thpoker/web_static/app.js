@@ -61,6 +61,7 @@ const loading = new Set();  // the rows whose review is on its way
 let inBB = false;  // the hands tables' Put in and Result in big blinds rather than chips
 let clock = null;  // the move timer of this turn: { turn, deadline, warned, fired }, or null
 let clockPaused = null;  // when a coach request began: waiting on it isn't the player's time
+let controlsAbove = false;
 let timeoutNote = "";  // what the timer did, shown with the status until the next move
 // Title, tip, class, and the value a click on the title sorts by, and whether it is an amount.
 const COLUMNS = [
@@ -318,6 +319,19 @@ function show(view) {
   document.getElementById("helpers-toggle").hidden = view !== "table";
   document.getElementById("training-pill").hidden = view !== "table" || !state || !state.training;
   document.getElementById("chance-mode").hidden = view !== "table" || !state || !state.training;
+  renderToTable();
+}
+
+function renderToTable() {
+  // The way back up from the log and reviews below the table; it turns gold on the player's turn.
+  const button = document.getElementById("to-table");
+  button.hidden = !controlsAbove || document.getElementById("table").hidden;
+  const turn = Boolean(state && state.your_turn);
+  const left = turn && state.timer && clock ? secondsLeft() : null;
+  button.classList.toggle("turn", turn);
+  button.classList.toggle("low", left !== null && left <= Math.min(10, state.timer / 3));
+  document.getElementById("to-table-text").textContent = !turn ? "Back to table"
+    : left !== null ? "Your turn · " + left + " s" : "Your turn";
 }
 
 function seatNames(players) {
@@ -684,10 +698,15 @@ function startClock(actions) {
   tickClock();
 }
 
+function secondsLeft() {
+  return Math.max(0, Math.ceil((clock.deadline - (clockPaused ?? Date.now())) / 1000));
+}
+
 function tickClock() {
+  renderToTable();
   const pill = document.getElementById("clock");
   if (!clock || !pill) return;
-  const left = Math.max(0, Math.ceil((clock.deadline - (clockPaused ?? Date.now())) / 1000));
+  const left = secondsLeft();
   pill.textContent = left + " s left" + (clockPaused ? ", paused" : "");
   const low = left <= Math.min(10, state.timer / 3);
   pill.classList.toggle("low", low);
@@ -956,6 +975,7 @@ function render() {
   renderSwitches();
   renderHands();
   showChance();
+  renderToTable();
 }
 
 function clearCoach() {
@@ -1471,6 +1491,17 @@ for (const radio of document.querySelectorAll("input[name=chance]")) {
 
 document.querySelector("#table .copy-host").prepend(reviewSwitches());
 setInterval(tickClock, 250);
+
+
+new IntersectionObserver(([entry]) => {
+  controlsAbove = !entry.isIntersecting && entry.boundingClientRect.bottom < 0;
+  renderToTable();
+}).observe(document.getElementById("controls"));
+document.getElementById("to-table").addEventListener("click", (event) => {
+  const smooth = !window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  window.scrollTo({ top: 0, behavior: smooth ? "smooth" : "auto" }); // the top seat sits above the table box
+  event.currentTarget.blur();
+});
 
 const rangeDialog = document.getElementById("range-dialog");
 rangeDialog.addEventListener("click", (event) => {

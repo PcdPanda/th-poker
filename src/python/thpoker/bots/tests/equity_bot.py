@@ -4,7 +4,8 @@ import pytest
 
 from   thpoker.bots.abstraction import AbstractAction, legal_abstract_actions
 from   thpoker.bots.bot         import PRESETS
-from   thpoker.bots.equity_bot  import EquityBot, assumed_ranges, preflop_range
+from   thpoker.bots.equity_bot  import (EquityBot, assumed_ranges, bet_shifted,
+                                        preflop_range)
 from   thpoker.bots.tests.bot   import random_views
 from   thpoker.game.cards       import COMBOS, combo_index, parse_cards
 from   thpoker.game.engine      import apply_action, new_hand, observation
@@ -184,3 +185,17 @@ def test_the_oversized_read_phases_in_with_depth():
 
     assert shove_width(2_600) == pytest.approx(shove_width(2_500), abs=0.03)
     assert shove_width(2_500) > 0.3
+
+
+def test_a_bet_over_the_pot_shrinks_the_floor_but_keeps_a_small_one():
+    # The big blind bets two pots (400 into 200): Hard's floor of 0.25 shrinks by the square
+    # of the size, and Expert's lower floor for a user who rarely bets stops at 0.05.
+    state = play(heads_up("QcJd", "8c8d", "8s5h2dKcAc"), CALL, CHECK, Action(ActionType.BET, 400))
+    view = observation(state, 0)
+    full = tuple(1.0 for _ in COMBOS)
+    for floor, weakest in ((0.25, 0.0625), (0.1, 0.05)):
+        shifted = bet_shifted(view, 1, full, (floor, floor), sized=True)
+        live = [w for w, (a, b) in zip(shifted, COMBOS) if not {a, b} & set(view.board)]
+        assert min(live) == pytest.approx(weakest, abs=1e-3)
+    # Unsized, as Medium reads it, the floor stays (the weakest tied hands rank a little above 0).
+    assert 0.25 <= min(bet_shifted(view, 1, full)) < 0.26

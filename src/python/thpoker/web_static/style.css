@@ -791,6 +791,57 @@ button.seat-chance {
   font-weight: 700;
 }
 
+#to-table {
+  position: fixed;
+  right: max(var(--space-4), env(safe-area-inset-right));
+  bottom: max(var(--space-4), env(safe-area-inset-bottom));
+  z-index: 10;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--touch);
+  line-height: 1;
+  padding: 0 var(--space-4) 0 var(--space-3);
+  border: 1px solid var(--gold);
+  border-radius: var(--round);
+  background: color-mix(in srgb, var(--panel-2) 90%, transparent);
+  backdrop-filter: blur(6px);
+  color: var(--gold);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 45%);
+  animation: rise-in 0.18s ease-out;
+}
+
+#to-table .up {
+  width: 1.1em;
+  height: 1.1em;
+  background: currentColor;
+  mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M12 19V5M6 11l6-6 6 6'/%3E%3C/svg%3E") center / contain no-repeat;
+}
+
+#to-table.turn {
+  background: var(--gold);
+  color: var(--ink);
+  box-shadow: 0 6px 20px rgb(0 0 0 / 45%), 0 0 22px color-mix(in srgb, var(--gold) 55%, transparent);
+}
+
+#to-table.low {
+  border-color: var(--bad);
+  background: var(--bad);
+}
+
+@keyframes rise-in {
+  from {
+    opacity: 0;
+    transform: translateY(0.6rem);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  #to-table {
+    animation: none;
+  }
+}
+
 .review-switches {
   margin: 0 0 var(--space-2);
   color: var(--muted);

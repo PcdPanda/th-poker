@@ -1,9 +1,6 @@
 from   dataclasses              import replace
-from   typing                   import Any
-
 import numpy as np
 import pytest
-
 from   thpoker.analysis.tracking \
                                 import REFERENCE_FLOOR, _likelihoods, track
 from   thpoker.bots.abstraction import (AbstractAction, legal_abstract_actions,
@@ -15,9 +12,10 @@ from   thpoker.game.engine      import observation
 from   thpoker.game.rng         import Rng
 from   thpoker.game.session     import Mode, SessionConfig
 from   thpoker.game.state       import (Action, ActionType, AnteType,
-                                        GameConfig, Observation)
+                                        GameConfig, Observation, Street)
 from   thpoker.game.tests.decks import CHECK, heads_up, play
 from   thpoker.table            import TableConfig, TableRunner
+from   typing                   import Any
 
 REFERENCE = RangeBot("reference", PRESETS["balanced"])
 
@@ -147,3 +145,43 @@ def test_tracking_reads_every_bot_action_the_way_the_bot_plays(tier, num_seats, 
                 real = hand.hole_cards[seat]
                 assert seat == 0 or (real is not None and weights[combo_index(*real)] > 0)
     assert checked >= 20
+
+
+class JamsPairs(Bot):
+    """Opens, then, checked to after the flop, jams pocket pairs and bets a third of the pot
+    with everything else."""
+
+    name, style = "jams", PRESETS["balanced"]
+
+    def policy(self, view: Observation) -> tuple[dict[AbstractAction, float], dict[str, Any]]:
+        legal = legal_abstract_actions(view)
+        if AbstractAction.OPEN in legal:
+            return {AbstractAction.OPEN: 1.0}, {}
+        if AbstractAction.CHECK not in legal or view.street == Street.PREFLOP:
+            return {AbstractAction.CHECK if AbstractAction.CHECK in legal else AbstractAction.CALL: 1.0}, {}
+        a, b = view.my_cards
+        return {AbstractAction.ALL_IN if a // 4 == b // 4 else AbstractAction.BET_33: 1.0}, {}
+
+
+def test_the_reference_reads_a_jam_apart_from_smaller_bets():
+    opened = play(heads_up("7h7c", "AsKd"), Action(ActionType.RAISE, 250), Action(ActionType.CALL), CHECK)
+    pair, other = combo_index(*parse_cards("TcTd")), combo_index(*parse_cards("Qc7d"))
+    for bet, strong in ((9_750, pair), (375, other)):
+        state = play(opened, Action(ActionType.BET, bet))
+        final = track(state, 0, {1: Calls()}, JamsPairs())[-1].ranges[0]
+        weak = other if strong == pair else pair
+        assert final[weak] / final[strong] == pytest.approx(REFERENCE_FLOOR)
+
+
+def test_with_no_user_every_seat_is_read_exactly_and_ranges_close_with_their_street():
+    # The button opens pairs only, the big blind calls and checks the flop; nobody's cards are
+    # removed.
+    state = play(heads_up("7h7c", "AsKd"), Action(ActionType.RAISE, 250), Action(ActionType.CALL), CHECK)
+    snapshots = track(state, None, {0: RaisesPairs(), 1: Calls()}, None)
+    pairs = np.array([a // 4 == b // 4 for a, b in COMBOS])
+    assert snapshots[0].ranges[1][combo_index(*parse_cards("AsKd"))] == 1 / len(COMBOS)
+    flop = next(i for i, s in enumerate(snapshots) if s.state.street == Street.FLOP)
+    first = snapshots[flop].ranges[0]
+    assert not first[~pairs].any() and first[combo_index(*parse_cards("QhQd"))] > 0
+    # Once the flop's first action is read, hands holding a flop card are gone.
+    assert snapshots[flop + 1].ranges[0][combo_index(*parse_cards("QhQd"))] == 0

@@ -8,6 +8,8 @@ then shifted toward strong hands by each postflop bet or raise). Facing a bet it
 the top share of its range that the minimum defense frequency asks for, or whenever it is
 clearly priced in; when checked to it bets its value hands plus a balanced share of bluffs
 (b/(1+b) of the value hands on the river, more on earlier streets), sized by board texture.
+Stacks shape the sizes: with little behind it bets toward getting them in by the river and
+jams at the end. Bets over the pot read as strong, so it folds more against them.
 """
 
 from   bisect                   import bisect_left, bisect_right
@@ -21,14 +23,16 @@ from   thpoker.bots.abstraction import (AbstractAction, NEVER_FOLD_EQUITY,
                                         effective_stack, finish, last_bet,
                                         legal_abstract_actions,
                                         raises_this_street, sigmoid,
-                                        usual_raises)
+                                        stack_to_pot, to_action, usual_raises)
 from   thpoker.bots.bot         import PRESETS, Policy, Style, TierBot
 from   thpoker.bots.equity_bot  import (EquityBot, bet_shifted, preflop_range,
                                         public_seed)
 from   thpoker.charts           import call_chart, push_chart, strategy
 from   thpoker.game.cards       import (COMBOS, COMBOS_OF_CLASS, COMBO_CLASS,
                                         PREFLOP_CLASSES)
-from   thpoker.game.engine      import observation, replay_states
+from   thpoker.game.engine      import (apply_action, new_hand, observation,
+                                        replay_states)
+from   thpoker.game.evaluator   import evaluate_combos
 from   thpoker.game.rng         import Rng
 from   thpoker.game.rules       import legal_actions
 from   thpoker.game.state       import (ActionType, GameState, Observation,
@@ -38,7 +42,18 @@ from   thpoker.odds             import (Range, hand_range, range_equities,
 from   typing                   import Any
 
 _BLUFF_STREET_FACTOR = {Street.FLOP: 1.5, Street.TURN: 1.2, Street.RIVER: 1.0}
+# How wide a strong player reads a 3-bet and a 4-bet off the charts: with their bluffs, not the
+# value-only widths Tier 2 reads (EquityBot's RERAISE_TOPS), which make it fold too much to them.
 _RERAISE_TOPS = (0.1, 0.04)
+# A deep all-in raise off the charts reads as about QQ+ and AK against five possible callers, so
+# only KK+ calls it; against fewer it reads wider (EquityBot's `preflop_range`).
+_SHOVE_TOP = 0.03
+# Postflop, at or below this stack-to-pot ratio every bet and raise is all in; up to
+# `_GEOMETRIC_SPR`, bets grow toward the size that gets the stacks in by the river.
+_JAM_SPR = 1.5
+_GEOMETRIC_SPR = 4.0
+_STREETS_LEFT = {Street.FLOP: 3, Street.TURN: 2, Street.RIVER: 1}
+_JAM_BLUFFS = (0.25, 0.45)  # the equity band all-in bluffs come from, draws first
 # Chart thresholds sit on a half-big-blind grid; mix across about that width.
 _CHART_SOFTNESS_BB = 0.3
 # How much wider (above 1) or narrower a seat's continuing and re-raising chart rows are, from
@@ -246,18 +261,19 @@ def seat_range(
         weights = charted
     else:
         weights = (
-            preflop_range(view, seat, reraise_tops=_RERAISE_TOPS)
+            preflop_range(view, seat, reraise_tops=_RERAISE_TOPS, shove_top=_SHOVE_TOP)
             if limp is None
-            else preflop_range(view, seat, limp, _RERAISE_TOPS)
+            else preflop_range(view, seat, limp, _RERAISE_TOPS, _SHOVE_TOP)
         )
-    return bet_shifted(view, seat, weights, floors)
+    return bet_shifted(view, seat, weights, floors, sized=True)
 
 
 class RangeBot(TierBot):
     def __init__(self, name: str, style: Style):
         self.name = name
         self.style = style
-        self._fallback = EquityBot(name, style, _RERAISE_TOPS)
+        self._fallback = EquityBot(name, style, _RERAISE_TOPS, _SHOVE_TOP)
+        self._tracked: tuple[str, dict[tuple, Range]] = ("", {})
 
     def chart_factors(
         self, view: Observation, order: tuple[int, ...], raisers: list[int], index: int, node: str
@@ -272,6 +288,53 @@ class RangeBot(TierBot):
         """After the flop, what to add to the share of its range it continues with facing a
         bet, what to add to its value bar, and what to multiply its bluffs by."""
         return 0.0, 0.0, 1.0
+
+    def own_range(self, view: Observation) -> Range:
+        """The range it ranks its hand in. Facing a bet after it has checked this hand, the range
+        its own policy really leaves it: `seat_range` narrows only on bets, so after checks it
+        would still count strong hands it would have bet, and its defense share would land on
+        hands it does not hold (it folded 99% to air jams). Elsewhere, and when its own actions
+        are impossible under its policy (another bot played the seat), `seat_range`."""
+        checked = any(
+            e.seat == view.seat and e.street != Street.PREFLOP and e.action.type == ActionType.CHECK
+            for e in view.history
+        )
+        if view.street == Street.PREFLOP or last_bet(view) is None or not checked:
+            return self.seat_range(view, view.seat)
+        last = max(i for i, e in enumerate(view.history) if e.seat == view.seat)
+        key = (view.seat, view.starting_stacks, view.history[: last + 1], view.board)
+        if self._tracked[0] != view.hand_id:
+            self._tracked = (view.hand_id, {})
+        found = self._tracked[1].get(key)
+        if found is None:
+            found = self._self_tracked(view) or self.seat_range(view, view.seat)
+            self._tracked[1][key] = found
+        return found
+
+    def _self_tracked(self, view: Observation) -> Range | None:
+        """Its range from its own actions this hand, each weighted by the chance its policy
+        takes it, on a replay that deals its own cards and the board as they fell (the others'
+        cards are hidden from it anyway); None if no hand could have taken them."""
+        n = view.config.num_seats
+        order = [(view.button + k) % n for k in range(1, n + 1) if view.dealt_in[(view.button + k) % n]]
+        spare = iter(c for c in range(52) if c not in set(view.my_cards) | set(view.board))
+        dealt = {s: view.my_cards if s == view.seat else (next(spare), next(spare)) for s in order}
+        top = [dealt[s][0] for s in order] + [dealt[s][1] for s in order] + list(view.board)
+        deck = tuple(top + [c for c in range(52) if c not in top])
+        state, _ = new_hand(view.config, 0, view.button, view.starting_stacks, view.dealt_in, view.hand_id, deck)
+        weights = [1.0] * len(COMBOS)
+        for entry in view.history:
+            if entry.seat == view.seat:
+                past = observation(state, view.seat)
+                dead = set(past.board)
+                holes = [i for i, w in enumerate(weights) if w > 0 and not dead & set(COMBOS[i])]
+                concrete = {a: to_action(a, past) for a in legal_abstract_actions(past)}
+                for hole, distribution in self.policies(past, holes).items():
+                    weights[hole] *= sum(p for a, p in distribution.items() if concrete[a] == entry.action)
+            state, _ = apply_action(state, entry.action)
+        dead = set(view.board)
+        result = tuple(0.0 if dead & set(COMBOS[i]) else w for i, w in enumerate(weights))
+        return result if sum(result) > 0 else None
 
     def decisions(self, view: Observation, holes: list[int]) -> dict[int, Policy]:
         """One chart lookup preflop or one equity pass postflop serves every hand. Off the
@@ -418,7 +481,7 @@ class RangeBot(TierBot):
             s for s in range(view.config.num_seats) if s != view.seat and view.dealt_in[s] and not view.folded[s]
         ]
         opponent_ranges = [self.seat_range(view, s) for s in opponents]
-        own = self.seat_range(view, view.seat)
+        own = self.own_range(view)
         call_shift, value_shift, bluff_factor = self.exploits(view, opponents)
         combos = sorted({i for i, w in enumerate(own) if w > 0} | set(holes))
         equities = range_equities(view.board, combos, opponent_ranges, Rng(public_seed(view)))
@@ -437,10 +500,20 @@ class RangeBot(TierBot):
         }
         if (call_shift, value_shift, bluff_factor) != (0.0, 0.0, 1.0):
             common["exploits"] = [call_shift, value_shift, bluff_factor]
+        jam = False
         if legal.can_check:
             size = 0.75 if tags.wet or view.street == Street.RIVER else 0.33
             size = min(1.0, max(0.33, size + 0.3 * (style.sizing_preference - 0.5)))
+            spr = stack_to_pot(view, view.seat)
+            if _JAM_SPR < spr <= _GEOMETRIC_SPR:
+                streets = _STREETS_LEFT[view.street]
+                size = max(size, ((1 + 2 * spr) ** (1 / streets) - 1) / 2)
+            jam = 0 < spr and (spr <= _JAM_SPR or size >= spr)
+            if jam:
+                size = spr
             value_bar = 0.5 + 0.08 * (len(opponents) - 1)
+            if size > 1:  # a bigger bet is called by stronger hands
+                value_bar = max(value_bar, min(0.85, 0.5 + 0.12 * size))
             value_share = min(
                 1.0,
                 style.aggression * (weight_total - running[bisect_left(values, value_bar)]) / weight_total,
@@ -450,7 +523,7 @@ class RangeBot(TierBot):
                 value_share
                 * size
                 / (1 + size)
-                * _BLUFF_STREET_FACTOR[view.street]
+                * (1.0 if jam else _BLUFF_STREET_FACTOR[view.street])
                 * style.bluff_multiplier
                 * bluff_factor
                 / len(opponents),
@@ -462,10 +535,13 @@ class RangeBot(TierBot):
                     * (weight_total - running[bisect_left(values, value_bar + value_shift)])
                     / weight_total,
                 )
-            action = _size_action(size)
+            action = AbstractAction.ALL_IN if jam else _size_action(size)
+            if jam:
+                jam_bluffs = _jam_bluffs(view.board, combos, equities, own, bluff_share * weight_total)
             common.update(
                 {
                     "rule_triggered": "checked to: value and balanced bluffs",
+                    "value_bar": round(value_bar, 4),
                     "value_share": round(value_share, 4),
                     "bluff_share": round(bluff_share, 4),
                     "bet_size_pot": size,
@@ -480,11 +556,15 @@ class RangeBot(TierBot):
                     0.05,
                     defense
                     + 0.15 * (style.call_down_tendency - 0.5)
-                    - 0.1 * style.fold_to_pressure * max(0.0, bet_fraction - 0.75)
+                    - 0.1 * style.fold_to_pressure * min(0.75, max(0.0, bet_fraction - 0.75))
                     + call_shift,
                 ),
             )
             raise_share = continue_share * 0.2 * style.aggression
+            # Past the minimum defense share it continues when clearly priced in against the
+            # read the bet's size narrows; from a pot to two pots "clearly" shrinks to "just".
+            margin = 0.05 * min(1.0, max(0.0, 2 - bet_fraction))
+            raise_action = AbstractAction.ALL_IN if stack_to_pot(view, view.seat) <= _JAM_SPR else AbstractAction.BET_75
             common.update(
                 {
                     "rule_triggered": "facing bet: minimum defense and price",
@@ -505,15 +585,12 @@ class RangeBot(TierBot):
                 "range_percentile": round(percentile, 4),
             }
             if legal.can_check:
-                bet = min(
-                    1.0,
-                    sigmoid((percentile - (1 - value_share)) / softness)
-                    + sigmoid((bluff_share - percentile) / softness),
-                )
+                bluff = jam_bluffs[hole] if jam else sigmoid((bluff_share - percentile) / softness)
+                bet = min(1.0, sigmoid((percentile - (1 - value_share)) / softness) + bluff)
                 decided[hole] = ({AbstractAction.CHECK: 1 - bet, action: bet}, rationale)
                 continue
             keep = sigmoid((percentile - (1 - continue_share)) / softness)
-            keep = max(keep, sigmoid((strength - price - 0.05) / 0.02))  # clearly priced in
+            keep = max(keep, sigmoid((strength - price - margin) / 0.02))
             if strength >= NEVER_FOLD_EQUITY:
                 keep = 1.0
             raises = min(keep, sigmoid((percentile - (1 - raise_share)) / softness) * (strength >= 0.6))
@@ -521,7 +598,7 @@ class RangeBot(TierBot):
                 {
                     AbstractAction.FOLD: 1 - keep,
                     AbstractAction.CALL: keep - raises,
-                    AbstractAction.BET_75: raises,
+                    raise_action: raises,
                 },
                 rationale,
             )
@@ -557,6 +634,41 @@ def _defense(view: Observation, opponents: int) -> tuple[float, float]:
     if defense is None:
         defense = 1 - (bet_fraction / (1 + bet_fraction)) ** (1 / opponents)
     return defense, bet_fraction
+
+
+def _jam_bluffs(
+    board: tuple[int, ...],
+    combos: list[int],
+    equities: dict[int, float],
+    own: Range,
+    share: float,
+) -> dict[int, float]:
+    """How often each of `combos` bluffs all in: hands of `_JAM_BLUFFS` equity, those gaining
+    most over their made-hand rank (draws) first, until the bluffs hold `share` of the range's
+    weight; weak made hands near the top of the band have showdown value and check. A hand
+    outside the range bluffs when it ranks above the last bluff taken."""
+    values = dict(zip(combos, evaluate_combos(board, [COMBOS[i] for i in combos])))
+    # Ranked among the range's hands only, so the hands asked about do not move the ranks.
+    ranked = sorted(values[i] for i in combos if own[i] > 0)
+    made = {
+        i: (bisect_left(ranked, v) + bisect_right(ranked, v)) / 2 / max(1, len(ranked) - 1) for i, v in values.items()
+    }
+    low, high = _JAM_BLUFFS
+    band = sorted(
+        (i for i in combos if i in equities and low <= equities[i] <= high),
+        key=lambda i: (equities[i] - made[i], i),
+        reverse=True,
+    )
+    bluffs = dict.fromkeys(combos, 0.0)
+    for i in band:
+        if share <= 1e-12:
+            break
+        if own[i] > 0:
+            bluffs[i] = min(1.0, share / own[i])
+            share -= bluffs[i] * own[i]
+        else:
+            bluffs[i] = 1.0
+    return bluffs
 
 
 def _size_action(pot_fraction: float) -> AbstractAction:
